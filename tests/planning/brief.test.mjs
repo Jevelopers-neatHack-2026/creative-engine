@@ -10,7 +10,7 @@ import {
   persistCreativeBrief,
   resolveAssetUse,
 } from "../../src/planning/index.mjs";
-import { openCreativeBriefStore } from "../../src/planning/store.mjs";
+import { createCreativeBriefStore, openCreativeBriefStore } from "../../src/planning/store.mjs";
 import {
   completeResearchPackage,
   conflictingDateResearchPackage,
@@ -190,6 +190,48 @@ test("synthetic admission credential material is omitted from every planner outp
   assert.equal(result.execution_policy.provider_calls, 0);
 });
 
+test("recursive privacy screening catches secret-like keys and signed or encoded URLs without flagging ordinary Basic prose", () => {
+  const cases = [
+    ["email key", "person@example.test", (research) => { research.preferences.items[0]["person@example.test"] = "safe"; }],
+    ["provider key", "ghp_" + "A".repeat(30), (research) => { research.preferences.items[0]["ghp_" + "A".repeat(30)] = "safe"; }],
+    ["signed source URL", "synthetic-private-signature", (research) => { research.source_identity[0].uri = "https://example.test/image?X-Amz-Signature=synthetic-private-signature"; }],
+    ["encoded email URL", "person%40example.test", (research) => { research.source_identity[0].uri = "https://example.test/person%40example.test"; }],
+    ["nested sensitive key", "person@example.test", (research) => { research.preferences.items[0]["person@example.test"] = { authorization: "synthetic-private-value" }; }],
+  ];
+  for (const [name, marker, mutate] of cases) {
+    const research = completeResearchPackage();
+    mutate(research);
+    let failure;
+    try { plan(research); } catch (error) { failure = error; }
+    assert.equal(failure?.code, "sensitive_input", name);
+    assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes(marker), false, name);
+  }
+});
+
+test("Basic prose remains usable while credential-looking values are rejected", () => {
+  const result = plan(completeResearchPackage(), baseTime, {
+    customer_preferences: [{ preference_id: "illustration-style", value: "Basic illustrations with warm colors" }],
+  });
+  assert.equal(result.brief.preferences.items.some((item) => item.value === "Basic illustrations with warm colors"), true);
+  let failure;
+  try {
+    plan(completeResearchPackage(), baseTime, {
+      customer_preferences: [{ preference_id: "auth-style", value: "Basic dTpw" }],
+    });
+  } catch (error) { failure = error; }
+  assert.equal(failure?.code, "sensitive_input");
+  assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes("dTpw"), false);
+});
+
+test("prototype-named additional fact keys produce ordinary missing-fact clarifications", () => {
+  const result = plan(completeResearchPackage(), baseTime, {
+    additional_required_fact_keys: ["constructor", "toString"],
+  });
+  assert.deepEqual(result.required_facts.filter((item) => ["constructor", "toString"].includes(item.fact_key))
+    .map((item) => [item.fact_key, item.status]), [["constructor", "missing"], ["toString", "missing"]]);
+  assert.equal(result.clarification_requests.every((item) => typeof item.question === "string" && item.question.length > 0), true);
+});
+
 test("denied assets remain blocked and original artwork is offered without using the denied asset", () => {
   const result = plan(deniedAssetResearchPackage());
 
@@ -337,6 +379,21 @@ test("permission evidence is rechecked against current time after the async owne
   assert.equal(result.decisions[0].reason, "permission_proof_expired_or_unverified");
 });
 
+test("asset permission verifier failures are reduced to a safe blocked result", async () => {
+  const briefPlan = plan();
+  const result = await resolveAssetUse({
+    trusted_scope: trustedScope,
+    plan: briefPlan,
+    research_package: completeResearchPackage(),
+    clock: { now: () => baseTime },
+    invalidation_store: { isAssetFenced: () => false },
+    permission_verifier: { async verifyAssetUse() { throw new Error("Bearer synthetic-permission-secret"); } },
+  });
+  assert.equal(result.decisions[0].state, "blocked");
+  assert.equal(result.decisions[0].reason, "permission_verifier_unavailable");
+  assert.equal(JSON.stringify(result).includes("synthetic-permission-secret"), false);
+});
+
 test("invalidation verifies exact owner evidence, persists a fence before acknowledgments, and rejects forged proof", async (t) => {
   const { path } = await temporaryStore(t);
   const store = openCreativeBriefStore(path, trustedScope);
@@ -367,6 +424,156 @@ test("invalidation verifies exact owner evidence, persists a fence before acknow
     classification: "owner_verified",
   }), (error) => error.code === "invalidation_unverified");
   store.close();
+});
+
+test("invalidation owner verifier exceptions are returned only as a safe typed failure", async () => {
+  const store = openCreativeBriefStore(":memory:", trustedScope);
+  const briefPlan = plan();
+  persistCreativeBrief(store, briefPlan, trustedScope);
+  const event = invalidationEvent(briefPlan);
+  let failure;
+  try {
+    await applyResearchInvalidation({
+      trusted_scope: trustedScope,
+      event,
+      ports: {
+        clock: { now: () => baseTime },
+        store,
+        verifier: { async verifyInvalidation() { throw new Error("Bearer synthetic-invalidation-secret"); } },
+      },
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.equal(failure.code, "invalidation_verification_unavailable");
+  assert.equal(`${failure.name} ${failure.message} ${failure.stack}`.includes("synthetic-invalidation-secret"), false);
+  assert.equal(store.getInvalidationHistory().length, 0);
+  store.close();
+});
+
+test("caller-owned SQLite transactions cannot produce provisional external acknowledgments", async (t) => {
+  const database = new DatabaseSync(":memory:");
+  const store = createCreativeBriefStore({ database, trustedScope });
+  t.after(() => {
+    if (database.isTransaction) database.exec("ROLLBACK");
+    store.close();
+    database.close();
+  });
+  const briefPlan = plan();
+  persistCreativeBrief(store, briefPlan, trustedScope);
+  const event = invalidationEvent(briefPlan);
+  const order = [];
+
+  database.exec("BEGIN");
+  await assert.rejects(applyResearchInvalidation({
+    trusted_scope: trustedScope,
+    event,
+    ports: {
+      clock: { now: () => baseTime },
+      store,
+      verifier: syntheticVerifier({ now: () => baseTime }),
+      approvalStaleness: stalenessPort({ order }),
+      producerAcknowledgment: producerAckPort(order),
+    },
+  }), (error) => error.code === "invalidation_transaction_active");
+  assert.deepEqual(order, []);
+  database.exec("ROLLBACK");
+  assert.equal(store.isAssetFenced(trustedScope.tenant_id, trustedScope.project_id, "asset-1", event.assets[0].content_hash), false);
+  assert.equal(store.getInvalidationHistory().length, 0);
+});
+
+test("a caller transaction opened during owner verification stops before provisional fence persistence", async (t) => {
+  const database = new DatabaseSync(":memory:");
+  const store = createCreativeBriefStore({ database, trustedScope });
+  t.after(() => {
+    if (database.isTransaction) database.exec("ROLLBACK");
+    store.close();
+    database.close();
+  });
+  const briefPlan = plan();
+  persistCreativeBrief(store, briefPlan, trustedScope);
+  const event = invalidationEvent(briefPlan);
+  const order = [];
+  const synthetic = syntheticVerifier({ now: () => baseTime });
+  await assert.rejects(applyResearchInvalidation({
+    trusted_scope: trustedScope,
+    event,
+    ports: {
+      clock: { now: () => baseTime },
+      store,
+      verifier: {
+        async verifyInvalidation(input) {
+          const evidence = await synthetic.verifyInvalidation(input);
+          database.exec("BEGIN");
+          return evidence;
+        },
+      },
+      approvalStaleness: stalenessPort({ order }),
+      producerAcknowledgment: producerAckPort(order),
+    },
+  }), (error) => error.code === "invalidation_transaction_active");
+  assert.deepEqual(order, []);
+  assert.equal(store.getInvalidationHistory().length, 0);
+  database.exec("ROLLBACK");
+  assert.equal(store.isAssetFenced(trustedScope.tenant_id, trustedScope.project_id, "asset-1", event.assets[0].content_hash), false);
+});
+
+test("a transaction opened during an approval callback cannot lead to producer acknowledgment", async (t) => {
+  const database = new DatabaseSync(":memory:");
+  const store = createCreativeBriefStore({ database, trustedScope });
+  t.after(() => {
+    if (database.isTransaction) database.exec("ROLLBACK");
+    store.close();
+    database.close();
+  });
+  const briefPlan = plan();
+  persistCreativeBrief(store, briefPlan, trustedScope);
+  const event = invalidationEvent(briefPlan);
+  const order = [];
+  await assert.rejects(applyResearchInvalidation({
+    trusted_scope: trustedScope,
+    event,
+    ports: {
+      clock: { now: () => baseTime },
+      store,
+      verifier: syntheticVerifier({ now: () => baseTime }),
+      approvalStaleness: {
+        async markBriefStale(request) {
+          order.push("approval-stale");
+          database.exec("BEGIN");
+          return {
+            status: "acknowledged",
+            request_id: request.request_id,
+            brief_id: request.brief_id,
+            brief_hash: request.brief_hash,
+            event_id: request.event_id,
+            tenant_id: request.tenant_id,
+            project_id: request.project_id,
+          };
+        },
+      },
+      producerAcknowledgment: producerAckPort(order),
+    },
+  }), (error) => error.code === "invalidation_transaction_active");
+  assert.deepEqual(order, ["approval-stale"]);
+  assert.equal(store.getInvalidationHistory().length, 1);
+  assert.equal(store.getProducerAcknowledgment(trustedScope.tenant_id, trustedScope.project_id, event.event_id), null);
+  database.exec("ROLLBACK");
+
+  const replayOrder = [];
+  const replay = await applyResearchInvalidation({
+    trusted_scope: trustedScope,
+    event,
+    ports: {
+      clock: { now: () => baseTime },
+      store,
+      approvalStaleness: stalenessPort({ order: replayOrder }),
+      producerAcknowledgment: producerAckPort(replayOrder),
+    },
+  });
+  assert.deepEqual(replayOrder, ["approval-stale", "producer-ack"]);
+  assert.equal(replay.producer_acknowledgment.status, "acknowledged");
+  assert.equal(store.isAssetFenced(trustedScope.tenant_id, trustedScope.project_id, "asset-1", event.assets[0].content_hash), true);
 });
 
 test("duplicate and out-of-order invalidations survive restart without removing an asset fence", async (t) => {

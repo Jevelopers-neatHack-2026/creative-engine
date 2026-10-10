@@ -185,6 +185,8 @@ export interface ProducerAcknowledgment {
 }
 
 export interface CreativeBriefStore {
+  /** Fails closed if this connection is in, or cannot identify, a caller-owned transaction. */
+  assertInvalidationBoundary(): void;
   appendBriefVersion(input: { readonly brief: CreativeBrief; readonly brief_hash: string; readonly created_at: string }): BriefVersionReceipt;
   getBriefHistory(briefId: string): readonly BriefVersionReceipt[];
   getBriefVersion(briefId: string, versionNo: number): BriefVersionReceipt | null;

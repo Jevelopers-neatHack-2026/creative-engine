@@ -289,6 +289,20 @@ function createStore(database, scope, closeDatabase) {
   }
 
   const store = {
+    /**
+     * External invalidation acknowledgments are safe only after this connection
+     * commits its fence/outbox writes. Releasing a savepoint inside a caller's
+     * transaction is provisional and cannot authorize an external acknowledgment.
+     */
+    assertInvalidationBoundary() {
+      if (typeof database.isTransaction !== "boolean") {
+        fail("invalidation_transaction_state_unavailable", "The SQLite connection cannot confirm a committed invalidation boundary.", "database");
+      }
+      if (database.isTransaction) {
+        fail("invalidation_transaction_active", "Research invalidation cannot emit external acknowledgments inside a caller-owned transaction.", "database");
+      }
+    },
+
     appendBriefVersion(input) {
       if (!isRecord(input) || !isRecord(input.brief)) fail("invalid_input", "A brief record is required.", "brief");
       const brief = input.brief;

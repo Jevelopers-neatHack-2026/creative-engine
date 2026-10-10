@@ -17,7 +17,9 @@ const ISO_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+
 const SAFE_ENVIRONMENTS = new Set(["development", "test", "production"]);
 const SAFE_BILLING_MODES = new Set(["live", "sandbox", "simulated"]);
 const SENSITIVE_KEY = /(?:credential|secret|password|authorization|bearer|cookie|api[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|admission[_-]?(?:code|token|credential)|ticket[_-]?(?:code|token|barcode)|qr[_-]?(?:code|token)|barcode)/i;
-const SENSITIVE_VALUE = /(?:\bbearer\s+\S+|\bbasic\s+[A-Za-z0-9+/]+={0,2}|\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\b(?:rk|pk)-[A-Za-z0-9_-]{12,}\b|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:ticket|admission|barcode|qr)[ _:-]+(?:code|token|credential|id)[ _:#-]+[A-Za-z0-9_-]{6,})/i;
+const SENSITIVE_VALUE = /(?:\bbearer\s+\S+|\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\b(?:rk|pk)-[A-Za-z0-9_-]{12,}\b|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:ticket|admission|barcode|qr)[ _:-]+(?:code|token|credential|id)[ _:#-]+[A-Za-z0-9_-]{6,})/i;
+const BASIC_AUTH_CANDIDATE = /\bBasic[\t ]+([A-Za-z0-9+/]+={0,2})(?![A-Za-z0-9+/=])/gi;
+const SIGNED_URL_PARAMETER = /^(?:signature|sig|token|access[_-]?token|auth|authorization|api[_-]?key|credential|secret|x-amz-(?:signature|security-token|credential)|x-goog-(?:signature|credential))$/i;
 const FACT_PROMPTS = Object.freeze({
   event_name: "Please confirm the exact event name.",
   event_date: "Please confirm the exact event date.",
@@ -44,6 +46,60 @@ function fail(code, message, field) {
   throw new CreativePlanningError(code, message, field);
 }
 
+function hasBasicAuthMaterial(value) {
+  BASIC_AUTH_CANDIDATE.lastIndex = 0;
+  let match;
+  while ((match = BASIC_AUTH_CANDIDATE.exec(value)) !== null) {
+    const token = match[1];
+    const unpadded = token.replace(/=+$/, "");
+    if (unpadded.length % 4 === 1) continue;
+    const decoded = Buffer.from(token, "base64");
+    const canonical = decoded.toString("base64");
+    if (canonical !== token && canonical.replace(/=+$/, "") !== token) continue;
+    const colon = decoded.indexOf(0x3a);
+    if (colon < 0 || [...decoded].some((byte) => byte < 0x20 || byte === 0x7f || byte > 0x7e)) continue;
+    return true;
+  }
+  return false;
+}
+
+function decodeForScreening(value) {
+  let decoded = value;
+  for (let index = 0; index < 2; index += 1) {
+    try {
+      const next = decodeURIComponent(decoded.replace(/\+/g, "%20"));
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      break;
+    }
+  }
+  return decoded;
+}
+
+function hasSignedUrl(value) {
+  const candidates = value.match(/https?:\/\/[^\s"'<>]+/gi) ?? [];
+  for (const candidate of candidates) {
+    const decoded = decodeForScreening(candidate);
+    try {
+      const parsed = new URL(decoded);
+      for (const [key] of parsed.searchParams) {
+        if (SIGNED_URL_PARAMETER.test(decodeForScreening(key))) return true;
+      }
+    } catch {
+      // Malformed URLs are handled by the normal input contract.
+    }
+    if (SENSITIVE_VALUE.test(decoded) || hasBasicAuthMaterial(decoded)) return true;
+  }
+  return false;
+}
+
+function hasSensitivePublicText(value) {
+  if (SENSITIVE_VALUE.test(value) || hasBasicAuthMaterial(value) || hasSignedUrl(value)) return true;
+  const decoded = decodeForScreening(value);
+  return decoded !== value && (SENSITIVE_VALUE.test(decoded) || hasBasicAuthMaterial(decoded));
+}
+
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) &&
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
@@ -58,7 +114,7 @@ function expectString(value, field, { max = 2048, pattern = null } = {}) {
   if (typeof value !== "string" || value.trim().length === 0 || value.length > max || (pattern && !pattern.test(value))) {
     fail("invalid_input", "A required text field is missing or invalid.", field);
   }
-  if (SENSITIVE_VALUE.test(value)) fail("sensitive_input", "Sensitive content cannot be included in a brief output.", field);
+  if (hasSensitivePublicText(value)) fail("sensitive_input", "Sensitive content cannot be included in a brief output.", field);
   return value;
 }
 
@@ -82,7 +138,7 @@ function safeJsonValue(value, field, depth = 0) {
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "string") {
     if (value.length > 20_000) fail("invalid_input", "Text exceeds the supported size.", field);
-    if (SENSITIVE_VALUE.test(value)) fail("sensitive_input", "Sensitive content cannot be included in a brief output.", field);
+    if (hasSensitivePublicText(value)) fail("sensitive_input", "Sensitive content cannot be included in a brief output.", field);
     return value;
   }
   if (typeof value === "number") {
@@ -93,7 +149,7 @@ function safeJsonValue(value, field, depth = 0) {
   if (!isRecord(value)) fail("invalid_input", "Input must contain only plain JSON values.", field);
   const output = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (SENSITIVE_KEY.test(key)) fail("sensitive_input", "Sensitive fields cannot be included in a brief output.", field);
+    if (SENSITIVE_KEY.test(key) || hasSensitivePublicText(key)) fail("sensitive_input", "Sensitive fields cannot be included in a brief output.", field);
     Object.defineProperty(output, key, {
       value: safeJsonValue(entry, field, depth + 1),
       enumerable: true,
@@ -161,7 +217,9 @@ function requiredFactResults(packageFacts, requiredKeys) {
       clarification_id: `clarification:${digest.slice(HASH_PREFIX.length)}`,
       fact_key: key,
       status,
-      question: FACT_PROMPTS[key] ?? "Please confirm the exact value for this required event detail.",
+      question: Object.hasOwn(FACT_PROMPTS, key)
+        ? FACT_PROMPTS[key]
+        : "Please confirm the exact value for this required event detail.",
       source_fact_ids: matches.map((fact) => fact.fact_id),
     };
   });
@@ -590,7 +648,13 @@ export async function applyResearchInvalidation(input) {
   if (!clock || typeof clock.now !== "function") {
     fail("trusted_clock_unavailable", "A trusted current-time port is required for invalidation verification.", "ports.clock");
   }
-  const currentTime = () => expectIsoDateTime(clock.now(), "ports.clock.now");
+  const currentTime = () => {
+    try {
+      return expectIsoDateTime(clock.now(), "ports.clock.now");
+    } catch {
+      fail("trusted_clock_unavailable", "The trusted current-time port did not return a valid time.", "ports.clock");
+    }
+  };
   const startedAt = currentTime();
   const store = ports.store;
   if (!store || typeof store.persistInvalidationAndFences !== "function" ||
@@ -598,9 +662,12 @@ export async function applyResearchInvalidation(input) {
     typeof store.listPendingApprovalStaleness !== "function" ||
     typeof store.recordApprovalStalenessAcknowledgment !== "function" ||
     typeof store.getProducerAcknowledgment !== "function" ||
-    typeof store.recordProducerAcknowledgment !== "function") {
+    typeof store.recordProducerAcknowledgment !== "function" ||
+    typeof store.assertInvalidationBoundary !== "function") {
     fail("invalidation_store_unavailable", "The durable creative invalidation store is unavailable.", "ports.store");
   }
+  const assertCommittedBoundary = () => store.assertInvalidationBoundary();
+  assertCommittedBoundary();
   let receipt = store.getInvalidationReceipt(trustedScope.tenant_id, trustedScope.project_id, event.event_id);
   let evidence;
   if (receipt) {
@@ -614,22 +681,36 @@ export async function applyResearchInvalidation(input) {
     if (!verifier || typeof verifier.verifyInvalidation !== "function") {
       fail("invalidation_verifier_unavailable", "The trusted research-owner invalidation verifier is unavailable.", "ports.verifier");
     }
-    const verifiedRaw = await verifier.verifyInvalidation({ event, trusted_scope: trustedScope, now: startedAt });
+    let verifiedRaw;
+    try {
+      verifiedRaw = await verifier.verifyInvalidation({ event, trusted_scope: trustedScope, now: startedAt });
+    } catch {
+      fail("invalidation_verification_unavailable", "The trusted research-owner verifier did not return a decision.", "ports.verifier");
+    }
     const verifiedAt = currentTime();
     evidence = validateTrustedInvalidationEvidence(event, verifiedRaw, verifiedAt);
     acceptVerifiedInvalidation(event, evidence);
+    assertCommittedBoundary();
     receipt = store.persistInvalidationAndFences(event, evidence);
   }
+  assertCommittedBoundary();
   const approvalPort = ports.approvalStaleness;
   const staleReceipts = [];
   if (approvalPort && typeof approvalPort.markBriefStale === "function") {
     for (const request of store.listPendingApprovalStaleness(event.tenant_id, event.project_id, event.event_id)) {
-      const response = await approvalPort.markBriefStale(request);
+      assertCommittedBoundary();
+      let response;
+      try {
+        response = await approvalPort.markBriefStale(request);
+      } catch {
+        fail("approval_staleness_unconfirmed", "The application did not confirm the exact approval-staleness request.", "ports.approvalStaleness");
+      }
       if (!response || response.status !== "acknowledged" || response.request_id !== request.request_id ||
         response.brief_id !== request.brief_id || response.brief_hash !== request.brief_hash ||
         response.event_id !== event.event_id || response.tenant_id !== event.tenant_id || response.project_id !== event.project_id) {
         fail("approval_staleness_unconfirmed", "The application did not acknowledge the exact approval-staleness request.", "ports.approvalStaleness");
       }
+      assertCommittedBoundary();
       const stored = store.recordApprovalStalenessAcknowledgment(response);
       staleReceipts.push(stored);
     }
@@ -640,19 +721,26 @@ export async function applyResearchInvalidation(input) {
   if (!producerAcknowledgment && pendingStaleness.length === 0 && ackPort &&
     typeof ackPort.acknowledgeInvalidation === "function" &&
     typeof store.recordProducerAcknowledgment === "function") {
-    const response = await ackPort.acknowledgeInvalidation({
-      event_id: event.event_id,
-      idempotency_key: event.idempotency_key,
-      event_hash: event.content_hash,
-      durable_receipt_id: receipt.receipt_id,
-      tenant_id: event.tenant_id,
-      project_id: event.project_id,
-    });
+    assertCommittedBoundary();
+    let response;
+    try {
+      response = await ackPort.acknowledgeInvalidation({
+        event_id: event.event_id,
+        idempotency_key: event.idempotency_key,
+        event_hash: event.content_hash,
+        durable_receipt_id: receipt.receipt_id,
+        tenant_id: event.tenant_id,
+        project_id: event.project_id,
+      });
+    } catch {
+      fail("producer_acknowledgment_unconfirmed", "The research producer did not confirm the persisted invalidation.", "ports.producerAcknowledgment");
+    }
     if (!response || response.status !== "acknowledged" || response.event_id !== event.event_id ||
       response.idempotency_key !== event.idempotency_key || response.event_hash !== event.content_hash ||
       response.tenant_id !== event.tenant_id || response.project_id !== event.project_id) {
       fail("producer_acknowledgment_unconfirmed", "The research producer did not acknowledge the persisted invalidation.", "ports.producerAcknowledgment");
     }
+    assertCommittedBoundary();
     producerAcknowledgment = store.recordProducerAcknowledgment(response);
   }
   const finalReceipt = store.getInvalidationReceipt(trustedScope.tenant_id, trustedScope.project_id, event.event_id);
@@ -692,9 +780,14 @@ export async function resolveAssetUse(input) {
   const { plan_hash: planHash, ...planBody } = plan;
   if (planHash !== hash(planBody)) fail("plan_hash_mismatch", "The plan hash does not match its immutable content.", "plan_hash");
   const clock = input.clock;
-  const currentTime = () => clock && typeof clock.now === "function"
-    ? expectIsoDateTime(clock.now(), "clock.now")
-    : null;
+  const currentTime = () => {
+    if (!clock || typeof clock.now !== "function") return null;
+    try {
+      return expectIsoDateTime(clock.now(), "clock.now");
+    } catch {
+      return null;
+    }
+  };
   const clockAvailable = Boolean(clock && typeof clock.now === "function");
   const verifier = input.permission_verifier;
   const store = input.invalidation_store;
@@ -712,16 +805,22 @@ export async function resolveAssetUse(input) {
       decisions.push({ asset_id: assetId, content_hash: contentHash, state: "blocked", reason: !clockAvailable ? "trusted_clock_unavailable" : "external_permission_or_invalidation_port_unavailable" });
       continue;
     }
-    const proof = await verifier.verifyAssetUse({
-      tenant_id: trustedScope.tenant_id,
-      project_id: trustedScope.project_id,
-      asset_id: assetId,
-      content_hash: contentHash,
-      action: "reproduce",
-      package_id: expectString(research.package_id, "research_package.package_id", { max: 200, pattern: SAFE_ID }),
-      package_hash: hash(research),
-      now: requestedAt,
-    });
+    let proof;
+    try {
+      proof = await verifier.verifyAssetUse({
+        tenant_id: trustedScope.tenant_id,
+        project_id: trustedScope.project_id,
+        asset_id: assetId,
+        content_hash: contentHash,
+        action: "reproduce",
+        package_id: expectString(research.package_id, "research_package.package_id", { max: 200, pattern: SAFE_ID }),
+        package_hash: hash(research),
+        now: requestedAt,
+      });
+    } catch {
+      decisions.push({ asset_id: assetId, content_hash: contentHash, state: "blocked", reason: "permission_verifier_unavailable" });
+      continue;
+    }
     if (!proof || proof.status !== "granted" || proof.tenant_id !== trustedScope.tenant_id || proof.project_id !== trustedScope.project_id ||
       proof.asset_id !== assetId || proof.content_hash !== contentHash || proof.action !== "reproduce" ||
       proof.package_id !== research.package_id || proof.package_hash !== hash(research)) {
