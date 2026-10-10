@@ -180,7 +180,7 @@ test("real API invocation commits job, exact artifact bytes, version and selecti
   assert.equal(counters.provider, 1, "conflicting action replay must not dispatch again");
 });
 
-test("populated BASE4e v4 database migrates to v6 and replays historical generation and edit after restart", async (t) => {
+test("populated BASE4e v4 database migrates to v6 and replays historical generation, edit, and inspection after restart", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "creative-base4e-v4-migration-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
   const fixtureRoot = new URL("../../fixtures/versions/base4-populated-v4/", import.meta.url);
@@ -205,6 +205,7 @@ test("populated BASE4e v4 database migrates to v6 and replays historical generat
     .map((row) => ({ ...row })), [
     { action_id: "base4-edit-action", operation: "edit", status: "completed" },
     { action_id: "base4-generate-action", operation: "generate", status: "completed" },
+    { action_id: "base4-inspect-action", operation: "inspect", status: "completed" },
   ]);
   const v4DispatchColumns = baseline.prepare("PRAGMA table_info(creative_dispatch_intents)").all().map((column) => column.name);
   for (const column of ["reservation_ref", "provider_name", "provider_model"]) assert.equal(v4DispatchColumns.includes(column), false);
@@ -222,15 +223,21 @@ test("populated BASE4e v4 database migrates to v6 and replays historical generat
     assert.deepEqual(Buffer.from(await migrated.getArtifactBytes({ scope: SCOPE, brief_id: SCOPE.brief_id,
       design_version_id: designVersionId })), Buffer.from("durable exact artwork bytes"));
   }
-  assert.equal(migrated.db.prepare("SELECT COUNT(*) AS count FROM creative_jobs WHERE status='completed'").get().count, 2);
+  assert.equal(migrated.db.prepare("SELECT COUNT(*) AS count FROM creative_jobs WHERE status='completed'").get().count, 3);
   migrated.close();
 
   migrated = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
   t.after(() => migrated.close());
   assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, 6);
-  const counters = { provider: 0, reserved: 0 };
+  const counters = { provider: 0, reserved: 0, inspection: 0 };
   let id = 0;
-  const api = createCreativeApi({ ports: portsFor(migrated, counters, () => `base4-replay-port-${++id}`),
+  const ports = portsFor(migrated, counters, () => `base4-replay-port-${++id}`);
+  ports.inspection = {
+    resolveRoute: () => ({ retry_mapping_ref: "retry:fixture/1", provider: { name: "fixture-provider", model: "fixture-model",
+      endpoint: "test:/vision", sdk: { name: "fixture-sdk", version: "1.0" } } }),
+    async inspect() { counters.inspection += 1; throw new Error("historical inspection replay must not dispatch"); },
+  };
+  const api = createCreativeApi({ ports,
     now: () => NOW, idFactory: () => `base4-replay-api-${++id}` });
   const generatedReplay = await api.invoke(actor(), requests.generate_request);
   assert.equal(generatedReplay.ok, true, JSON.stringify(generatedReplay));
@@ -240,7 +247,12 @@ test("populated BASE4e v4 database migrates to v6 and replays historical generat
   assert.equal(editedReplay.ok, true, JSON.stringify(editedReplay));
   assert.equal(editedReplay.replayed, true);
   assert.equal(editedReplay.result.design_version.design_version_id, requests.expected_edit_design_version_id);
+  const inspectedReplay = await api.invoke(actor(), requests.inspect_request);
+  assert.equal(inspectedReplay.ok, true, JSON.stringify(inspectedReplay));
+  assert.equal(inspectedReplay.replayed, true);
+  assert.equal(inspectedReplay.result.design_version_id, requests.expected_inspection_design_version_id);
   assert.equal(counters.provider, 0, "historical replay after migration must not redispatch generation or edit");
+  assert.equal(counters.inspection, 0, "historical inspection replay after migration must not inspect again");
   assert.equal(counters.reserved, 0, "historical replay after migration must not create reservations");
 });
 

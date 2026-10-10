@@ -136,6 +136,30 @@
       "design_version_id": "design-durable-api-1"
     }
   },
+  "inspect_request": {
+    "contract": "CreativeApiRequest",
+    "schema_version": "1.0",
+    "event_id": "event-base4-inspect-action",
+    "request_id": "request-base4-inspect-action",
+    "tenant_id": "tenant-api-1",
+    "project_id": "project-api-1",
+    "correlation_id": "correlation-base4-inspect-action",
+    "producer": "versions-api-integration",
+    "occurred_at": "2026-10-10T12:20:00.000Z",
+    "ingested_at": "2026-10-10T12:20:00.000Z",
+    "environment": "test",
+    "billing_mode": "simulated",
+    "source_refs": [
+      "source-api-1"
+    ],
+    "operation": "inspect",
+    "action_id": "base4-inspect-action",
+    "payload": {
+      "brief_id": "brief-api-1",
+      "design_version_id": "design-durable-edit-2"
+    }
+  },
   "expected_generate_design_version_id": "design-durable-api-1",
-  "expected_edit_design_version_id": "design-durable-edit-2"
+  "expected_edit_design_version_id": "design-durable-edit-2",
+  "expected_inspection_design_version_id": "design-durable-edit-2"
 }

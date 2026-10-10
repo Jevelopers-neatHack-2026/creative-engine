@@ -3,14 +3,17 @@
   "schema_version": "1.0",
   "base_commit": "4e28839ea8baeb4112a4f12340ef2fe84f5c8efe",
   "storage_user_version": 4,
-  "database_sha256": "sha256:d5ed50b542eb9bf114e41eb548db65ea2b0a0576880401c3930904930410c6cc",
-  "requests_sha256": "sha256:2b171b3965e26bd527d2049543e56c1caa14913c8cd23e2e5d05837bdf37be51",
+  "database_sha256": "sha256:d2ecd75c9663fae6913f53c75017e7e91b6ff9bb485c364cc491a87781086db4",
+  "requests_sha256": "sha256:56b723d6973b6c282b564d94a62d641f494011ef684157ea8b13fa9eaf9a797a",
   "artifact_sha256": "sha256:9ef5fef2ad2679ad041e37fdf846e8391f0dfe1ea5227779e0cf4e7ac6625240",
   "completed_actions": [
     { "action_id": "base4-generate-action", "operation": "generate", "design_version_id": "design-durable-api-1" },
-    { "action_id": "base4-edit-action", "operation": "edit", "design_version_id": "design-durable-edit-2" }
+    { "action_id": "base4-edit-action", "operation": "edit", "design_version_id": "design-durable-edit-2" },
+    { "action_id": "base4-inspect-action", "operation": "inspect", "design_version_id": "design-durable-edit-2" }
   ],
   "provider_calls": 2,
+  "inspection_calls": 1,
+  "reservations": 3,
   "paid_provider_calls": 0,
-  "description": "SQLite database populated by the BASE4e API and version store with completed offline fixture generation and edit jobs, versions, telemetry, selection, and exact artifact bytes."
+  "description": "SQLite database populated by the BASE4e API and version store with completed offline fixture generation, edit, and inspection jobs, versions, telemetry, selection, and exact artifact bytes."
 }
