@@ -23,10 +23,13 @@ const plan: EditPlan = validateEditPlan(untrustedEditPlan, {
 });
 const baseDesignHash: string = plan.base.design_hash;
 const errorClass: typeof ContractError = ContractError;
+const constructedError = new ContractError("invalid_type", "CreativeBrief", "brief_id", "Safe public validation message.");
+const errorCode: string = constructedError.code;
 const decisionResult: DecisionPortResult = validateDecisionResult(request, result, { trustedScope });
 const batches: string[][] = planQuestionBatches(request, { trustedScope });
 
 void baseDesignHash;
 void errorClass;
+void errorCode;
 void decisionResult;
 void batches;

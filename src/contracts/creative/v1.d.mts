@@ -228,6 +228,7 @@ export interface ContractErrorShape {
 }
 
 export declare class ContractError extends Error implements ContractErrorShape {
+  constructor(code: string, contract: string, field: string, message: string);
   code: string;
   contract: string;
   field: string;

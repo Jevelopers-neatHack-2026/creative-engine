@@ -51,6 +51,11 @@ test("valid current and local alias packages normalize as EventIntelligencePacka
 
 test("creative subpath runtime exports the same ContractError declared by its public type surface", () => {
   assert.equal(CreativeContractError, ContractError);
+  const error = new CreativeContractError("invalid_type", "CreativeBrief", "brief_id", "Safe public validation message.");
+  assert.equal(error.code, "invalid_type");
+  assert.equal(error.contract, "CreativeBrief");
+  assert.equal(error.field, "brief_id");
+  assert.equal(error.message, "Safe public validation message.");
 });
 
 test("supported older package migrates values and permissions without granting authority", async () => {
