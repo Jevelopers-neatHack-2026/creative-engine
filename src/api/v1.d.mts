@@ -279,7 +279,7 @@ export interface CreativeRuntimePorts {
   inspection?: {
     resolveRoute(input: { scope: TrustedScope; actor_id: string; design_version: DesignVersion }):
       Promise<CreativeProviderRoute> | CreativeProviderRoute;
-    inspect(input: InspectionInput): Promise<InspectionOutput>;
+    inspect(input: InspectionInput): Promise<InspectionPortOutput>;
   };
   approval?: {
     verifyApproval: ApprovalVerifier["verifyApproval"];
@@ -370,7 +370,7 @@ export interface StructuredObservation {
 }
 
 export interface CreativeTelemetryEvidenceStatus {
-  readonly local_status: "recorded" | "duplicate" | "pending";
+  readonly local_status: "recorded" | "duplicate" | "pending" | "unknown";
   readonly pending_event_id?: string;
   readonly pending_event_staged?: boolean;
   /** Present only when the durable outbox retry path was unavailable. */
@@ -378,7 +378,9 @@ export interface CreativeTelemetryEvidenceStatus {
   readonly pending_event_hash?: string;
 }
 
-export interface InspectionOutput {
+/** Raw result returned by the injected inspection capability before the API
+ * attaches its own durable telemetry delivery status. */
+export interface InspectionPortOutput {
   tenant_id: string;
   project_id: string;
   brief_id: string;
@@ -389,6 +391,9 @@ export interface InspectionOutput {
   inspection_id: string;
   observations: StructuredObservation[];
   usage?: ProviderUsageRecord;
+}
+
+export interface InspectionOutput extends InspectionPortOutput {
   telemetry_evidence: CreativeTelemetryEvidenceStatus;
 }
 

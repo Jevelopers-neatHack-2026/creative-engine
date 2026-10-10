@@ -332,6 +332,8 @@ test("public metering outcome redacts unsafe settlement references without chang
     posting_refs: [
       "ghp_SyntheticCredentialValueSyntheticCredentialValue",
       "person@example.invalid",
+      "https://user:synthetic-pass@localhost/path",
+      "https://user:synthetic-pass@127.0.0.1/path",
       "posting:fixture-safe-1",
     ],
   });
@@ -347,12 +349,13 @@ test("public metering outcome redacts unsafe settlement references without chang
   assert.equal(result.outcome.status, "settled");
   assert.equal(result.outcome.settlement.status, "settled");
   assert.deepEqual(result.outcome.settlement.posting_refs, [
-    "[REDACTED]", "[REDACTED]", "posting:fixture-safe-1",
+    "[REDACTED]", "[REDACTED]", "[REDACTED]", "[REDACTED]", "posting:fixture-safe-1",
   ]);
   assert.equal(authority.reservationFor("attempt:privacy-posting-refs").state, "settled");
   const publicJson = JSON.stringify(result);
   assert.equal(publicJson.includes("ghp_SyntheticCredentialValueSyntheticCredentialValue"), false);
   assert.equal(publicJson.includes("person@example.invalid"), false);
+  assert.equal(publicJson.includes("synthetic-pass"), false);
 });
 
 test("oversized Finance metadata cannot turn a completed settlement into an execution failure", async () => {

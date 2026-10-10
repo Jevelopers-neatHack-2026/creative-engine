@@ -7,6 +7,9 @@ const SENSITIVE_PUBLIC_TEXT = [
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
   /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/i,
   /https?:\/\/[^\s"'<>]+[?&][^=\s&#]*(?:signature|sig|token|credential|secret|access[_-]?key|auth)[^=\s&#]*=[^&#\s]+/i,
+  // Userinfo is credential-bearing regardless of whether the authority uses
+  // a public DNS name, localhost, an IPv4 address, or an IPv6 literal.
+  /https?:\/\/[^/?#\s]*:[^/?#\s]*@[^/?#\s]*/i,
   /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i,
   /(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?!\d)/,
 ];

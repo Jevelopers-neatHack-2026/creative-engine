@@ -90,6 +90,8 @@ const publicApi = createCreativeApi({ ports: { telemetry: apiTelemetry } });
 void publicApi;
 void sqliteOutbox.enqueueUsageObservation({ attempt, trustedScope: scope, observation: usage });
 void sqliteOutbox.append(evidence);
+void sqliteOutbox.hasAttemptEvidence({ ...scope, logical_operation_id: attempt.logical_operation_id,
+  billable_attempt_id: attempt.billable_attempt_id });
 void sqliteOutbox.claimPendingEvidence({ limit: 4, leaseMs: 500 });
 void deliverPendingTelemetryEvidence({ outbox: sqliteOutbox, sink: {
   async record(event) { return { status: "accepted", event_id: event.event_id }; },

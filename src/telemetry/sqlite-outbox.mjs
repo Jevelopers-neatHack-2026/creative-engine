@@ -371,6 +371,71 @@ export function createSqliteTelemetryOutbox({
       });
     },
 
+    /**
+     * Distinguish a pre-telemetry job result from a current result whose
+     * telemetry status was removed or corrupted. This is a local integrity
+     * check only; it does not assert remote delivery or acceptance.
+     */
+    async hasAttemptEvidence(input) {
+      if (!isRecord(input)) throw boundary("invalid_evidence_identity");
+      const tenantId = safeIdentifier(input.tenant_id, "invalid_evidence_identity");
+      const projectId = safeIdentifier(input.project_id, "invalid_evidence_identity");
+      const budgetScopeId = safeIdentifier(input.budget_scope_id, "invalid_evidence_identity");
+      const logicalOperationId = safeIdentifier(input.logical_operation_id, "invalid_evidence_identity");
+      const billableAttemptId = safeIdentifier(input.billable_attempt_id, "invalid_evidence_identity");
+      let rows;
+      try {
+        rows = database.prepare(`SELECT event_id, tenant_id, project_id, budget_scope_id, event_type,
+            payload_json, payload_sha256
+          FROM ${EVIDENCE_TABLE}
+          WHERE tenant_id = ? AND project_id = ?
+            AND json_extract(payload_json, '$.logical_operation_id') = ?
+            AND json_extract(payload_json, '$.billable_attempt_id') = ?`)
+          .all(tenantId, projectId, logicalOperationId, billableAttemptId);
+      } catch {
+        throw boundary("telemetry_storage_unavailable");
+      }
+      for (const row of rows) {
+        const event = normalizeEvent(decodePayload(row, {
+          kind: "evidence", idField: "event_id", hashField: "payload_sha256",
+        })).payloadValue;
+        if (event.event_id !== row.event_id || event.event_type !== row.event_type ||
+          event.tenant_id !== tenantId || event.project_id !== projectId ||
+          event.budget_scope_id !== budgetScopeId || event.logical_operation_id !== logicalOperationId ||
+          event.billable_attempt_id !== billableAttemptId) {
+          throw boundary("corrupt_evidence_record");
+        }
+      }
+      if (rows.length !== 0) return "found";
+
+      let observations;
+      try {
+        observations = database.prepare(`SELECT record_ref, tenant_id, project_id, budget_scope_id,
+            logical_operation_id, billable_attempt_id, source_observation_id, payload_json, payload_sha256
+          FROM ${OBSERVATION_TABLE}
+          WHERE tenant_id = ? AND project_id = ? AND budget_scope_id = ?
+            AND logical_operation_id = ? AND billable_attempt_id = ?`)
+          .all(tenantId, projectId, budgetScopeId, logicalOperationId, billableAttemptId);
+      } catch {
+        throw boundary("telemetry_storage_unavailable");
+      }
+      for (const row of observations) {
+        const payload = decodePayload(row, {
+          kind: "observation", idField: "source_observation_id", hashField: "payload_sha256",
+        });
+        if (row.tenant_id !== tenantId || row.project_id !== projectId || row.budget_scope_id !== budgetScopeId ||
+          row.logical_operation_id !== logicalOperationId || row.billable_attempt_id !== billableAttemptId ||
+          payload.attempt.tenant_id !== tenantId || payload.attempt.project_id !== projectId ||
+          payload.attempt.budget_scope_id !== budgetScopeId ||
+          payload.attempt.logical_operation_id !== logicalOperationId ||
+          payload.attempt.billable_attempt_id !== billableAttemptId ||
+          payload.observation.billable_attempt_id !== billableAttemptId) {
+          throw boundary("corrupt_observation_record");
+        }
+      }
+      return observations.length === 0 ? "not_found" : "found";
+    },
+
     /** Retry a sanitized outcome append through a direct durable queue path. */
     async stagePendingEvidence(rawEvent) {
       assertOutermostCommitBoundary(database);

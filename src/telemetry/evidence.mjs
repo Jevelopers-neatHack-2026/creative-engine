@@ -421,8 +421,28 @@ export async function executeCreativeMeteredAttempt({
   const recordTransport = async (context, transportAttemptId) => {
     const safeTransportId = safeOptionalId(transportAttemptId, "transport_attempt_id");
     if (safeTransportId && authorizedTransports.has(safeTransportId)) {
-      return Object.freeze({ transport_attempt_id: safeTransportId,
-        dispatch_intent_ref: authorizedTransports.get(safeTransportId) });
+      const dispatchIntentRef = authorizedTransports.get(safeTransportId);
+      assertTransportActive(context.signal ?? signal);
+      assertTransportActive(signal);
+      try {
+        // Replayed transport identities reuse Finance's recorded ACK, but they
+        // must still prove the job lease, cancellation, and creative context
+        // are current immediately before a caller proceeds to transport.
+        await revalidateTransport(Object.freeze({
+          attempt: deepFreeze(structuredClone(attempt)),
+          logical_operation_id: attempt.logical_operation_id,
+          billable_attempt_id: attempt.billable_attempt_id,
+          reservation_ref: context.reservation_ref,
+          transport_attempt_id: safeTransportId,
+          dispatch_intent_ref: dispatchIntentRef,
+          signal: context.signal ?? signal,
+        }));
+      } catch {
+        throw new TelemetryBoundaryError("dispatch_fence_unavailable");
+      }
+      assertTransportActive(context.signal ?? signal);
+      assertTransportActive(signal);
+      return Object.freeze({ transport_attempt_id: safeTransportId, dispatch_intent_ref: dispatchIntentRef });
     }
     if (!safeTransportId || transportIds.has(safeTransportId) ||
       safeTransportId === attempt.logical_operation_id || safeTransportId === attempt.billable_attempt_id) {

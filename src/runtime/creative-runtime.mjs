@@ -26,6 +26,7 @@ import { MeteringContractError, METERING_PROPOSAL_VERSION } from "../contracts/m
 import {
   createUsageObservation,
   executeCreativeMeteredAttempt,
+  projectPublicTelemetry,
   TelemetryBoundaryError,
   USAGE_PROFILE,
 } from "../telemetry/index.mjs";
@@ -432,12 +433,43 @@ function publicJob(job, operation_id) {
   }), job.operation ?? "unknown", "job");
 }
 
-function validateTelemetryEvidenceStatus(value, operation, expected = {}) {
+async function validateTelemetryEvidenceStatus(value, operation, expected = {}, evidenceOutbox) {
+  const legacyEvidenceStatus = async () => {
+    if (!isRecord(evidenceOutbox) || typeof evidenceOutbox.hasAttemptEvidence !== "function") {
+      throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+    }
+    let status;
+    try {
+      status = await evidenceOutbox.hasAttemptEvidence({
+        tenant_id: expected.tenant_id,
+        project_id: expected.project_id,
+        budget_scope_id: expected.budget_scope_id,
+        logical_operation_id: expected.logical_operation_id,
+        billable_attempt_id: expected.billable_attempt_id,
+      });
+    } catch {
+      throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+    }
+    if (status !== "not_found") {
+      throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+    }
+    // Pre-integration jobs have no local evidence records. This status makes
+    // that absence explicit without claiming any sink or owner acceptance.
+    return Object.freeze({ local_status: "unknown" });
+  };
+  if (value === undefined) return await legacyEvidenceStatus();
   if (!isRecord(value)) throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
   assertStoredOnlyKeys(value, ["local_status", "pending_event_id", "pending_event_staged", "pending_event", "pending_event_hash"],
     operation, "stored_result.telemetry_evidence");
-  if (!["recorded", "duplicate", "pending"].includes(value.local_status)) {
+  if (!["recorded", "duplicate", "pending", "unknown"].includes(value.local_status)) {
     throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+  }
+  if (value.local_status === "unknown") {
+    if (value.pending_event_id !== undefined || value.pending_event_staged !== undefined ||
+      value.pending_event !== undefined || value.pending_event_hash !== undefined) {
+      throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+    }
+    return await legacyEvidenceStatus();
   }
   if (value.local_status !== "pending") {
     if (value.pending_event_id !== undefined || value.pending_event_staged !== undefined ||
@@ -575,6 +607,29 @@ function usageObservation(attempt, trustedScope, rawUsage, profile, transportAtt
     source: "provider_response",
     transportAttemptId,
   });
+}
+
+function providerFailureUsage(error) {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) return undefined;
+  let usageDescriptor;
+  let outcomeDescriptor;
+  try {
+    usageDescriptor = Object.getOwnPropertyDescriptor(error, "usage");
+    outcomeDescriptor = Object.getOwnPropertyDescriptor(error, "provider_outcome");
+  } catch {
+    return undefined;
+  }
+  if (!usageDescriptor || !Object.hasOwn(usageDescriptor, "value") || !isRecord(usageDescriptor.value)) return undefined;
+  let projected;
+  try {
+    projected = projectPublicTelemetry(usageDescriptor.value, { maxDepth: 8, maxNodes: 256, maxBytes: 16 * 1024 });
+  } catch {
+    return undefined;
+  }
+  const reportedOutcome = outcomeDescriptor && Object.hasOwn(outcomeDescriptor, "value")
+    ? outcomeDescriptor.value : undefined;
+  const providerOutcome = ["failed", "partial", "unknown"].includes(reportedOutcome) ? reportedOutcome : "unknown";
+  return Object.freeze({ usage: projected.value, provider_outcome: providerOutcome });
 }
 
 function meteringFailure(outcome, operation) {
@@ -1004,18 +1059,23 @@ export function createCreativeApi(options = {}) {
           dispatch_intent_ref,
           async recordTransportAttempt(transportId) {
             boundedString(transportId, "transport_attempt_id", 256);
-            let intentRef = dispatchIntentRefs.get(transportId);
-            if (!intentRef) {
-              if (dispatchContext.signal?.aborted) throw new CreativeApiError("cancelled", request.operation, "deadline");
-              await dispatchContext.recordTransportAttempt(transportId);
-              intentRef = dispatchIntentRefs.get(transportId);
-              if (!intentRef) throw new CreativeApiError("unavailable", request.operation, "dispatch_authorization");
-            }
+            if (dispatchContext.signal?.aborted) throw new CreativeApiError("cancelled", request.operation, "deadline");
+            // The telemetry executor owns idempotent transport identity reuse
+            // and must revalidate the active job/context fence on every call.
+            await dispatchContext.recordTransportAttempt(transportId);
+            const intentRef = dispatchIntentRefs.get(transportId);
+            if (!intentRef) throw new CreativeApiError("unavailable", request.operation, "dispatch_authorization");
             if (dispatchContext.signal?.aborted) throw new CreativeApiError("cancelled", request.operation, "deadline");
             return intentRef;
           },
           setDecisionRequest(value) { validatedDecisionRequest = value; },
-        }); } catch (error) { throw error; }
+        }); } catch (error) {
+          const failed = providerFailureUsage(error);
+          if (!failed) throw error;
+          const usage_observation = usageObservation(dispatchContext.attempt, meteredTrustedScope(principal),
+            failed.usage, usageProfile, transportAttemptId, idFactory);
+          return { provider_outcome: failed.provider_outcome, usage_observation };
+        }
         providerValue = dispatched?.value;
         const rawUsage = dispatched?.usage;
         const usage_observation = usageObservation(dispatchContext.attempt, meteredTrustedScope(principal),
@@ -1603,10 +1663,10 @@ export function createCreativeApi(options = {}) {
         job.result.usage.completeness !== "complete" || job.result.attempt_id !== current.billable_attempt_id) {
         throw new CreativeApiError("unavailable", request.operation, "stored_result");
       }
-      const telemetryEvidence = validateTelemetryEvidenceStatus(job.result.telemetry_evidence, request.operation, {
+      const telemetryEvidence = await validateTelemetryEvidenceStatus(job.result.telemetry_evidence, request.operation, {
         tenant_id: principal.tenant_id, project_id: principal.project_id, budget_scope_id: principal.budget_scope_id,
         logical_operation_id: request.action_id, billable_attempt_id: current.billable_attempt_id,
-      });
+      }, ports.telemetry?.outbox);
       return Object.freeze({ design_version: current, usage: Object.freeze({ completeness: "complete" }),
         telemetry_evidence: telemetryEvidence });
     }
@@ -1679,10 +1739,10 @@ export function createCreativeApi(options = {}) {
       });
       if (typeof started.job.result.attempt_id !== "string") throw new CreativeApiError("unavailable", request.operation, "stored_inspection");
       publicIdentifier(result.inspection_id, "stored_inspection.inspection_id", request.operation, 256);
-      const telemetryEvidence = validateTelemetryEvidenceStatus(result.telemetry_evidence, request.operation, {
+      const telemetryEvidence = await validateTelemetryEvidenceStatus(result.telemetry_evidence, request.operation, {
         tenant_id: principal.tenant_id, project_id: principal.project_id, budget_scope_id: principal.budget_scope_id,
         logical_operation_id: request.action_id, billable_attempt_id: started.job.result.attempt_id,
-      });
+      }, ports.telemetry?.outbox);
       return Object.freeze({ tenant_id: result.tenant_id, project_id: result.project_id, brief_id: result.brief_id,
         design_version_id: result.design_version_id, artifact_id: result.artifact_id,
         artifact_hash: result.artifact_hash, design_hash: result.design_hash,

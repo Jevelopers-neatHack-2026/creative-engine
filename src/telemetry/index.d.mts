@@ -237,6 +237,14 @@ export interface SqliteTelemetryOutbox {
     readonly status: "recorded" | "duplicate";
     readonly event_id: string;
   }>;
+  /** Local presence check for distinguishing legacy job results from corrupted new results. */
+  hasAttemptEvidence(input: Readonly<{
+    tenant_id: string;
+    project_id: string;
+    budget_scope_id: string;
+    logical_operation_id: string;
+    billable_attempt_id: string;
+  }>): Promise<"found" | "not_found">;
   stagePendingEvidence(event: CreativeTelemetryEvidence): Promise<{
     readonly status: "recorded" | "duplicate";
     readonly event_id: string;
