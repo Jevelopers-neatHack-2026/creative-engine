@@ -107,6 +107,7 @@ function boundedString(value, field, max = 200) {
 
 const SENSITIVE_PUBLIC_TEXT = [
   /\bBearer\s+[A-Za-z0-9._~+/-]{8,}={0,2}/i,
+  /\bBasic\s+[A-Za-z0-9+/]{12,}={0,2}/i,
   /\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|secret|password|authorization|credential|cookie)\s*[:=]\s*["']?[^\s"'&,;]+/i,
   /\bAKIA[0-9A-Z]{16}\b/,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
@@ -118,24 +119,6 @@ const SENSITIVE_PUBLIC_TEXT = [
 
 function hasSensitivePublicText(value) {
   return SENSITIVE_PUBLIC_TEXT.some((pattern) => pattern.test(value));
-}
-
-const PUBLIC_IDENTIFIER_FIELDS = new Set([
-  "action_id", "actor_id", "artifact_id", "approval_id", "approval_reference", "asset_id", "audience",
-  "billable_attempt_id", "brief_id", "consumer_id", "correlation_id", "design_version_id", "destination_ref",
-  "dispatch_intent_ref", "event_id", "grant_ref", "handoff_id", "inspection_id", "issuer_id", "job_id",
-  "key_id", "key_set_version", "layer_id", "locator_ref", "logical_operation_id", "operation_id",
-  "permission_ref", "project_id", "provider_request_id", "record_ref", "request_id", "result_ref",
-  "source_id", "source_ref", "tenant_id", "transport_attempt_id", "usage_ref",
-]);
-const PUBLIC_IDENTIFIER_ARRAY_FIELDS = new Set(["source_refs", "trace_refs", "usage_refs", "verified_layer_ids"]);
-
-function isPublicIdentifierField(key) {
-  return PUBLIC_IDENTIFIER_FIELDS.has(key) || key === "id" || /(?:_id|_ref)$/.test(key);
-}
-
-function isPublicIdentifierArrayField(key) {
-  return PUBLIC_IDENTIFIER_ARRAY_FIELDS.has(key) || /(?:_ids|_refs)$/.test(key);
 }
 
 const SENSITIVE_PUBLIC_FIELD = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|credential|authorization|cookie|raw[_-]?response)/i;
@@ -159,19 +142,11 @@ function projectPublicIdentifiers(value, operation, path = "response", depth = 0
   if (!isRecord(value)) return value;
   const projected = {};
   for (const [key, item] of Object.entries(value)) {
-    const field = `${path}.${key}`;
-    if (SENSITIVE_PUBLIC_FIELD.test(key)) throw new CreativeApiError("unavailable", operation, field);
-    let projectedValue;
-    if (isPublicIdentifierField(key) && !(key === "parent_version_id" && item === null)) {
-      projectedValue = publicIdentifier(item, field, operation);
-    } else if (isPublicIdentifierField(key)) {
-      projectedValue = null;
-    } else if (isPublicIdentifierArrayField(key)) {
-      if (!Array.isArray(item)) throw new CreativeApiError("unavailable", operation, field);
-      projectedValue = Object.freeze(item.map((entry, index) => publicIdentifier(entry, `${field}[${index}]`, operation)));
-    } else {
-      projectedValue = projectPublicIdentifiers(item, operation, field, depth + 1);
+    if (SENSITIVE_PUBLIC_FIELD.test(key) || hasSensitivePublicText(key)) {
+      throw new CreativeApiError("unavailable", operation, safeFieldPath(path) || "result");
     }
+    const field = `${path}.${key}`;
+    const projectedValue = projectPublicIdentifiers(item, operation, field, depth + 1);
     Object.defineProperty(projected, key, { value: projectedValue, enumerable: true, writable: false, configurable: false });
   }
   return Object.freeze(projected);
@@ -189,15 +164,11 @@ function assertPublicIdentifiers(value, operation, path = "response", depth = 0)
   }
   if (!isRecord(value)) return;
   for (const [key, item] of Object.entries(value)) {
-    const field = `${path}.${key}`;
-    if (SENSITIVE_PUBLIC_FIELD.test(key)) throw new CreativeApiError("unavailable", operation, field);
-    if (isPublicIdentifierField(key) && !(key === "parent_version_id" && item === null)) {
-      publicIdentifier(item, field, operation);
+    if (SENSITIVE_PUBLIC_FIELD.test(key) || hasSensitivePublicText(key)) {
+      throw new CreativeApiError("unavailable", operation, safeFieldPath(path) || "result");
     }
-    else if (isPublicIdentifierArrayField(key)) {
-      if (!Array.isArray(item)) throw new CreativeApiError("unavailable", operation, field);
-      item.forEach((entry, index) => publicIdentifier(entry, `${field}[${index}]`, operation));
-    } else assertPublicIdentifiers(item, operation, field, depth + 1);
+    const field = `${path}.${key}`;
+    assertPublicIdentifiers(item, operation, field, depth + 1);
   }
 }
 
@@ -441,7 +412,8 @@ function safeDiagnosticRef(value, fallback) {
 function safeFieldPath(value) {
   if (typeof value !== "string" || value.length > 120 ||
     !/^[A-Za-z][A-Za-z0-9_-]*(?:\[\d+\])?(?:\.[A-Za-z][A-Za-z0-9_-]*(?:\[\d+\])?)*$/.test(value) ||
-    /token|secret|credential|password|api[_-]?key|authorization|cookie|bearer/i.test(value)) return "";
+    /token|secret|credential|password|api[_-]?key|authorization|cookie|bearer/i.test(value) ||
+    hasSensitivePublicText(value)) return "";
   return value;
 }
 

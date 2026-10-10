@@ -818,12 +818,18 @@ test("public projection rejects unsafe strings in nested hash-bound metadata and
   const safeHarness = await setup();
   const original = safeHarness.state.designs.get("design-api-1");
   const withSafeMetadata = versionFrom(original, { artifact: { ...original.artifact,
-    extra: JSON.parse('{"palette":"cobalt","treatment":"matte","__proto__":{"surface":"velvet"}}') } });
+    extra: JSON.parse('{"palette":"cobalt","treatment":"matte","vendor_id":42,"render_ref":{"revision":2},"optional_ref":null,"source_id":42,"usage_refs":{"vendor":2},"display":"Basic shapes create a balanced composition.","__proto__":{"surface":"velvet"}}') } });
   safeHarness.state.designs.set(withSafeMetadata.design_version_id, withSafeMetadata);
   const listed = await safeHarness.api.invoke(actor(), request("list", { brief_id: "brief-api-1" }));
   assert.equal(listed.ok, true, JSON.stringify(listed));
   assert.equal(listed.result.items[0].artifact.extra.palette, "cobalt");
   assert.equal(listed.result.items[0].artifact.extra.treatment, "matte");
+  assert.equal(listed.result.items[0].artifact.extra.vendor_id, 42);
+  assert.deepEqual(listed.result.items[0].artifact.extra.render_ref, { revision: 2 });
+  assert.equal(listed.result.items[0].artifact.extra.optional_ref, null);
+  assert.equal(listed.result.items[0].artifact.extra.source_id, 42);
+  assert.deepEqual(listed.result.items[0].artifact.extra.usage_refs, { vendor: 2 });
+  assert.equal(listed.result.items[0].artifact.extra.display, "Basic shapes create a balanced composition.");
   assert.equal(Object.hasOwn(listed.result.items[0].artifact.extra, "__proto__"), true);
   assert.deepEqual(listed.result.items[0].artifact.extra.__proto__, { surface: "velvet" });
   assert.equal(listed.result.items[0].design_hash, withSafeMetadata.design_hash);
@@ -843,6 +849,108 @@ test("public projection rejects unsafe strings in nested hash-bound metadata and
   assert.equal(rejectedCompare.ok, false);
   assert.equal(rejectedCompare.error.code, "unavailable");
   assert.equal(JSON.stringify(rejectedCompare).includes(secret), false);
+});
+
+test("safe additive artifact metadata preserves canonical design identity across generate, replay, list, and compare", async () => {
+  await loadPlans();
+  const safeExtra = JSON.parse('{"vendor_id":42,"render_ref":{"revision":2},"optional_ref":null,"source_id":42,"usage_refs":{"vendor":2},"display":"Basic shapes create a balanced composition."}');
+  const harness = await setup({ withDesign: false });
+  const originalGenerate = harness.ports.provider.generate;
+  harness.ports.provider.generate = async (input) => {
+    const design = await originalGenerate(input);
+    return versionFrom(design, { artifact: { ...design.artifact, extra: structuredClone(safeExtra) } });
+  };
+  const body = generationRequest("safe-additive-metadata-roundtrip");
+  const first = await harness.api.invoke(actor(), body);
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const generated = first.result.design_version;
+  assert.deepEqual(generated.artifact.extra, safeExtra);
+  assert.equal(generated.design_hash, computeDesignVersionHash(generated));
+
+  const replayRequest = structuredClone(body);
+  replayRequest.event_id += ":retry";
+  replayRequest.request_id += ":retry";
+  replayRequest.correlation_id += ":retry";
+  const replay = await harness.api.invoke(actor(), replayRequest);
+  assert.equal(replay.ok, true, JSON.stringify(replay));
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.result.design_version.artifact.extra, safeExtra);
+  assert.equal(replay.result.design_version.design_hash, generated.design_hash);
+
+  const listed = await harness.api.invoke(actor(), request("list", { brief_id: "brief-api-1" }, "safe-additive-metadata-list"));
+  assert.equal(listed.ok, true, JSON.stringify(listed));
+  const listedDesign = listed.result.items.find((item) => item.design_version_id === generated.design_version_id);
+  assert.ok(listedDesign);
+  assert.deepEqual(listedDesign.artifact.extra, safeExtra);
+  assert.equal(listedDesign.design_hash, generated.design_hash);
+
+  const compared = await harness.api.invoke(actor(), request("compare", {
+    brief_id: "brief-api-1", left_design_version_id: generated.design_version_id,
+    right_design_version_id: generated.design_version_id,
+  }, "safe-additive-metadata-compare"));
+  assert.equal(compared.ok, true, JSON.stringify(compared));
+  assert.deepEqual(compared.result.left.artifact.extra, safeExtra);
+  assert.deepEqual(compared.result.right.artifact.extra, safeExtra);
+  assert.equal(compared.result.left.design_hash, generated.design_hash);
+  assert.equal(compared.result.right.design_hash, generated.design_hash);
+});
+
+test("public projection rejects sensitive object keys and Basic credentials without echoing diagnostic paths", async () => {
+  await loadPlans();
+  const privateKey = "sk-abcdefghijklmnopqrstuvwxyz1234";
+  const privateText = "sk-syntheticPublicIdentifierSecret123456789";
+  const basicCredential = "Basic dXNlcjpwYXNzd29yZA==";
+  const cases = [
+    { extra: { nested: { [privateKey]: "cobalt" } }, secrets: [privateKey], field: "result.design.artifact.extra.nested" },
+    { extra: { nested: { "owner@example.test": "cobalt" } }, secrets: ["owner@example.test"], field: "result.design.artifact.extra.nested" },
+    { extra: { nested: { [privateKey]: privateText } }, secrets: [privateKey, privateText], field: "result.design.artifact.extra.nested" },
+    { extra: { display: basicCredential }, secrets: [basicCredential, "dXNlcjpwYXNzd29yZA=="], field: "result.design.artifact.extra.display" },
+  ];
+  const markerAbsent = (response, secrets) => {
+    assert.equal(response.ok, false, JSON.stringify(response));
+    assert.equal(response.error.code, "unavailable");
+    for (const secret of secrets) assert.equal(JSON.stringify(response).includes(secret), false);
+  };
+
+  for (const [index, testCase] of cases.entries()) {
+    const freshHarness = await setup({ withDesign: false });
+    const originalGenerate = freshHarness.ports.provider.generate;
+    freshHarness.ports.provider.generate = async (input) => {
+      const design = await originalGenerate(input);
+      return versionFrom(design, { artifact: { ...design.artifact, extra: structuredClone(testCase.extra) } });
+    };
+    const freshRequest = generationRequest(`public-object-key-fresh-${index}`);
+    const fresh = await freshHarness.api.invoke(actor(), freshRequest);
+    markerAbsent(fresh, testCase.secrets);
+    assert.equal(fresh.error.field, testCase.field);
+    const failedReplay = await freshHarness.api.invoke(actor(), freshRequest);
+    for (const secret of testCase.secrets) assert.equal(JSON.stringify(failedReplay).includes(secret), false);
+
+    const replayHarness = await setup({ withDesign: false });
+    const replayRequest = generationRequest(`public-object-key-replay-${index}`);
+    const completed = await replayHarness.api.invoke(actor(), replayRequest);
+    assert.equal(completed.ok, true, JSON.stringify(completed));
+    const stored = [...replayHarness.state.jobs.values()].find((job) => job.action_id === replayRequest.action_id);
+    const changed = versionFrom(stored.result.design, { artifact: {
+      ...stored.result.design.artifact, extra: structuredClone(testCase.extra),
+    } });
+    replayHarness.state.designs.set(changed.design_version_id, changed);
+    stored.result.design = structuredClone(changed);
+    const replay = structuredClone(replayRequest);
+    replay.event_id += ":retry";
+    replay.request_id += ":retry";
+    replay.correlation_id += ":retry";
+    markerAbsent(await replayHarness.api.invoke(actor(), replay), testCase.secrets);
+
+    const readHarness = await setup();
+    const base = readHarness.state.designs.get("design-api-1");
+    const unsafe = versionFrom(base, { artifact: { ...base.artifact, extra: structuredClone(testCase.extra) } });
+    readHarness.state.designs.set(unsafe.design_version_id, unsafe);
+    markerAbsent(await readHarness.api.invoke(actor(), request("list", { brief_id: "brief-api-1" }, `public-object-key-list-${index}`)), testCase.secrets);
+    markerAbsent(await readHarness.api.invoke(actor(), request("compare", {
+      brief_id: "brief-api-1", left_design_version_id: "design-api-1", right_design_version_id: "design-api-1",
+    }, `public-object-key-compare-${index}`)), testCase.secrets);
+  }
 });
 
 test("provider, approval, and receipt records reject credential-shaped values before exposing them", async () => {
@@ -1481,23 +1589,27 @@ test("job status rejects sensitive stored public references", async () => {
 
 test("typed read-port errors and persisted job diagnostics sanitize field paths and messages", async () => {
   await loadPlans();
-  const marker = "Bearer unsafe-field-token";
-  const typedErrors = [
-    new ContractError("invalid_type", "CreativeBrief", marker, marker),
-    new ApprovalHandoffContractError("approval_invalid", marker, { field: marker }),
-    new MeteringContractError("invalid_reservation", marker, marker),
-    new CreativeApiError("invalid_request", "list", marker),
-  ];
-  for (const [index, typedError] of typedErrors.entries()) {
-    const harness = await setup();
-    harness.ports.storage.getBrief = () => { throw typedError; };
-    const response = await harness.api.invoke(actor(), request("list", { brief_id: "brief-api-1" }, undefined));
-    assert.equal(response.ok, false, `typed error ${index}`);
-    assert.equal(JSON.stringify(response).includes(marker), false, `typed error ${index}`);
-    assert.notEqual(response.error.field, marker);
-    assert.notEqual(response.error.message, marker);
+  const markers = ["Bearer unsafe-field-token", "sk-abcdefghijklmnopqrstuvwxyz1234", "owner@example.test"];
+  for (const marker of markers) {
+    const fieldPath = `input.${marker}`;
+    const typedErrors = [
+      new ContractError("invalid_type", "CreativeBrief", fieldPath, marker),
+      new ApprovalHandoffContractError("approval_invalid", marker, { field: fieldPath }),
+      new MeteringContractError("invalid_reservation", fieldPath, marker),
+      new CreativeApiError("invalid_request", "list", fieldPath),
+    ];
+    for (const [index, typedError] of typedErrors.entries()) {
+      const harness = await setup();
+      harness.ports.storage.getBrief = () => { throw typedError; };
+      const response = await harness.api.invoke(actor(), request("list", { brief_id: "brief-api-1" }, undefined));
+      assert.equal(response.ok, false, `typed error ${marker} ${index}`);
+      assert.equal(JSON.stringify(response).includes(marker), false, `typed error ${marker} ${index}`);
+      assert.notEqual(response.error.field, fieldPath);
+      assert.notEqual(response.error.message, marker);
+    }
   }
 
+  const marker = "Bearer unsafe-field-token";
   const harness = await setup();
   harness.state.jobs.set("job-private-error", {
     job_id: "job-private-error", tenant_id: "tenant-api-1", project_id: "project-api-1",
