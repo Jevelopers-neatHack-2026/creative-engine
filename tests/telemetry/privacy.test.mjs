@@ -78,6 +78,10 @@ test("Basic credentials, signed URLs, email and phone canaries are detected; ord
   assert.equal(containsSensitivePublicText("Basic illustrations support the main headline."), false);
   assert.equal(containsSensitivePublicText("Basic shapes and calm colors."), false);
   assert.equal(containsSensitivePublicText("the bearer of the note has no credential"), false);
+  const oversizedBasic = `Basic ${Buffer.from(`u:${"p".repeat(7_000)}`).toString("base64")}`;
+  assert.ok(oversizedBasic.length > 8_192 && oversizedBasic.length < 64 * 1_024);
+  assert.equal(containsSensitivePublicText(oversizedBasic), true);
+  assert.equal(projectPublicTelemetry({ value: oversizedBasic }).value.value, "[REDACTED]");
   const fixtureCases = fixture.cases;
   for (const value of fixtureCases) {
     const projection = projectPublicTelemetry(value);

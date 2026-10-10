@@ -40,6 +40,12 @@ function evidencePort(events, { failAt = -1 } = {}) {
       stored.push(structuredClone(event));
       return { status: "recorded", event_id: event.event_id };
     },
+    async stagePendingEvidence(event) {
+      events.push(`evidence.stage.${event.event_type}`);
+      const previous = stored.find((item) => item.event_id === event.event_id);
+      if (!previous) stored.push(structuredClone(event));
+      return { status: previous ? "duplicate" : "recorded", event_id: event.event_id };
+    },
   };
 }
 
@@ -65,6 +71,7 @@ function runWithTelemetry(args) {
   return executeCreativeMeteredAttempt({
     observationOutbox: testObservationOutbox(),
     authorizeTransport: async ({ transport_attempt_id }) => `dispatch:${transport_attempt_id}`,
+    revalidateTransport: async () => {},
     ...args,
   });
 }
@@ -118,6 +125,7 @@ test("sanitized evidence is recorded before the C03 reservation, each transport,
       events.push("jobs.authorizeDispatch");
       return `dispatch:${transport_attempt_id}`;
     },
+    revalidateTransport: async () => { events.push("jobs.revalidateDispatch"); },
     dispatch: successfulDispatch(events),
     idFactory: idFactory(),
     clock: () => new Date("2026-10-10T12:00:00.000Z"),
@@ -134,7 +142,8 @@ test("sanitized evidence is recorded before the C03 reservation, each transport,
   assert.ok(events.indexOf("evidence.attempt_intent") < events.indexOf("metering.reserveAttempt"));
   assert.ok(events.indexOf("evidence.transport_intent") < events.indexOf("jobs.authorizeDispatch"));
   assert.ok(events.indexOf("jobs.authorizeDispatch") < events.indexOf("metering.recordTransportAttempt"));
-  assert.ok(events.indexOf("metering.recordTransportAttempt") < events.indexOf("provider.dispatch"));
+  assert.ok(events.indexOf("metering.recordTransportAttempt") < events.indexOf("jobs.revalidateDispatch"));
+  assert.ok(events.indexOf("jobs.revalidateDispatch") < events.indexOf("provider.dispatch"));
   assert.ok(events.indexOf("observation.persist") < events.indexOf("metering.recordUsageObservation"));
   assert.ok(events.indexOf("metering.recordUsageObservation") < events.indexOf("metering.settleReservation"));
 });
@@ -310,6 +319,8 @@ test("post-settlement evidence outage is reported as pending without converting 
   assert.equal(result.outcome.status, "settled");
   assert.equal(result.evidence_delivery, "pending");
   assert.equal(result.pending_evidence.event_type, "attempt_outcome");
+  assert.ok(result.evidence_refs.includes(result.pending_evidence.event_id), "the direct durable retry path staged the outcome");
+  assert.equal(evidence.stored.at(-1).event_type, "attempt_outcome");
   assert.equal(authority.reservationFor("attempt:fixture-001").state, "settled");
 });
 

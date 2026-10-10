@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { canonicalHash, computeDesignVersionHash, ContractError } from "../../src/contracts/index.mjs";
+import { canonicalHash, canonicalSerialize, computeDesignVersionHash, ContractError } from "../../src/contracts/index.mjs";
 import { ApprovalHandoffContractError, createConsumptionReceipt, hashCompositionLayerManifest } from "../../src/contracts/approval-handoff.mjs";
 import { FakeMeteringAuthority } from "../../fixtures/contracts/metering/fake-authority.mjs";
 import { MeteringContractError } from "../../src/contracts/metering.mjs";
@@ -73,6 +73,12 @@ function memoryTelemetryOutbox() {
     events,
     observations,
     async append(event) {
+      const previous = events.get(event.event_id);
+      if (previous && JSON.stringify(previous) !== JSON.stringify(event)) throw new Error("event identity conflict");
+      events.set(event.event_id, structuredClone(event));
+      return { status: previous ? "duplicate" : "recorded", event_id: event.event_id };
+    },
+    async stagePendingEvidence(event) {
       const previous = events.get(event.event_id);
       if (previous && JSON.stringify(previous) !== JSON.stringify(event)) throw new Error("event identity conflict");
       events.set(event.event_id, structuredClone(event));
@@ -191,6 +197,15 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
         if (job.status !== "running") return { status: "lease_lost" };
         if (beforeDispatchAuthorize) await beforeDispatchAuthorize(input);
         if (!contextFenceMatches(input.context_fence)) return { status: "stale_context" };
+        const existing = dispatchIntents.find((intent) => intent.job_id === input.job_id &&
+          intent.transport_attempt_id === input.transport_attempt_id);
+        if (existing) {
+          const sameFence = canonicalSerialize(existing.context_fence) === canonicalSerialize(input.context_fence);
+          const sameAttempt = (existing.billable_attempt_id ?? null) === (input.billable_attempt_id ?? null);
+          return sameFence && sameAttempt
+            ? { status: "authorized", dispatch_intent_ref: existing.dispatch_intent_ref }
+            : { status: "lease_lost" };
+        }
         dispatchIntentCounter += 1;
         const dispatch_intent_ref = `dispatch-intent:${input.job_id}:${dispatchIntentCounter}`;
         dispatchIntents.push({ job_id: input.job_id, transport_attempt_id: input.transport_attempt_id,

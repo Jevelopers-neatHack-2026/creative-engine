@@ -108,6 +108,10 @@ void executeCreativeMeteredAttempt({
   trustedScope: scope,
   modes,
   authorizeTransport: ({ transport_attempt_id }) => `dispatch:${transport_attempt_id}`,
+  revalidateTransport: async ({ transport_attempt_id, dispatch_intent_ref }) => {
+    transport_attempt_id satisfies string;
+    dispatch_intent_ref satisfies string;
+  },
   dispatch: async (context) => {
     context.reservation_ref satisfies string;
     context.transport_attempt_id satisfies string;

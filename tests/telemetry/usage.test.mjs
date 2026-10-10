@@ -113,6 +113,23 @@ test("missing, unsupported, malformed and internally contradictory usage stays u
   assert.ok(contradictory.missing_fields.includes("usage.inconsistent_counts"));
 });
 
+test("reported partial and unknown missing fields are screened without dropping the observation", () => {
+  const partial = create({
+    profile: USAGE_PROFILE.NORMALIZED,
+    usage: { completeness: "partial", input_tokens: 2, missing_fields: ["output_tokens"] },
+    sourceObservationId: "usage:reported-partial",
+  });
+  assert.equal(partial.completeness, "partial");
+  assert.ok(partial.missing_fields.includes("output_tokens"));
+  const unknown = create({
+    profile: "unrecognized/1",
+    usage: { completeness: "unknown", missing_fields: ["output_tokens"] },
+    sourceObservationId: "usage:reported-unknown",
+  });
+  assert.equal(unknown.completeness, "unknown");
+  assert.ok(unknown.missing_fields.includes("output_tokens"));
+});
+
 test("prototype-inherited profile names remain typed unsupported usage instead of throwing", () => {
   for (const profile of ["__proto__", "constructor", "toString"]) {
     const observation = create({ profile, sourceObservationId: `usage:unsupported:${profile}` });

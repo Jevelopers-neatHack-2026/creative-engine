@@ -10,7 +10,7 @@ import { createCreativeApi } from "../../src/api/v1.mjs";
 import { canonicalHash, canonicalSerialize } from "../../src/contracts/index.mjs";
 import { createCreativeVersionApiPorts } from "../../src/versions/api-ports.mjs";
 import { CreativeVersionStore, VersionStoreError } from "../../src/versions/store.mjs";
-import { createSqliteTelemetryOutbox, USAGE_PROFILE } from "../../src/telemetry/index.mjs";
+import { createSqliteTelemetryOutbox, deliverPendingUsageObservations, USAGE_PROFILE } from "../../src/telemetry/index.mjs";
 
 const NOW = Date.parse("2026-10-10T12:30:00.000Z");
 const SCOPE = Object.freeze({ tenant_id: "tenant-api-1", project_id: "project-api-1", brief_id: "brief-api-1" });
@@ -43,7 +43,7 @@ function substituteAttemptIdentity(intentJson) {
   return canonicalSerialize(intent);
 }
 
-function portsFor(store, counters, idFactory) {
+function portsFor(store, counters, idFactory, { leaseDurationMs = 60_000 } = {}) {
   const bytes = Buffer.from("durable exact artwork bytes");
   const hash = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
   const provider = {
@@ -88,7 +88,7 @@ function portsFor(store, counters, idFactory) {
       released_unused_amount: { amount: "0.90", currency: "USD" } }; },
     async markOutcomeUnknown() { return { status: "held_for_reconciliation" }; },
   };
-  const adapted = createCreativeVersionApiPorts({ store, otherPorts: { provider, metering }, idFactory });
+  const adapted = createCreativeVersionApiPorts({ store, otherPorts: { provider, metering }, idFactory, leaseDurationMs });
   return {
     ...adapted.ports,
     telemetry: {
@@ -177,6 +177,177 @@ test("real API invocation commits job, exact artifact bytes, version and selecti
   assert.equal(conflict.ok, false);
   assert.equal(conflict.error.code, "conflict");
   assert.equal(counters.provider, 1, "conflicting action replay must not dispatch again");
+});
+
+test("outcome append failure is durably staged and replayed as pending without another provider attempt", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-version-api-pending-outcome-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const databasePath = join(root, "versions.sqlite");
+  const objectRoot = join(root, "objects");
+  const store = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  t.after(() => store.close());
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief: await fixture("brief") });
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const ports = portsFor(store, counters, () => `pending-outcome-port-${++id}`);
+  const durableOutbox = ports.telemetry.outbox;
+  ports.telemetry.outbox = Object.freeze({
+    ...durableOutbox,
+    async append(event) {
+      if (event.event_type === "attempt_outcome") throw new Error("synthetic single-append failure");
+      return durableOutbox.append(event);
+    },
+  });
+  const api = createCreativeApi({ ports, now: () => NOW, idFactory: () => `pending-outcome-api-${++id}` });
+  const body = request("pending-outcome-action", await fixture("generate-plan"));
+  const result = await api.invoke(actor(), body);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.result.telemetry_evidence.local_status, "pending");
+  assert.equal(result.result.telemetry_evidence.pending_event_staged, true);
+  assert.equal(typeof result.result.telemetry_evidence.pending_event_id, "string");
+  assert.equal("pending_event" in result.result.telemetry_evidence, false);
+  assert.equal(counters.provider, 1);
+  assert.equal(counters.reserved, 1);
+  const eventRows = store.db.prepare("SELECT event_id,event_type,status FROM creative_telemetry_evidence_outbox_v1 ORDER BY rowid").all();
+  assert.deepEqual(eventRows.map((row) => row.event_type), ["attempt_intent", "transport_intent", "attempt_outcome"]);
+  assert.ok(eventRows.every((row) => row.status === "pending"));
+  assert.equal(eventRows[2].event_id, result.result.telemetry_evidence.pending_event_id);
+
+  store.close();
+  const reopened = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  t.after(() => reopened.close());
+  const replayApi = createCreativeApi({ ports: portsFor(reopened, counters, () => `pending-outcome-replay-${++id}`),
+    now: () => NOW, idFactory: () => `pending-outcome-replay-api-${++id}` });
+  const replay = await replayApi.invoke(actor(), { ...body, event_id: "pending-outcome-replay-event",
+    request_id: "pending-outcome-replay-request", correlation_id: "pending-outcome-replay-correlation" });
+  assert.equal(replay.ok, true, JSON.stringify(replay));
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.result.telemetry_evidence.local_status, "pending");
+  assert.equal(replay.result.telemetry_evidence.pending_event_id, result.result.telemetry_evidence.pending_event_id);
+  assert.equal(replay.result.telemetry_evidence.pending_event_staged, true);
+  assert.equal(counters.provider, 1, "replay must not redispatch after staging the outcome");
+  assert.equal(counters.reserved, 1, "replay must not allocate another reservation");
+  const claims = await createSqliteTelemetryOutbox({ database: reopened.db, clock: () => NOW })
+    .claimPendingEvidence({ limit: 3 });
+  assert.ok(claims.records.some((record) => record.event.event_type === "attempt_outcome" &&
+    record.event.event_id === result.result.telemetry_evidence.pending_event_id));
+});
+
+test("final Finance transport acknowledgement is followed by an atomic active-lease fence before provider dispatch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-version-api-transport-ack-expiry-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  let now = NOW;
+  const store = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now: () => now });
+  t.after(() => store.close());
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief: await fixture("brief") });
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const ports = portsFor(store, counters, () => `transport-ack-expiry-port-${++id}`, { leaseDurationMs: 1_000 });
+  const recordTransportAttempt = ports.metering.recordTransportAttempt;
+  let unknownOutcomes = 0;
+  const markOutcomeUnknown = ports.metering.markOutcomeUnknown;
+  ports.metering.recordTransportAttempt = async (input) => {
+    const ack = await recordTransportAttempt(input);
+    now = NOW + 120_000;
+    return ack;
+  };
+  ports.metering.markOutcomeUnknown = async (...args) => {
+    unknownOutcomes += 1;
+    return markOutcomeUnknown(...args);
+  };
+  const api = createCreativeApi({ ports, now: () => now, idFactory: () => `transport-ack-expiry-api-${++id}` });
+  const result = await api.invoke(actor(), request("transport-ack-expiry", await fixture("generate-plan")));
+  assert.equal(result.ok, false);
+  assert.equal(counters.provider, 0, "expired lease after Finance ACK must prevent provider transport");
+  assert.equal(counters.reserved, 1);
+  assert.equal(unknownOutcomes, 1, "uncertain in-flight Finance state remains held for reconciliation");
+  assert.equal(store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, 0);
+});
+
+test("partial provider usage persists an observation before incomplete usage prevents publication", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-version-api-partial-usage-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const store = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now: () => NOW });
+  t.after(() => store.close());
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief: await fixture("brief") });
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const ports = portsFor(store, counters, () => `partial-usage-port-${++id}`);
+  const generate = ports.provider.generate;
+  ports.provider.generate = async (input) => ({ ...await generate(input),
+    usage: { completeness: "partial", input_tokens: 2, missing_fields: ["output_tokens"] } });
+  const api = createCreativeApi({ ports, now: () => NOW, idFactory: () => `partial-usage-api-${++id}` });
+  const result = await api.invoke(actor(), request("partial-usage-action", await fixture("generate-plan")));
+  assert.equal(result.ok, false);
+  assert.equal(counters.provider, 1);
+  assert.equal(counters.reserved, 1);
+  const row = store.db.prepare("SELECT status,payload_json FROM creative_telemetry_observations_v1").get();
+  assert.ok(row, "partial usage is retained even when it cannot authorize publication");
+  const observation = JSON.parse(row.payload_json).observation;
+  assert.equal(observation.completeness, "partial");
+  assert.ok(observation.missing_fields.includes("output_tokens"));
+  assert.equal(store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, 0);
+});
+
+test("late usage after deadline remains a durable observation-only replay with no publication", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-version-api-late-usage-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const store = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now: () => NOW });
+  t.after(() => store.close());
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief: await fixture("brief") });
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const ports = portsFor(store, counters, () => `late-usage-port-${++id}`);
+  const generate = ports.provider.generate;
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, delay, ...args) => originalSetTimeout(callback, delay === 30_000 ? 5 : delay, ...args);
+  let result;
+  try {
+    ports.provider.generate = async (input) => {
+      await input.recordTransportAttempt(input.transport_attempt_id);
+      await new Promise((resolve) => originalSetTimeout(resolve, 20));
+      return { ...await generate({ ...input, recordTransportAttempt: async () => {} }),
+        usage: { completeness: "complete", input_tokens: 9, output_tokens: 4 } };
+    };
+    const api = createCreativeApi({ ports, now: () => NOW, idFactory: () => `late-usage-api-${++id}` });
+    result = await api.invoke(actor(), request("late-usage-action", await fixture("generate-plan")));
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "cancelled");
+  assert.equal(counters.reserved, 1);
+  await new Promise((resolve) => originalSetTimeout(resolve, 40));
+  assert.equal(counters.provider, 1);
+  assert.equal(store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, 0);
+  const row = store.db.prepare("SELECT status,payload_json FROM creative_telemetry_observations_v1").get();
+  assert.ok(row, "usage arriving after abort is durable for later C03 reconciliation");
+  assert.equal(row.status, "pending", "late usage has not been mistaken for an already-confirmed Finance observation");
+  const observation = JSON.parse(row.payload_json).observation;
+  assert.equal(observation.input_tokens, undefined);
+  assert.deepEqual(observation.usage_units.map((unit) => unit.quantity), ["9", "4"]);
+  assert.equal(observation.transport_attempt_id, counters.providerTransportIds[0]);
+
+  store.close();
+  const reopened = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now: () => NOW });
+  t.after(() => reopened.close());
+  const replayed = await deliverPendingUsageObservations({
+    outbox: createSqliteTelemetryOutbox({ database: reopened.db, clock: () => NOW }),
+    trustedScopeForRecord: async () => ({ tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id,
+      budget_scope_id: "budget-api-1" }),
+    meteringPort: {
+      async recordUsageObservation(input) {
+        return { status: "accepted", source_observation_id: input.observation.source_observation_id,
+          effective_billable_attempt_id: input.observation.billable_attempt_id };
+      },
+    },
+  });
+  assert.deepEqual(replayed, { status: "complete", attempted: 1, acknowledged: 1, retained: 0 });
+  assert.equal(counters.provider, 1, "reconciliation replays only the observation, never the provider call");
 });
 
 test("actual API usage profile persists nested provider counts as included subsets without double counting", async (t) => {

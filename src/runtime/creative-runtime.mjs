@@ -432,6 +432,47 @@ function publicJob(job, operation_id) {
   }), job.operation ?? "unknown", "job");
 }
 
+function validateTelemetryEvidenceStatus(value, operation, expected = {}) {
+  if (!isRecord(value)) throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+  assertStoredOnlyKeys(value, ["local_status", "pending_event_id", "pending_event_staged", "pending_event", "pending_event_hash"],
+    operation, "stored_result.telemetry_evidence");
+  if (!["recorded", "duplicate", "pending"].includes(value.local_status)) {
+    throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+  }
+  if (value.local_status !== "pending") {
+    if (value.pending_event_id !== undefined || value.pending_event_staged !== undefined ||
+      value.pending_event !== undefined || value.pending_event_hash !== undefined) {
+      throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+    }
+    return Object.freeze({ local_status: value.local_status });
+  }
+  publicIdentifier(value.pending_event_id, "stored_result.telemetry_evidence.pending_event_id", operation, 256);
+  if (typeof value.pending_event_staged !== "boolean") {
+    throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+  }
+  if (value.pending_event_staged) {
+    if (value.pending_event !== undefined || value.pending_event_hash !== undefined) {
+      throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+    }
+    return Object.freeze({ local_status: "pending", pending_event_id: value.pending_event_id,
+      pending_event_staged: true });
+  }
+  const event = value.pending_event;
+  if (!isRecord(event) || event.schema_version !== "creative.telemetry.evidence/v1" ||
+    event.event_type !== "attempt_outcome" || event.event_id !== value.pending_event_id ||
+    typeof value.pending_event_hash !== "string" || canonicalHash(event) !== value.pending_event_hash ||
+    (expected.tenant_id !== undefined && event.tenant_id !== expected.tenant_id) ||
+    (expected.project_id !== undefined && event.project_id !== expected.project_id) ||
+    (expected.budget_scope_id !== undefined && event.budget_scope_id !== expected.budget_scope_id) ||
+    (expected.logical_operation_id !== undefined && event.logical_operation_id !== expected.logical_operation_id) ||
+    (expected.billable_attempt_id !== undefined && event.billable_attempt_id !== expected.billable_attempt_id)) {
+    throw new CreativeApiError("unavailable", operation, "stored_result.telemetry_evidence");
+  }
+  assertPublicIdentifiers(event, operation, "stored_result.telemetry_evidence.pending_event");
+  return Object.freeze({ local_status: "pending", pending_event_id: value.pending_event_id,
+    pending_event_staged: false, pending_event: event, pending_event_hash: value.pending_event_hash });
+}
+
 function safeDiagnosticRef(value, fallback) {
   return typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,200}$/.test(value) &&
     !hasSensitivePublicText(value) ? value : fallback;
@@ -855,6 +896,7 @@ export function createCreativeApi(options = {}) {
     const telemetry = ports.telemetry;
     if (!isRecord(telemetry) || !isRecord(telemetry.modes) || !isRecord(telemetry.outbox) ||
       typeof telemetry.outbox.append !== "function" ||
+      typeof telemetry.outbox.stagePendingEvidence !== "function" ||
       typeof telemetry.outbox.enqueueUsageObservation !== "function") {
       throw new CreativeApiError("unavailable", request.operation, "telemetry", { retryable: true });
     }
@@ -899,9 +941,37 @@ export function createCreativeApi(options = {}) {
       dispatchIntentRefs.set(transportAttemptId, intentRef);
       return intentRef;
     };
+    const revalidateTransport = async ({ transport_attempt_id, billable_attempt_id, dispatch_intent_ref, signal }) => {
+      boundedString(transport_attempt_id, "transport_attempt_id", 256);
+      if (billable_attempt_id !== attempt.billable_attempt_id || signal?.aborted || deadline.signal.aborted) {
+        throw new CreativeApiError("cancelled", request.operation, "dispatch_authorization");
+      }
+      await checkDispatchFence();
+      if (signal?.aborted || deadline.signal.aborted) {
+        throw new CreativeApiError("cancelled", request.operation, "dispatch_authorization");
+      }
+      let freshIntentRef;
+      try {
+        // This atomic, idempotent authorization is intentionally the final
+        // awaited fence after the external Finance ACK and before dispatch.
+        freshIntentRef = await authorizeJobDispatch(principal, request, started, transport_attempt_id,
+          billable_attempt_id, contextFence);
+      } catch (error) {
+        preDispatchError = error;
+        throw error;
+      }
+      if (freshIntentRef !== dispatch_intent_ref || signal?.aborted || deadline.signal.aborted) {
+        const error = new CreativeApiError(signal?.aborted || deadline.signal.aborted ? "cancelled" : "stale_version",
+          request.operation, "dispatch_authorization");
+        preDispatchError = error;
+        throw error;
+      }
+      dispatchIntentRefs.set(transport_attempt_id, freshIntentRef);
+    };
     let outcome;
     let evidenceRefs = [];
     let observationRef;
+    let telemetryEvidence;
     try {
       const telemetryResult = await executeCreativeMeteredAttempt({
       meteringPort: metering,
@@ -914,6 +984,7 @@ export function createCreativeApi(options = {}) {
       clock: () => new Date(now()),
       signal: deadline.signal,
       authorizeTransport: async ({ transport_attempt_id }) => authorizeTransport(transport_attempt_id),
+      revalidateTransport,
       dispatch: async (dispatchContext) => {
         const transportAttemptId = dispatchContext.transport_attempt_id;
         const dispatch_intent_ref = dispatchContext.dispatch_intent_ref;
@@ -955,6 +1026,15 @@ export function createCreativeApi(options = {}) {
       outcome = telemetryResult.outcome;
       evidenceRefs = telemetryResult.evidence_refs;
       observationRef = telemetryResult.observation_ref;
+      if (telemetryResult.pending_evidence) {
+        const event = telemetryResult.pending_evidence;
+        const staged = evidenceRefs.includes(event.event_id);
+        telemetryEvidence = Object.freeze({ local_status: "pending", pending_event_id: event.event_id,
+          pending_event_staged: staged,
+          ...(!staged ? { pending_event: event, pending_event_hash: canonicalHash(event) } : {}) });
+      } else {
+        telemetryEvidence = Object.freeze({ local_status: telemetryResult.evidence_delivery });
+      }
     } finally {
       deadline.dispose();
     }
@@ -965,7 +1045,7 @@ export function createCreativeApi(options = {}) {
     return { value: providerValue, attempt_id: attemptId, decision_request: validatedDecisionRequest,
       metering: outcome, transport_attempt_ids: Object.freeze([...dispatchIntentRefs.keys()]),
       usage_ref: observationRef ?? outcome.observation_ack?.source_observation_id,
-      evidence_refs: Object.freeze([...(evidenceRefs ?? [])]) };
+      evidence_refs: Object.freeze([...(evidenceRefs ?? [])]), telemetry_evidence: telemetryEvidence };
   }
 
   function decisionInput(decisionRequest, principal, request, brief, started) {
@@ -1196,6 +1276,7 @@ export function createCreativeApi(options = {}) {
     const usageRefs = typeof metered.usage_ref === "string"
       ? [publicIdentifier(metered.usage_ref, "usage_ref", operation, 256)] : [];
     return { design, artifact_bytes: artifactBytes,
+      telemetry_evidence: metered.telemetry_evidence,
       creation_evidence: { transport_attempt_ids: [...metered.transport_attempt_ids], provider_request_ids: providerRequestIds,
         usage_refs: usageRefs, evidence_refs: [...metered.evidence_refs] },
       usage: { completeness: usage.completeness ?? "unknown" }, attempt_id: metered.attempt_id };
@@ -1267,7 +1348,8 @@ export function createCreativeApi(options = {}) {
         brief_id: brief.brief_id, design_version_id: design.design_version_id,
         artifact_id: design.artifact.artifact_id, artifact_hash: design.artifact.content_hash,
         design_hash: design.design_hash, inspection_id: result.inspection_id,
-        observations: Object.freeze(observations), usage: inspectionUsage });
+        observations: Object.freeze(observations), usage: inspectionUsage,
+        telemetry_evidence: metered.telemetry_evidence });
       const output = { inspection, attempt_id: metered.attempt_id };
       const job = await publish(principal, request, started, output, async () => undefined, {
         brief_id: brief.brief_id, brief_hash: canonicalHash(brief),
@@ -1360,7 +1442,9 @@ export function createCreativeApi(options = {}) {
         if (!isRecord(saved) || saved.status !== "saved") throw new CreativeApiError("stale_version", operation);
       }, creativeContextFence(brief, baseDesign, branchMode ? undefined : (baseDesign?.design_version_id ?? null)));
       return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse", schema_version: CREATIVE_API_VERSION,
-        operation_id: job.job_id, job: publicJob(job, job.job_id), result: Object.freeze({ design_version: output.design, usage: output.usage }) }), operation);
+        operation_id: job.job_id, job: publicJob(job, job.job_id), result: Object.freeze({
+          design_version: output.design, usage: output.usage, telemetry_evidence: output.telemetry_evidence,
+        }) }), operation);
     }
     if (operation === "restore") {
       const brief = await loadBrief(scope, payload.brief_id, operation);
@@ -1508,7 +1592,7 @@ export function createCreativeApi(options = {}) {
       throw new CreativeApiError("unavailable", request.operation, "stored_result");
     }
     if (["generate", "edit"].includes(request.operation)) {
-      assertStoredOnlyKeys(job.result, ["design", "usage", "attempt_id"], request.operation, "stored_result");
+      assertStoredOnlyKeys(job.result, ["design", "usage", "attempt_id", "telemetry_evidence"], request.operation, "stored_result");
       const brief = await loadBrief(started.scope, request.payload.brief_id, request.operation);
       const stored = validateDesignVersion(job.result.design, {
         trustedScope: { ...started.scope, design_version_id: job.result.design?.design_version_id },
@@ -1516,10 +1600,15 @@ export function createCreativeApi(options = {}) {
       });
       const current = await loadDesign(started.scope, brief, stored.design_version_id, request.operation);
       if (canonicalSerialize(stored) !== canonicalSerialize(current) || !isRecord(job.result.usage) ||
-        job.result.usage.completeness !== "complete" || typeof job.result.attempt_id !== "string") {
+        job.result.usage.completeness !== "complete" || job.result.attempt_id !== current.billable_attempt_id) {
         throw new CreativeApiError("unavailable", request.operation, "stored_result");
       }
-      return Object.freeze({ design_version: current, usage: Object.freeze({ completeness: "complete" }) });
+      const telemetryEvidence = validateTelemetryEvidenceStatus(job.result.telemetry_evidence, request.operation, {
+        tenant_id: principal.tenant_id, project_id: principal.project_id, budget_scope_id: principal.budget_scope_id,
+        logical_operation_id: request.action_id, billable_attempt_id: current.billable_attempt_id,
+      });
+      return Object.freeze({ design_version: current, usage: Object.freeze({ completeness: "complete" }),
+        telemetry_evidence: telemetryEvidence });
     }
     if (request.operation === "restore") {
       assertStoredOnlyKeys(job.result, ["selection"], request.operation, "stored_result");
@@ -1549,7 +1638,7 @@ export function createCreativeApi(options = {}) {
       const result = job.result.inspection;
       if (!isRecord(result)) throw new CreativeApiError("unavailable", request.operation, "stored_inspection");
       assertStoredOnlyKeys(result, ["tenant_id", "project_id", "brief_id", "design_version_id", "artifact_id", "artifact_hash",
-        "design_hash", "inspection_id", "observations", "usage"], request.operation, "stored_inspection");
+        "design_hash", "inspection_id", "observations", "usage", "telemetry_evidence"], request.operation, "stored_inspection");
       if (result.tenant_id !== principal.tenant_id || result.project_id !== principal.project_id || result.brief_id !== brief.brief_id ||
         result.design_version_id !== design.design_version_id || result.artifact_id !== design.artifact.artifact_id ||
         result.artifact_hash !== design.artifact.content_hash || result.design_hash !== design.design_hash ||
@@ -1590,10 +1679,15 @@ export function createCreativeApi(options = {}) {
       });
       if (typeof started.job.result.attempt_id !== "string") throw new CreativeApiError("unavailable", request.operation, "stored_inspection");
       publicIdentifier(result.inspection_id, "stored_inspection.inspection_id", request.operation, 256);
+      const telemetryEvidence = validateTelemetryEvidenceStatus(result.telemetry_evidence, request.operation, {
+        tenant_id: principal.tenant_id, project_id: principal.project_id, budget_scope_id: principal.budget_scope_id,
+        logical_operation_id: request.action_id, billable_attempt_id: started.job.result.attempt_id,
+      });
       return Object.freeze({ tenant_id: result.tenant_id, project_id: result.project_id, brief_id: result.brief_id,
         design_version_id: result.design_version_id, artifact_id: result.artifact_id,
         artifact_hash: result.artifact_hash, design_hash: result.design_hash,
-        inspection_id: result.inspection_id, observations: Object.freeze(observations), usage: normalizedUsage });
+        inspection_id: result.inspection_id, observations: Object.freeze(observations), usage: normalizedUsage,
+        telemetry_evidence: telemetryEvidence });
     }
     if (request.operation === "handoff") {
       assertStoredOnlyKeys(job.result, ["handoff", "receipt", "handoff_created_at"], request.operation, "stored_result");

@@ -84,7 +84,11 @@ function hasBasicAuthMaterial(value) {
   while ((match = BASIC_AUTH_CANDIDATE.exec(candidate)) !== null) {
     const token = match[1];
     const unpadded = token.replace(/=+$/, "");
-    if (unpadded.length % 4 === 1 || token.length > MAX_BASIC_AUTH_TOKEN_CHARS) continue;
+    // Once a value is syntactically a Basic credential candidate, an
+    // over-limit token is ambiguous and must fail closed rather than escaping
+    // screening solely because it exceeded the decoder budget.
+    if (token.length > MAX_BASIC_AUTH_TOKEN_CHARS) return true;
+    if (unpadded.length % 4 === 1) continue;
     const decoded = Buffer.from(token, "base64");
     const canonical = decoded.toString("base64");
     if (canonical !== token && canonical.replace(/=+$/, "") !== token) continue;

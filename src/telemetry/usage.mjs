@@ -5,7 +5,7 @@ import {
   validateUsageObservation,
 } from "../contracts/metering.mjs";
 import { canonicalSerialize } from "../contracts/validation.mjs";
-import { assertSafePublicIdentifier, containsSensitivePublicText } from "./privacy.mjs";
+import { assertSafePublicIdentifier, containsSensitivePublicText, isSensitivePublicField } from "./privacy.mjs";
 
 export const USAGE_PROFILE = Object.freeze({
   NORMALIZED: "creative.normalized-token-usage/1",

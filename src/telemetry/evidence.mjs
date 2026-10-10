@@ -1,4 +1,5 @@
-import { executeMeteredAttempt, MeteringContractError, validateMeteredAttempt } from "../contracts/metering.mjs";
+import { executeMeteredAttempt, MeteringContractError, validateMeteredAttempt, validateUsageObservation } from "../contracts/metering.mjs";
+import { canonicalSerialize } from "../contracts/validation.mjs";
 import { assertSafePublicIdentifier, isSensitivePublicField, projectPublicTelemetry, TelemetryPrivacyError } from "./privacy.mjs";
 
 export const CREATIVE_TELEMETRY_SCHEMA = "creative.telemetry.evidence/v1";
@@ -223,14 +224,22 @@ function bindMeteringPort(port, capture, { observationOutbox, attempt, trustedSc
           if (!input || input.observation === undefined || typeof observationOutbox?.enqueueUsageObservation !== "function") {
             throw new TelemetryBoundaryError("usage_observation_outbox_unavailable");
           }
-          try {
-            enqueuedObservation = await observationOutbox.enqueueUsageObservation({
-              attempt,
-              trustedScope,
-              observation: input.observation,
-            });
-          } catch {
-            throw new TelemetryBoundaryError("usage_observation_persist_failed");
+          const alreadyStaged = capture.observationRef && capture.observation &&
+            capture.observation.source_observation_id === input.observation.source_observation_id &&
+            canonicalSerialize(capture.observation) === canonicalSerialize(input.observation);
+          if (alreadyStaged) {
+            enqueuedObservation = { status: "duplicate", record_ref: capture.observationRef,
+              source_observation_id: input.observation.source_observation_id };
+          } else {
+            try {
+              enqueuedObservation = await observationOutbox.enqueueUsageObservation({
+                attempt,
+                trustedScope,
+                observation: input.observation,
+              });
+            } catch {
+              throw new TelemetryBoundaryError("usage_observation_persist_failed");
+            }
           }
           if (enqueuedObservation === null || typeof enqueuedObservation !== "object" ||
             !["recorded", "duplicate"].includes(enqueuedObservation.status) ||
@@ -360,6 +369,7 @@ export async function executeCreativeMeteredAttempt({
   trustedScope,
   modes,
   authorizeTransport,
+  revalidateTransport,
   dispatch,
   idFactory = () => globalThis.crypto.randomUUID(),
   clock = () => new Date(),
@@ -370,6 +380,7 @@ export async function executeCreativeMeteredAttempt({
   const evidence = evidencePort(rawEvidencePort);
   const safeModes = validateModes(modes);
   if (typeof dispatch !== "function" || typeof authorizeTransport !== "function" ||
+    typeof revalidateTransport !== "function" ||
     typeof observationOutbox?.enqueueUsageObservation !== "function" ||
     typeof idFactory !== "function" || typeof clock !== "function") {
     throw new TelemetryBoundaryError("invalid_execution_input");
@@ -447,6 +458,21 @@ export async function executeCreativeMeteredAttempt({
     await context.recordTransportAttempt(safeTransportId);
     assertTransportActive(context.signal ?? signal);
     assertTransportActive(signal);
+    try {
+      await revalidateTransport(Object.freeze({
+        attempt: deepFreeze(structuredClone(attempt)),
+        logical_operation_id: attempt.logical_operation_id,
+        billable_attempt_id: attempt.billable_attempt_id,
+        reservation_ref: context.reservation_ref,
+        transport_attempt_id: safeTransportId,
+        dispatch_intent_ref: dispatchIntentRef,
+        signal: context.signal ?? signal,
+      }));
+    } catch {
+      throw new TelemetryBoundaryError("dispatch_fence_unavailable");
+    }
+    assertTransportActive(context.signal ?? signal);
+    assertTransportActive(signal);
     authorizedTransports.set(safeTransportId, dispatchIntentRef);
     return Object.freeze({ transport_attempt_id: safeTransportId, dispatch_intent_ref: dispatchIntentRef });
   };
@@ -467,7 +493,37 @@ export async function executeCreativeMeteredAttempt({
     });
     assertTransportActive(context.signal ?? signal);
     assertTransportActive(signal);
-    return dispatch(wrapped);
+    const result = await dispatch(wrapped);
+    if (result && typeof result === "object" && result.usage_observation !== undefined) {
+      let observation;
+      try {
+        const safeObservation = projectPublicTelemetry(result.usage_observation);
+        if (safeObservation.redactions.length !== 0 ||
+          canonicalSerialize(safeObservation.value) !== canonicalSerialize(result.usage_observation)) {
+          throw new Error("unsafe observation");
+        }
+        observation = validateUsageObservation(safeObservation.value, attempt);
+        if (observation.transport_attempt_id !== undefined && !transportIds.has(observation.transport_attempt_id)) {
+          throw new Error("unreported transport");
+        }
+      } catch {
+        throw new TelemetryBoundaryError("usage_observation_invalid");
+      }
+      let persisted;
+      try {
+        persisted = await observationOutbox.enqueueUsageObservation({ attempt, trustedScope, observation });
+      } catch {
+        throw new TelemetryBoundaryError("usage_observation_persist_failed");
+      }
+      if (!persisted || !["recorded", "duplicate"].includes(persisted.status) ||
+        typeof persisted.record_ref !== "string" || persisted.source_observation_id !== observation.source_observation_id) {
+        throw new TelemetryBoundaryError("invalid_usage_observation_persist_ack");
+      }
+      captured.observation = observation;
+      captured.observationRef = persisted.record_ref;
+      return Object.freeze({ ...result, usage_observation: observation });
+    }
+    return result;
   };
 
   let outcome;
@@ -520,6 +576,16 @@ export async function executeCreativeMeteredAttempt({
     persistedEvidenceRefs.push(outcomeEvent.event_id);
   } catch {
     // The caller may persist this sanitized event for replay after a telemetry outage.
+    if (outcomeEvent && typeof evidence.stagePendingEvidence === "function") {
+      try {
+        const staged = await evidence.stagePendingEvidence(outcomeEvent);
+        if (staged && ["recorded", "duplicate"].includes(staged.status) && staged.event_id === outcomeEvent.event_id) {
+          persistedEvidenceRefs.push(outcomeEvent.event_id);
+        }
+      } catch {
+        // A failed retry stays visible as pending and is carried with the job result.
+      }
+    }
   }
   return Object.freeze({
     outcome: publicMeteringOutcome(outcome),

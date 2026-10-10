@@ -101,6 +101,11 @@ export interface TelemetryEvidencePort {
     status: "recorded" | "duplicate";
     event_id: string;
   }>;
+  /** Durable local retry path for an outcome event whose first append failed. */
+  stagePendingEvidence?(event: CreativeTelemetryEvidence): Promise<{
+    status: "recorded" | "duplicate";
+    event_id: string;
+  }>;
 }
 export type DeepReadonly<T> = T extends (...args: never[]) => unknown
   ? T
@@ -143,6 +148,15 @@ export declare function executeCreativeMeteredAttempt(args: {
     transport_attempt_id: string;
     signal?: AbortSignal;
   }>): Promise<string> | string;
+  revalidateTransport(input: Readonly<{
+    attempt: DeepReadonly<MeteredAttemptRequest>;
+    logical_operation_id: string;
+    billable_attempt_id: string;
+    reservation_ref: string;
+    transport_attempt_id: string;
+    dispatch_intent_ref: string;
+    signal?: AbortSignal;
+  }>): Promise<void> | void;
   dispatch(context: MeteredDispatchWithEvidenceContext): Promise<{
     provider_outcome?: "succeeded" | "failed" | "partial" | "unknown";
     usage_observation?: UsageObservation;
@@ -220,6 +234,10 @@ export interface SqliteTelemetryEvidenceClaim {
 
 export interface SqliteTelemetryOutbox {
   append(event: CreativeTelemetryEvidence): Promise<{
+    readonly status: "recorded" | "duplicate";
+    readonly event_id: string;
+  }>;
+  stagePendingEvidence(event: CreativeTelemetryEvidence): Promise<{
     readonly status: "recorded" | "duplicate";
     readonly event_id: string;
   }>;

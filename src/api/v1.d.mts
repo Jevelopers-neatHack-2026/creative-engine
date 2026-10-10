@@ -21,7 +21,7 @@ import type {
   MeteredDispatchContext,
   MeteringPort,
 } from "../contracts/metering.mjs";
-import type { CreativeTelemetryConfiguration } from "../telemetry/index.mjs";
+import type { CreativeTelemetryConfiguration, CreativeTelemetryEvidence } from "../telemetry/index.mjs";
 
 export type CreativeOperation =
   | "generate" | "edit" | "inspect" | "list" | "compare" | "restore" | "cancel" | "handoff" | "job.status";
@@ -369,6 +369,15 @@ export interface StructuredObservation {
   source_ref?: string;
 }
 
+export interface CreativeTelemetryEvidenceStatus {
+  readonly local_status: "recorded" | "duplicate" | "pending";
+  readonly pending_event_id?: string;
+  readonly pending_event_staged?: boolean;
+  /** Present only when the durable outbox retry path was unavailable. */
+  readonly pending_event?: CreativeTelemetryEvidence;
+  readonly pending_event_hash?: string;
+}
+
 export interface InspectionOutput {
   tenant_id: string;
   project_id: string;
@@ -380,10 +389,11 @@ export interface InspectionOutput {
   inspection_id: string;
   observations: StructuredObservation[];
   usage?: ProviderUsageRecord;
+  telemetry_evidence: CreativeTelemetryEvidenceStatus;
 }
 
 export type CreativeApiResult =
-  | { design_version: DesignVersion; usage: UsageRecord }
+  | { design_version: DesignVersion; usage: UsageRecord; telemetry_evidence: CreativeTelemetryEvidenceStatus }
   | InspectionOutput
   | { items: DesignVersion[]; next_cursor: string | null }
   | { left: DesignVersion; right: DesignVersion; changed_fields: readonly string[] }

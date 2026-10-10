@@ -371,6 +371,32 @@ export function createSqliteTelemetryOutbox({
       });
     },
 
+    /** Retry a sanitized outcome append through a direct durable queue path. */
+    async stagePendingEvidence(rawEvent) {
+      assertOutermostCommitBoundary(database);
+      const event = normalizeEvent(rawEvent).payloadValue;
+      const now = nowMilliseconds(clock);
+      return withTransaction(database, () => {
+        const existing = database.prepare(`SELECT payload_sha256, tenant_id, project_id, budget_scope_id FROM ${EVIDENCE_TABLE} WHERE event_id = ?`)
+          .get(event.event_id);
+        const payloadHash = canonicalHash(event);
+        if (existing) {
+          if (existing.payload_sha256 !== payloadHash.slice("sha256:".length) || existing.tenant_id !== event.tenant_id ||
+            existing.project_id !== event.project_id || existing.budget_scope_id !== event.budget_scope_id) {
+            throw boundary("evidence_identity_conflict");
+          }
+          return Object.freeze({ status: "duplicate", event_id: event.event_id });
+        }
+        const payloadJson = canonicalSerialize(event);
+        database.prepare(`INSERT INTO ${EVIDENCE_TABLE}
+          (event_id, tenant_id, project_id, budget_scope_id, event_type, payload_json, payload_sha256, status, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+          .run(event.event_id, event.tenant_id, event.project_id, event.budget_scope_id,
+            event.event_type, payloadJson, payloadHash.slice("sha256:".length), now);
+        return Object.freeze({ status: "recorded", event_id: event.event_id });
+      });
+    },
+
     /** Persist one exact C03 pair; same source identity and payload is idempotent. */
     async enqueueUsageObservation(input) {
       assertOutermostCommitBoundary(database);
