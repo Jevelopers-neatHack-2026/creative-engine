@@ -113,6 +113,15 @@ test("missing, unsupported, malformed and internally contradictory usage stays u
   assert.ok(contradictory.missing_fields.includes("usage.inconsistent_counts"));
 });
 
+test("prototype-inherited profile names remain typed unsupported usage instead of throwing", () => {
+  for (const profile of ["__proto__", "constructor", "toString"]) {
+    const observation = create({ profile, sourceObservationId: `usage:unsupported:${profile}` });
+    assert.equal(observation.completeness, "unknown", profile);
+    assert.equal(observation.usage_units, undefined, profile);
+    assert.ok(observation.missing_fields.includes("usage_profile_unsupported"), profile);
+  }
+});
+
 test("unsafe provider request identity is omitted and reported as missing", () => {
   const observation = create({
     usage: { ...fixture.openai_image_edit_gpt_image_1_documented_shape, provider_request_id: "Bearer synthetic-not-real-token" },

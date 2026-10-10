@@ -281,16 +281,24 @@ function selectClaimable(database, table, limit, now, leaseUntil, idFactory, kin
   const keyField = table === EVIDENCE_TABLE ? "event_id" : "record_ref";
   const claimUpdate = database.prepare(`
     UPDATE ${table}
-    SET status = 'claimed', claim_token_sha256 = ?, lease_expires_at = ?, claim_count = claim_count + 1
-    WHERE ${keyField} = ? AND status = 'pending'
+    SET status = 'claimed', claim_token_sha256 = ?, lease_expires_at = ?, claim_count = ?
+    WHERE ${keyField} = ? AND status = 'pending' AND claim_count = ?
   `);
   const tokenHashes = new Set();
   return rows.map((row) => {
-    const token = nextSafeId(idFactory, `${kind}_claim`);
+    const generation = row.claim_count + 1;
+    if (!Number.isSafeInteger(row.claim_count) || row.claim_count < 0 || !Number.isSafeInteger(generation)) {
+      throw boundary("claim_generation_invalid");
+    }
+    // claim_count is durable per-record fencing state. A repeated host
+    // idFactory value therefore cannot recreate a token from an older lease.
+    const hostIdentity = nextSafeId(idFactory, `${kind}_claim`);
+    const tokenSeed = JSON.stringify([kind, row[keyField], generation, hostIdentity]);
+    const token = `claim:${createHash("sha256").update(tokenSeed, "utf8").digest("hex")}`;
     const tokenHash = hashClaimToken(token);
     if (tokenHashes.has(tokenHash)) throw boundary("duplicate_claim_identity");
     tokenHashes.add(tokenHash);
-    const changed = claimUpdate.run(tokenHash, leaseUntil, row[keyField]).changes;
+    const changed = claimUpdate.run(tokenHash, leaseUntil, generation, row[keyField], row.claim_count).changes;
     if (changed !== 1) throw boundary("claim_conflict");
     const payload = decode(row);
     return Object.freeze({ ...payload, record_ref: row[keyField], claim_token: token });

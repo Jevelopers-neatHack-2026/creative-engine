@@ -153,6 +153,53 @@ test("SQLite outbox snapshots evidence and C03 observations, fences claims, and 
   reopenedDb.close();
 });
 
+test("durable claim generations fence stale acknowledgements when the host id factory repeats after restart", async (t) => {
+  const path = await temporaryDatabase(t);
+  let now = 20_000;
+  const repeatedIdFactory = (kind) => `stable:${kind}`;
+  const firstDb = openDatabase(path);
+  const first = createSqliteTelemetryOutbox({ database: firstDb, clock: () => now, claimLeaseMs: 100,
+    idFactory: repeatedIdFactory });
+  await first.append(makeEvent("event:repeated-claim-id"));
+  const source = makeObservation({ sourceObservationId: "usage:repeated-claim-id" });
+  const queued = await first.enqueueUsageObservation({ ...source, trustedScope });
+  const oldEvidence = (await first.claimPendingEvidence({ limit: 1 })).records[0];
+  const oldObservation = (await first.claimPending({ limit: 1 })).records[0];
+  firstDb.close();
+
+  now += 101;
+  const reopenedDb = openDatabase(path);
+  const reopened = createSqliteTelemetryOutbox({ database: reopenedDb, clock: () => now, claimLeaseMs: 100,
+    idFactory: repeatedIdFactory });
+  const newEvidence = (await reopened.claimPendingEvidence({ limit: 1 })).records[0];
+  const newObservation = (await reopened.claimPending({ limit: 1 })).records[0];
+  assert.notEqual(newEvidence.claim_token, oldEvidence.claim_token);
+  assert.notEqual(newObservation.claim_token, oldObservation.claim_token);
+  assert.deepEqual(await reopened.acknowledgeEvidence({
+    event_id: "event:repeated-claim-id", claim_token: oldEvidence.claim_token,
+  }), { status: "lease_lost", event_id: "event:repeated-claim-id" });
+  assert.deepEqual(await reopened.acknowledge({
+    record_ref: queued.record_ref,
+    claim_token: oldObservation.claim_token,
+    source_observation_id: "usage:repeated-claim-id",
+    effective_billable_attempt_id: "attempt:fixture-001",
+    authority_status: "accepted",
+  }), { status: "mismatch", source_observation_id: "usage:repeated-claim-id" });
+  assert.deepEqual(await reopened.acknowledgeEvidence({
+    event_id: "event:repeated-claim-id", claim_token: newEvidence.claim_token,
+  }), { status: "acknowledged", event_id: "event:repeated-claim-id" });
+  assert.deepEqual(await reopened.acknowledge({
+    record_ref: queued.record_ref,
+    claim_token: newObservation.claim_token,
+    source_observation_id: "usage:repeated-claim-id",
+    effective_billable_attempt_id: "attempt:fixture-001",
+    authority_status: "duplicate",
+  }), { status: "acknowledged", source_observation_id: "usage:repeated-claim-id" });
+  assert.equal((await reopened.status("evidence", "event:repeated-claim-id")).claim_count, 2);
+  assert.equal((await reopened.status("observation", queued.record_ref)).claim_count, 2);
+  reopenedDb.close();
+});
+
 test("SQLite claims serialize across independent processes so one worker owns each row", async (t) => {
   const path = await temporaryDatabase(t);
   const database = openDatabase(path);

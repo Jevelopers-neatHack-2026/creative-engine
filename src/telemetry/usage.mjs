@@ -101,7 +101,7 @@ function validateAttemptSafely(rawAttempt, trustedScope) {
 }
 
 function unsupportedProfileReason(profile, attempt) {
-  if (!PROFILE_FIELDS[profile]) return "usage_profile_unsupported";
+  if (typeof profile !== "string" || !Object.hasOwn(PROFILE_FIELDS, profile)) return "usage_profile_unsupported";
   if (profile === USAGE_PROFILE.OPENAI_GPT_IMAGE_1 &&
     (attempt.provider.name.toLowerCase() !== "openai" || attempt.provider.model !== "gpt-image-1")) {
     return "usage_profile_model_unverified";
