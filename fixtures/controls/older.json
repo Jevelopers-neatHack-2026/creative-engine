@@ -1,0 +1,169 @@
+{
+  "evidence_mode": "mock",
+  "schema": {
+    "schema_version": "creative-controls/1.0",
+    "contract_status": "local-consumer-proposal",
+    "tenant_id": "fixture_tenant",
+    "project_id": "fixture_project",
+    "brief_id": "brief_fixture",
+    "expected_versions": {
+      "brief": "brief_v1",
+      "design": "design_v1",
+      "composition": "composition_v1"
+    },
+    "controls": [
+      {
+        "id": "c01",
+        "label": "Name size",
+        "kind": "select",
+        "value_type": "string",
+        "field": "name_size",
+        "route": "composition.update",
+        "options": [
+          {
+            "value": "small",
+            "label": "Small"
+          },
+          {
+            "value": "medium",
+            "label": "Medium"
+          },
+          {
+            "value": "large",
+            "label": "Large"
+          }
+        ],
+        "default_value": "medium",
+        "locked": false
+      },
+      {
+        "id": "c02",
+        "label": "Layout",
+        "kind": "select",
+        "value_type": "string",
+        "field": "layout",
+        "route": "composition.update",
+        "options": [
+          {
+            "value": "centered",
+            "label": "Centered"
+          },
+          {
+            "value": "stacked",
+            "label": "Stacked"
+          }
+        ],
+        "default_value": "centered",
+        "locked": false
+      },
+      {
+        "id": "c03",
+        "label": "Approved logo position",
+        "kind": "select",
+        "value_type": "string",
+        "field": "logo_position",
+        "route": "composition.update",
+        "options": [
+          {
+            "value": "top",
+            "label": "Top"
+          },
+          {
+            "value": "bottom",
+            "label": "Bottom"
+          }
+        ],
+        "default_value": "top",
+        "locked": true,
+        "asset_id": "fixture_approved_logo"
+      },
+      {
+        "id": "c04",
+        "label": "Artwork style",
+        "kind": "select",
+        "value_type": "string",
+        "field": "style",
+        "route": "artwork.edit",
+        "options": [
+          {
+            "value": "calm",
+            "label": "Calm"
+          },
+          {
+            "value": "vibrant",
+            "label": "Vibrant"
+          }
+        ],
+        "default_value": "calm",
+        "locked": false
+      }
+    ],
+    "follow_up_questions": [
+      {
+        "id": "q01",
+        "label": "Stacked layout emphasis",
+        "field": "layout_emphasis",
+        "route": "composition.update",
+        "when": {
+          "control_id": "c02",
+          "value": "stacked"
+        },
+        "required": true,
+        "locked": false,
+        "options": [
+          {
+            "value": "balanced",
+            "label": "Balanced"
+          },
+          {
+            "value": "name",
+            "label": "Name"
+          }
+        ],
+        "default_value": "balanced"
+      }
+    ],
+    "submit_intent": "apply",
+    "approval": false,
+    "purchase": false
+  },
+  "control_reference": {
+    "contract": "DesignControlSchema",
+    "schema_version": "1.0",
+    "tenant_id": "fixture_tenant",
+    "project_id": "fixture_project",
+    "control_contract": "creative-controls",
+    "control_schema_version": "1.0",
+    "expected_versions": {
+      "brief": "brief_v1",
+      "design": "design_v1",
+      "composition": "composition_v1"
+    },
+    "control_schema_hash": "sha256:ac0b7dae103804f6a80e5e40ff458460b8da293a1dde86c8a42ce1a76148778b"
+  },
+  "action": {
+    "action_version": "creative-apply/1.0",
+    "schema_version": "creative-controls/1.0",
+    "action_id": "fixture_older",
+    "tenant_id": "fixture_tenant",
+    "project_id": "fixture_project",
+    "control_schema_hash": "sha256:ac0b7dae103804f6a80e5e40ff458460b8da293a1dde86c8a42ce1a76148778b",
+    "brief_id": "brief_fixture",
+    "expected_versions": {
+      "brief": "brief_v1",
+      "design": "design_v1",
+      "composition": "composition_v1"
+    },
+    "intent": "apply",
+    "draft": {
+      "selections": {
+        "c01": "large",
+        "c02": "centered",
+        "c03": "top",
+        "c04": "calm"
+      },
+      "answers": {}
+    },
+    "draft_hash": "624368e764bd0f0ec78f2761ccd746cee48343f8e45aafc2f7401bbcb1d8c12f"
+  }
+}
