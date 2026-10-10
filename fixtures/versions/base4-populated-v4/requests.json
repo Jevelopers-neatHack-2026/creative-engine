@@ -1,0 +1,141 @@
+{
+  "base_commit": "4e28839ea8baeb4112a4f12340ef2fe84f5c8efe",
+  "storage_user_version": 4,
+  "tenant_id": "tenant-api-1",
+  "project_id": "project-api-1",
+  "brief_id": "brief-api-1",
+  "artifact_sha256": "sha256:9ef5fef2ad2679ad041e37fdf846e8391f0dfe1ea5227779e0cf4e7ac6625240",
+  "generate_request": {
+    "contract": "CreativeApiRequest",
+    "schema_version": "1.0",
+    "event_id": "event-base4-generate-action",
+    "request_id": "request-base4-generate-action",
+    "tenant_id": "tenant-api-1",
+    "project_id": "project-api-1",
+    "correlation_id": "correlation-base4-generate-action",
+    "producer": "versions-api-integration",
+    "occurred_at": "2026-10-10T12:20:00.000Z",
+    "ingested_at": "2026-10-10T12:20:00.000Z",
+    "environment": "test",
+    "billing_mode": "simulated",
+    "source_refs": [
+      "source-api-1"
+    ],
+    "operation": "generate",
+    "action_id": "base4-generate-action",
+    "payload": {
+      "brief_id": "brief-api-1",
+      "plan": {
+        "contract": "EditPlan",
+        "schema_version": "1.0",
+        "event_id": "event-plan-generate-1",
+        "tenant_id": "tenant-api-1",
+        "project_id": "project-api-1",
+        "correlation_id": "correlation-plan-generate-1",
+        "producer": "fixture-api",
+        "occurred_at": "2026-10-10T12:02:00.000Z",
+        "ingested_at": "2026-10-10T12:02:00.000Z",
+        "environment": "test",
+        "billing_mode": "simulated",
+        "source_refs": [
+          "source-api-1"
+        ],
+        "plan_id": "plan-generate-1",
+        "base": {
+          "brief_hash": "sha256:4128c720b3feae75564fb946f0c785f16c3c300fe57ee964ccb8ebe5d980c870",
+          "design_hash": "sha256:b87cc92addf3f430f69981dbc9115bc6473b27dadc22cafe84cabd91a6fcbf81"
+        },
+        "operation": "concept.generate",
+        "steps": [
+          {
+            "step_id": "step-generate-1",
+            "action": "concept.generate",
+            "source_refs": [
+              "source-api-1"
+            ],
+            "parameters": {
+              "brief_id": "brief-api-1",
+              "variant_count": 1
+            }
+          }
+        ],
+        "expected_result": {
+          "contract": "DesignVersion",
+          "schema_version": "1.0",
+          "parent_version_id": "root:brief-api-1",
+          "artifact_kind": "image"
+        },
+        "invalidates": []
+      }
+    }
+  },
+  "edit_request": {
+    "contract": "CreativeApiRequest",
+    "schema_version": "1.0",
+    "event_id": "event-base4-edit-action",
+    "request_id": "request-base4-edit-action",
+    "tenant_id": "tenant-api-1",
+    "project_id": "project-api-1",
+    "correlation_id": "correlation-base4-edit-action",
+    "producer": "versions-api-integration",
+    "occurred_at": "2026-10-10T12:20:00.000Z",
+    "ingested_at": "2026-10-10T12:20:00.000Z",
+    "environment": "test",
+    "billing_mode": "simulated",
+    "source_refs": [
+      "source-api-1"
+    ],
+    "operation": "edit",
+    "action_id": "base4-edit-action",
+    "payload": {
+      "brief_id": "brief-api-1",
+      "plan": {
+        "contract": "EditPlan",
+        "schema_version": "1.0",
+        "event_id": "event-plan-edit-1",
+        "tenant_id": "tenant-api-1",
+        "project_id": "project-api-1",
+        "correlation_id": "correlation-plan-edit-1",
+        "producer": "fixture-api",
+        "occurred_at": "2026-10-10T12:03:00.000Z",
+        "ingested_at": "2026-10-10T12:03:00.000Z",
+        "environment": "test",
+        "billing_mode": "simulated",
+        "source_refs": [
+          "source-api-1"
+        ],
+        "plan_id": "plan-edit-1",
+        "base": {
+          "brief_hash": "sha256:4128c720b3feae75564fb946f0c785f16c3c300fe57ee964ccb8ebe5d980c870",
+          "design_hash": "sha256:31ee013acf11f99535c4cb9084066fde33cf1bbcd5fcbdbb8e628fd37ce60cfb",
+          "design_version_id": "design-durable-api-1"
+        },
+        "operation": "image.edit",
+        "steps": [
+          {
+            "step_id": "step-edit-1",
+            "action": "image.edit",
+            "source_refs": [
+              "source-api-1"
+            ],
+            "parameters": {
+              "design_version_id": "design-durable-api-1",
+              "artifact_id": "artifact-durable-api-1",
+              "instruction": "Refine the balanced border while preserving the supplied event details."
+            }
+          }
+        ],
+        "expected_result": {
+          "contract": "DesignVersion",
+          "schema_version": "1.0",
+          "parent_version_id": "design-durable-api-1",
+          "artifact_kind": "image"
+        },
+        "invalidates": []
+      },
+      "design_version_id": "design-durable-api-1"
+    }
+  },
+  "expected_generate_design_version_id": "design-durable-api-1",
+  "expected_edit_design_version_id": "design-durable-edit-2"
+}

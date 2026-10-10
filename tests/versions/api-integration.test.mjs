@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { spawnSync } from "node:child_process";
-import { readFile, unlink } from "node:fs/promises";
+import { cp, readFile, unlink } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -177,6 +178,70 @@ test("real API invocation commits job, exact artifact bytes, version and selecti
   assert.equal(conflict.ok, false);
   assert.equal(conflict.error.code, "conflict");
   assert.equal(counters.provider, 1, "conflicting action replay must not dispatch again");
+});
+
+test("populated BASE4e v4 database migrates to v6 and replays historical generation and edit after restart", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-base4e-v4-migration-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const fixtureRoot = new URL("../../fixtures/versions/base4-populated-v4/", import.meta.url);
+  const manifest = JSON.parse(await readFile(new URL("manifest.json", fixtureRoot), "utf8"));
+  const databaseBytes = await readFile(new URL("creative.sqlite", fixtureRoot));
+  const requests = JSON.parse(await readFile(new URL("requests.json", fixtureRoot), "utf8"));
+  const sha256 = (bytes) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  assert.equal(manifest.base_commit, "4e28839ea8baeb4112a4f12340ef2fe84f5c8efe");
+  assert.equal(manifest.storage_user_version, 4);
+  assert.equal(sha256(databaseBytes), manifest.database_sha256);
+  assert.equal(sha256(Buffer.from(JSON.stringify(requests, null, 2) + "\n")), manifest.requests_sha256);
+  assert.equal(requests.artifact_sha256, manifest.artifact_sha256);
+  assert.equal(sha256(Buffer.from("durable exact artwork bytes")), manifest.artifact_sha256);
+  const databasePath = join(root, "versions.sqlite");
+  const objectRoot = join(root, "objects");
+  await cp(new URL("creative.sqlite", fixtureRoot), databasePath);
+  await cp(new URL("objects", fixtureRoot), objectRoot, { recursive: true });
+
+  const baseline = new DatabaseSync(databasePath);
+  assert.equal(baseline.prepare("PRAGMA user_version").get().user_version, 4);
+  assert.deepEqual(baseline.prepare("SELECT action_id,operation,status FROM creative_jobs ORDER BY operation").all()
+    .map((row) => ({ ...row })), [
+    { action_id: "base4-edit-action", operation: "edit", status: "completed" },
+    { action_id: "base4-generate-action", operation: "generate", status: "completed" },
+  ]);
+  const v4DispatchColumns = baseline.prepare("PRAGMA table_info(creative_dispatch_intents)").all().map((column) => column.name);
+  for (const column of ["reservation_ref", "provider_name", "provider_model"]) assert.equal(v4DispatchColumns.includes(column), false);
+  assert.equal(baseline.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='private_provider_attributions'").get(), undefined);
+  baseline.close();
+
+  let migrated = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, 6);
+  const v6DispatchColumns = migrated.db.prepare("PRAGMA table_info(creative_dispatch_intents)").all().map((column) => column.name);
+  for (const column of ["reservation_ref", "provider_name", "provider_model"]) assert.equal(v6DispatchColumns.includes(column), true);
+  assert.ok(migrated.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='private_provider_attributions'").get());
+  for (const designVersionId of [requests.expected_generate_design_version_id, requests.expected_edit_design_version_id]) {
+    const design = migrated.getDesignVersion({ scope: SCOPE, brief_id: SCOPE.brief_id, design_version_id: designVersionId });
+    assert.ok(design, designVersionId);
+    assert.deepEqual(Buffer.from(await migrated.getArtifactBytes({ scope: SCOPE, brief_id: SCOPE.brief_id,
+      design_version_id: designVersionId })), Buffer.from("durable exact artwork bytes"));
+  }
+  assert.equal(migrated.db.prepare("SELECT COUNT(*) AS count FROM creative_jobs WHERE status='completed'").get().count, 2);
+  migrated.close();
+
+  migrated = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  t.after(() => migrated.close());
+  assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, 6);
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const api = createCreativeApi({ ports: portsFor(migrated, counters, () => `base4-replay-port-${++id}`),
+    now: () => NOW, idFactory: () => `base4-replay-api-${++id}` });
+  const generatedReplay = await api.invoke(actor(), requests.generate_request);
+  assert.equal(generatedReplay.ok, true, JSON.stringify(generatedReplay));
+  assert.equal(generatedReplay.replayed, true);
+  assert.equal(generatedReplay.result.design_version.design_version_id, requests.expected_generate_design_version_id);
+  const editedReplay = await api.invoke(actor(), requests.edit_request);
+  assert.equal(editedReplay.ok, true, JSON.stringify(editedReplay));
+  assert.equal(editedReplay.replayed, true);
+  assert.equal(editedReplay.result.design_version.design_version_id, requests.expected_edit_design_version_id);
+  assert.equal(counters.provider, 0, "historical replay after migration must not redispatch generation or edit");
+  assert.equal(counters.reserved, 0, "historical replay after migration must not create reservations");
 });
 
 test("outcome append failure is durably staged and replayed as pending without another provider attempt", async (t) => {
