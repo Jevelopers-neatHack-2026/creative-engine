@@ -27,6 +27,8 @@ jobs:
           cache: npm
       - name: Install the locked root package
         run: npm ci --ignore-scripts --offline
+      - name: Install the isolated locked image codec
+        run: npm ci --prefix src/models/codec-runtime --ignore-scripts
       - name: Install locked TypeScript consumer tools
         run: npm ci --prefix examples/frontend-action-roundtrip
       - name: Verify TypeScript compiler version
@@ -39,6 +41,8 @@ jobs:
         run: make check TARGET=access-preflight MODE=mock
       - name: CE-02 public brief and invalidation API checks
         run: make check TARGET=brief MODE=mock
+      - name: CE-03 native Images adapter and actual API/C03/CE08 fixtures
+        run: make check TARGET=image-adapter MODE=mock
       - name: Verify CE-02 external acceptance remains pending
         shell: bash
         run: |
@@ -110,6 +114,54 @@ jobs:
           assert.equal(gate.cells.length, 8);
           assert.ok(gate.missing_owner_evidence.includes('external_grant_and_finance_reservation'));
           NODE
+      - name: Verify CE-03 live gate fails before provider dispatch
+        shell: bash
+        run: |
+          set +e
+          make check TARGET=image-adapter MODE=live > build/image-adapter-live-gate.stdout.json
+          gate_status=$?
+          set -e
+          if [ "$gate_status" -ne 2 ]; then
+            echo "Expected the pending CE-03 live gate to exit 2; got $gate_status." >&2
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const gate = JSON.parse(readFileSync('build/image-adapter-live-gate.stdout.json', 'utf8'));
+          assert.equal(gate.target, 'CE-03');
+          assert.equal(gate.status, 'blocked');
+          assert.equal(gate.acceptance_allowed, false);
+          assert.equal(gate.provider_dispatches, 0);
+          assert.equal(gate.paid_provider_calls, 0);
+          assert.equal(gate.provider_credentials_read, false);
+          assert.ok(gate.missing_owner_evidence.includes('owner_selected_image_model_and_exact_operation_profile'));
+          assert.ok(gate.missing_owner_evidence.includes('trusted_live_capability_grant_and_finance_reservation_authority'));
+          assert.ok(gate.missing_owner_evidence.includes('accepted_provider_usage_to_rate_mapping_for_selected_model'));
+          NODE
+      - name: Verify CE-03 acceptance remains pending
+        shell: bash
+        run: |
+          set +e
+          make acceptance TARGET=image-adapter > build/image-adapter-acceptance-gate.stdout.json
+          gate_status=$?
+          set -e
+          if [ "$gate_status" -ne 2 ]; then
+            echo "Expected CE-03 owner acceptance to remain pending with exit 2; got $gate_status." >&2
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const gate = JSON.parse(readFileSync('build/image-adapter-acceptance-gate.stdout.json', 'utf8'));
+          assert.equal(gate.schema_version, 'creative-image-adapter-acceptance-result/v1');
+          assert.equal(gate.target, 'CE-03');
+          assert.equal(gate.acceptance_allowed, false);
+          assert.equal(gate.provider_dispatches, 0);
+          assert.equal(gate.paid_provider_calls, 0);
+          assert.equal(gate.provider_credentials_read, false);
+          assert.equal(gate.missing_owner_evidence.length, 6);
+          NODE
       - name: Aggregate offline checks
         run: make check TARGET=all MODE=mock
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 verified 2026-10-10
@@ -123,4 +175,8 @@ jobs:
             build/access-preflight-live-gate.json
             build/access-preflight-live-gate.stdout.json
             build/access-preflight-acceptance-gate.stdout.json
+            build/image-adapter-evidence.json
+            build/image-adapter-live-gate.json
+            build/image-adapter-live-gate.stdout.json
+            build/image-adapter-acceptance-gate.stdout.json
           if-no-files-found: warn

@@ -52,9 +52,79 @@ export interface DispatchAuthorizationInput {
   action_id: string;
   operation: CreativeOperation;
   billable_attempt_id?: string;
+  /** Exact reservation returned by the C03 authority for this transport. */
+  reservation_ref?: string;
+  /** Trusted route identity captured with the dispatch intent for private response attribution. */
+  provider_name?: string;
+  provider_model?: string;
   transport_attempt_id: string;
   /** Atomically compared with authoritative creative records when inserting each transport intent. */
   context_fence: CreativeContextFence;
+}
+
+export interface CreativeImageReferenceManifest {
+  readonly contract: "CreativeImageReferenceManifest";
+  readonly schema_version: "1.0";
+  readonly tenant_id: string;
+  readonly project_id: string;
+  readonly brief_id: string;
+  readonly brief_hash: `sha256:${string}`;
+  readonly research_package_id: string;
+  readonly research_package_hash: `sha256:${string}`;
+  readonly base_design_version_id: string;
+  readonly base_design_hash: `sha256:${string}`;
+  readonly references: readonly Readonly<{
+    source_ref: string;
+    asset_id: string;
+    content_hash: `sha256:${string}`;
+    media_type: "image/png" | "image/jpeg" | "image/webp";
+    width: number;
+    height: number;
+  }>[];
+}
+
+/** Private backend-only attribution. The raw provider ID must never be copied to public API records. */
+export interface PrivateProviderRequestAttribution {
+  readonly scope: TrustedScope;
+  readonly actor_id: string;
+  readonly job_id: string;
+  readonly action_id: string;
+  readonly request_hash: `sha256:${string}`;
+  readonly operation: "generate" | "edit";
+  readonly provider: "openai";
+  readonly model: string;
+  readonly reservation_ref: string;
+  readonly billable_attempt_id: string;
+  readonly transport_attempt_id: string;
+  readonly dispatch_intent_ref: string;
+  readonly provider_request_id: string;
+  readonly provider_request_ref: string;
+}
+
+export interface PrivateProviderRequestAttributionResult {
+  readonly status: "recorded" | "replayed";
+}
+
+export interface PrivateProviderUsageAttribution {
+  readonly scope: TrustedScope;
+  readonly actor_id: string;
+  readonly job_id: string;
+  readonly action_id: string;
+  readonly request_hash: string;
+  readonly operation: "generate" | "edit";
+  readonly provider: "openai";
+  readonly model: string;
+  readonly reservation_ref: string;
+  readonly billable_attempt_id: string;
+  readonly transport_attempt_id: string;
+  readonly dispatch_intent_ref: string;
+  readonly target_binding_sha256: `sha256:${string}`;
+  readonly usage_sha256: `sha256:${string}`;
+  readonly usage: ProviderUsageRecord;
+}
+
+export interface PrivateProviderUsageAttributionResult {
+  readonly status: "recorded" | "replayed";
 }
 
 export type DispatchAuthorizationResult =
@@ -120,7 +190,8 @@ export type CreativeApiRequest =
       payload: { brief_id: string; plan: EditPlan; decision_request?: CreativeDecisionInput } })
   | (CreativeApiRequestEnvelope & { operation: "edit"; action_id: string;
       payload: { brief_id: string; design_version_id: string; plan: EditPlan;
-        selection_mode?: "advance" | "branch"; decision_request?: CreativeDecisionInput } })
+        selection_mode?: "advance" | "branch"; decision_request?: CreativeDecisionInput;
+        image_reference_manifest?: CreativeImageReferenceManifest } })
   | (CreativeApiRequestEnvelope & { operation: "inspect"; action_id: string;
       payload: { brief_id: string; design_version_id: string } })
   | (CreativeApiRequestEnvelope & { operation: "list"; action_id?: string;
@@ -218,8 +289,8 @@ export interface ProviderUsageRecord {
   input_tokens?: number;
   output_tokens?: number;
   total_tokens?: number;
-  input_tokens_details?: Readonly<Record<string, number>>;
-  output_tokens_details?: Readonly<Record<string, number>>;
+  input_tokens_details?: Readonly<Record<string, number | undefined>>;
+  output_tokens_details?: Readonly<Record<string, number | undefined>>;
   provider_request_id?: string;
   transport_attempt_id?: string;
   missing_fields?: readonly string[];
@@ -291,6 +362,12 @@ export interface CreativeRuntimePorts {
     recordAttemptEvidence?(input: { scope: TrustedScope; actor_id: string; job_id: string; lease_token: string;
       action_id: string; request_hash: string; creation: CreativeVersionCreationEvidence }):
       Promise<{ status: "recorded" | "replayed" }> | { status: "recorded" | "replayed" };
+    /** Persist an exact raw provider request ID in private local storage before result parsing/publication. */
+    recordPrivateProviderAttribution?(input: PrivateProviderRequestAttribution):
+      Promise<PrivateProviderRequestAttributionResult> | PrivateProviderRequestAttributionResult;
+    /** Retain sanitized raw provider counters privately for later owner-reviewed mapping/reconciliation. */
+    recordPrivateProviderUsageAttribution?(input: PrivateProviderUsageAttribution):
+      Promise<PrivateProviderUsageAttributionResult> | PrivateProviderUsageAttributionResult;
   };
   provider?: {
     resolveRoute(input: { scope: TrustedScope; actor_id: string; operation: "generate" | "edit"; plan: EditPlan }):
@@ -387,12 +464,24 @@ export interface ProviderInput {
   brief: CreativeBrief;
   base_design: DesignVersion | null;
   plan: EditPlan;
+  /** Versioned edit-only list of immutable, already permission-checked research image references. */
+  readonly image_reference_manifest?: CreativeImageReferenceManifest;
   decision_result?: DecisionPortResult;
   /** Exact reservation reference validated and returned by the trusted C03 authority. */
   readonly reservation_ref: string;
   transport_attempt_id: string;
   dispatch_intent_ref: string;
   recordTransportAttempt(transport_attempt_id: string): Promise<string>;
+  /** Called as soon as an HTTP response exposes x-request-id; raw value is private and never public JSON. */
+  recordPrivateProviderRequestId?(input: Readonly<{
+    provider_request_id: string;
+    provider_request_ref: string;
+  }>): Promise<void>;
+  /** Called after bounded normalization when the response actually contains a usage object. */
+  recordPrivateProviderUsage?(input: Readonly<{
+    target_binding_sha256: `sha256:${string}`;
+    usage: ProviderUsageRecord;
+  }>): Promise<void>;
   signal: AbortSignal;
   deadline_at: string;
 }
@@ -419,6 +508,8 @@ export interface ProviderOutput {
   artifact_bytes: Uint8Array;
   provider: string;
   model: string;
+  /** Exact target binding used for this response, when supplied by a typed provider adapter. */
+  target_binding_sha256?: `sha256:${string}`;
   usage?: ProviderUsageRecord;
 }
 

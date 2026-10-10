@@ -800,7 +800,9 @@ test("observed raw usage accompanies failed outcomes without publishing artifact
     ["HTTP refusal", async () => new Response(JSON.stringify({ error: { code: "invalid_api_key" }, usage }), { status: 401 }), "authentication_denied"],
   ];
   for (const [name, makeResponse, code] of cases) await t.test(name, async () => {
-    const harness = providerHarness({ fetchImpl: async () => makeResponse(harness) });
+    const retainedUsage = [];
+    const harness = providerHarness({ fetchImpl: async () => makeResponse(harness),
+      inputOverride: { recordPrivateProviderUsage: async (value) => { retainedUsage.push(value); } } });
     let failure;
     try { await harness.provider.generate(harness.ctx); } catch (error) { failure = error; }
     assert.ok(failure instanceof OpenAIImagesProviderError);
@@ -811,6 +813,11 @@ test("observed raw usage accompanies failed outcomes without publishing artifact
     assert.equal(failure.usage.input_tokens, 50);
     assert.deepEqual(failure.usage.input_tokens_details, { text_tokens: 10, image_tokens: 40 });
     assert.equal(failure.usage.total_tokens, 100);
+    assert.equal(retainedUsage.length, 1, "usage is handed to the restricted attribution port before failure is returned");
+    assert.match(retainedUsage[0].target_binding_sha256, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(retainedUsage[0].usage.transport_attempt_id, "transport-image-001");
+    assert.equal(retainedUsage[0].usage.total_tokens, 100);
+    assert.doesNotMatch(JSON.stringify(retainedUsage), /req-private-fixture-id/);
     assert.equal(failure.usage.transport_attempt_id, "transport-image-001");
     if (["cancellation after response", "malformed image bytes"].includes(name)) {
       assert.equal(readPrivateOpenAIImageRequestId(failure.usage), "req-private-fixture-id");
@@ -827,6 +834,19 @@ test("observed raw usage accompanies failed outcomes without publishing artifact
     assert.equal(Object.hasOwn(error, "usage"), false);
     return true;
   });
+  const persistenceFailure = providerHarness({ inputOverride: {
+    recordPrivateProviderUsage: async () => { throw new Error("Bearer private-store-secret"); },
+  } });
+  await assert.rejects(persistenceFailure.provider.generate(persistenceFailure.ctx), (error) => {
+    assert.equal(error.code, "private_usage_attribution_unavailable");
+    assert.equal(error.provider_outcome, "unknown");
+    assert.equal(error.usage.completeness, "unknown");
+    assert.ok(error.usage.missing_fields.includes("usage.unmapped_fields"));
+    assert.equal(Object.hasOwn(error, "artifact"), false);
+    assert.doesNotMatch(JSON.stringify(error), /private-store-secret|Bearer/);
+    return true;
+  });
+  assert.equal(persistenceFailure.fetchCount, 1, "failed private attribution never triggers an automatic retry");
 });
 
 test("provider output refusal, malformed base64, timeout, and post-response deadline never publish an artifact", async (t) => {

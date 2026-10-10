@@ -13,12 +13,14 @@ export interface OpenAIImageConfiguration {
 }
 
 export interface OpenAIImageTokenDetails {
+  readonly [detail: string]: number | undefined;
   readonly text_tokens?: number;
   readonly image_tokens?: number;
 }
 
 /** Raw allowlisted provider counters. The owner-reviewed operation profile maps these to C03. */
 export interface OpenAIImageUsage extends UsageRecord {
+  readonly [providerField: string]: unknown;
   readonly completeness: "unknown";
   readonly input_tokens?: number;
   readonly output_tokens?: number;
@@ -33,6 +35,7 @@ export interface OpenAIImageUsage extends UsageRecord {
 export type OpenAIImagesInput = ProviderInput & { readonly reservation_ref: string };
 
 export interface OpenAIImagesOutput extends ProviderOutput {
+  readonly target_binding_sha256: `sha256:${string}`;
   readonly usage: OpenAIImageUsage;
 }
 
@@ -55,6 +58,7 @@ export interface OpenAIImageTargetBinding {
   readonly plan_sha256: `sha256:${string}`;
   readonly parent_artifact_sha256?: `sha256:${string}`;
   readonly mask_content_sha256?: `sha256:${string}`;
+  readonly image_reference_manifest_sha256?: `sha256:${string}`;
   readonly deadline_at: string;
   readonly transport_policy: Readonly<{
     maximum_transport_attempts: 1;

@@ -344,12 +344,22 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
             return Object.freeze({ status: "stale_context" });
           }
           const transport_attempt_id = safeReference(input.transport_attempt_id, "transport_attempt_id");
-          const existing = store.db.prepare(`SELECT dispatch_intent_ref,context_fence_json,billable_attempt_id FROM creative_dispatch_intents
+          const billable_attempt_id = input.billable_attempt_id === undefined ? null
+            : safeReference(input.billable_attempt_id, "billable_attempt_id");
+          const reservation_ref = input.reservation_ref === undefined ? null
+            : safeReference(input.reservation_ref, "reservation_ref");
+          const provider_name = input.provider_name === undefined ? null : safeReference(input.provider_name, "provider_name");
+          const provider_model = input.provider_model === undefined ? null : safeReference(input.provider_model, "provider_model");
+          if ((provider_name === null) !== (provider_model === null)) throw new VersionStoreError("invalid_request", "provider_route");
+          const existing = store.db.prepare(`SELECT dispatch_intent_ref,context_fence_json,billable_attempt_id,
+            reservation_ref,provider_name,provider_model FROM creative_dispatch_intents
             WHERE tenant_id=? AND project_id=? AND job_id=? AND transport_attempt_id=?`)
             .get(input.scope.tenant_id, input.scope.project_id, input.job_id, transport_attempt_id);
           if (existing) {
             const sameFence = existing.context_fence_json === canonicalSerialize(input.context_fence);
-            const sameAttempt = (existing.billable_attempt_id ?? null) === (input.billable_attempt_id ?? null);
+            const sameAttempt = (existing.billable_attempt_id ?? null) === billable_attempt_id &&
+              (existing.reservation_ref ?? null) === reservation_ref &&
+              (existing.provider_name ?? null) === provider_name && (existing.provider_model ?? null) === provider_model;
             const finalStatus = transactionStatusFor(row, input.scope, input.actor_id, input.lease_token, store.now());
             if (finalStatus !== "active") {
               store.db.exec("ROLLBACK");
@@ -368,10 +378,12 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
             return Object.freeze({ status: "lease_lost" });
           }
           store.db.prepare(`INSERT INTO creative_dispatch_intents
-            (tenant_id,project_id,job_id,transport_attempt_id,billable_attempt_id,dispatch_intent_ref,context_fence_json,authorized_at)
-            VALUES(?,?,?,?,?,?,?,?)`)
+            (tenant_id,project_id,job_id,transport_attempt_id,billable_attempt_id,reservation_ref,provider_name,provider_model,
+              dispatch_intent_ref,context_fence_json,authorized_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
             .run(input.scope.tenant_id, input.scope.project_id, input.job_id, transport_attempt_id,
-              input.billable_attempt_id ?? null, dispatch_intent_ref, canonicalSerialize(input.context_fence), authorized_at);
+              billable_attempt_id, reservation_ref, provider_name, provider_model,
+              dispatch_intent_ref, canonicalSerialize(input.context_fence), authorized_at);
           store.db.exec("COMMIT");
           return Object.freeze({ status: "authorized", dispatch_intent_ref });
         } catch (error) {
@@ -383,6 +395,12 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
     },
     recordAttemptEvidence(input) {
       return serial(() => store.recordAttemptEvidence(input));
+    },
+    recordPrivateProviderAttribution(input) {
+      return serial(() => store.recordPrivateProviderAttribution(input));
+    },
+    recordPrivateProviderUsageAttribution(input) {
+      return serial(() => store.recordPrivateProviderUsageAttribution(input));
     },
     async completeIfActive(input, publish) {
       return serial(async () => {

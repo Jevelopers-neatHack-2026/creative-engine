@@ -1,4 +1,4 @@
-.PHONY: bootstrap build check acceptance typecheck-contracts typecheck-boundary-contracts typecheck-api typecheck-preflight typecheck-versions typecheck-telemetry typecheck-brief
+.PHONY: bootstrap build check acceptance typecheck-contracts typecheck-boundary-contracts typecheck-api typecheck-preflight typecheck-versions typecheck-telemetry typecheck-brief typecheck-models
 
 TARGET ?= all
 MODE ?= mock
@@ -6,6 +6,7 @@ MODE ?= mock
 bootstrap:
 	npm ci --ignore-scripts --offline
 	npm ci --prefix examples/frontend-action-roundtrip
+	npm ci --prefix src/models/codec-runtime --ignore-scripts
 
 build:
 	npm run build
@@ -25,6 +26,7 @@ build:
 	$(MAKE) typecheck-brief
 	$(MAKE) typecheck-versions
 	$(MAKE) typecheck-telemetry
+	$(MAKE) typecheck-models
 
 typecheck-contracts:
 	node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc -p tests/contracts/types/tsconfig.json
@@ -49,10 +51,15 @@ typecheck-versions:
 typecheck-telemetry:
 	node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --noEmit --strict --skipLibCheck false --module NodeNext --moduleResolution NodeNext --target ES2022 tests/telemetry/public-consumer.mts
 
+typecheck-models:
+	node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --noEmit --strict --skipLibCheck false --module NodeNext --moduleResolution NodeNext --target ES2022 tests/models/public-consumer.mts
+
 check:
 	@case "$(TARGET):$(MODE)" in \
 		access-preflight:mock) npm run check:access-preflight && node scripts/access-preflight-check.mjs --mode mock --out build/access-preflight-evidence.json && $(MAKE) typecheck-preflight ;; \
 		access-preflight:live) node scripts/access-preflight-check.mjs --mode live --out build/access-preflight-live-gate.json ;; \
+		image-adapter:mock) npm run check:models && node scripts/image-adapter-check.mjs --mode mock --out build/image-adapter-evidence.json && $(MAKE) typecheck-models ;; \
+		image-adapter:live) node scripts/image-adapter-check.mjs --mode live --out build/image-adapter-live-gate.json ;; \
 		brief:mock) npm run check:brief && $(MAKE) typecheck-brief ;; \
 		versions:mock) npm run check:versions ;; \
 		creative-metering:mock) npm run check:creative-metering && $(MAKE) typecheck-telemetry ;; \
@@ -63,8 +70,8 @@ check:
 		handoff-contract:mock) npm run check:handoff-contract && $(MAKE) typecheck-boundary-contracts ;; \
 		api:mock) npm run check:api && $(MAKE) typecheck-api ;; \
 		controls:mock) node fixtures/controls/check.mjs ;; \
-		all:mock) npm test && npm run check:eval-policy && npm run check:metering-contract && npm run check:handoff-contract && npm run check:access-preflight && node scripts/access-preflight-check.mjs --mode mock --out build/access-preflight-evidence.json && npm run check:brief && npm run check:versions && npm run check:creative-metering && $(MAKE) typecheck-contracts && $(MAKE) typecheck-api && $(MAKE) typecheck-preflight && $(MAKE) typecheck-brief && $(MAKE) typecheck-telemetry && node fixtures/controls/check.mjs ;; \
-		*) echo "Unsupported TARGET=$(TARGET) MODE=$(MODE): only offline mock checks are implemented and no live provider dispatch exists; access-preflight's live gate is fail-closed." >&2; exit 2 ;; \
+		all:mock) npm test && npm run check:eval-policy && npm run check:metering-contract && npm run check:handoff-contract && npm run check:access-preflight && node scripts/access-preflight-check.mjs --mode mock --out build/access-preflight-evidence.json && npm run check:models && node scripts/image-adapter-check.mjs --mode mock --out build/image-adapter-evidence.json && npm run check:brief && npm run check:versions && npm run check:creative-metering && $(MAKE) typecheck-contracts && $(MAKE) typecheck-api && $(MAKE) typecheck-preflight && $(MAKE) typecheck-brief && $(MAKE) typecheck-telemetry && $(MAKE) typecheck-models && node fixtures/controls/check.mjs ;; \
+		*) echo "Unsupported TARGET=$(TARGET) MODE=$(MODE): only offline mock checks are implemented and no live provider dispatch exists; access-preflight and image-adapter live gates are fail-closed." >&2; exit 2 ;; \
 	esac
 
 acceptance:

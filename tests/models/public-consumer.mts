@@ -6,7 +6,10 @@ import {
   type OpenAIImagesInput,
   type OpenAIImagesOutput,
   type OpenAIImageAuthorizationRequest,
-} from "../../src/models/index.mjs";
+} from "creative-engine/models";
+import type { PrivateProviderUsageAttribution } from "creative-engine/api/v1";
+import type { TrustedProviderUsageProfileAuthority } from "creative-engine/telemetry";
+import type { UsageObservation } from "creative-engine/contracts/metering";
 
 const provider = createOpenAIImagesProvider({
   model_id: "gpt-image-2.5-sunburst-2026-09-08",
@@ -44,4 +47,49 @@ export async function consumeImageBytes(bytes: Uint8Array) {
   const retry = evaluateOpenAIImageRetry({ attempt_number: 1, started_at: new Date(0).toISOString(),
     now_at: new Date(1000).toISOString(), deadline_at: new Date(100_000).toISOString(), retry_after: "1" });
   return { format: info.format, width: info.width, usage, retry };
+}
+
+export const ownerUsageProfile: TrustedProviderUsageProfileAuthority = {
+  mapProviderUsage(input) {
+    const exactAttempt: string = input.attempt.billable_attempt_id;
+    const exactTarget: `sha256:${string}` = input.targetBindingSha256;
+    const reservation: string = input.reservationRef;
+    const dispatch: string = input.dispatchIntentRef;
+    void exactAttempt;
+    void exactTarget;
+    void reservation;
+    void dispatch;
+    const observation: UsageObservation = {
+      schema_version: "creative.metering.proposal/v1",
+      tenant_id: input.attempt.tenant_id,
+      project_id: input.attempt.project_id,
+      budget_scope_id: input.attempt.budget_scope_id,
+      logical_operation_id: input.attempt.logical_operation_id,
+      billable_attempt_id: input.attempt.billable_attempt_id,
+      source_observation_id: input.sourceObservationId,
+      source: "provider_response",
+      provider_name: input.attempt.provider.name,
+      model: input.attempt.provider.model,
+      transport_attempt_id: input.transportAttemptId,
+      environment: input.attempt.environment,
+      billing_mode: input.attempt.billing_mode,
+      completeness: "unknown",
+      missing_fields: ["profile_not_selected"],
+    };
+    return {
+      status: "mapped",
+      profile_ref: "owner-profile/illustrative",
+      profile_sha256: `sha256:${"0".repeat(64)}`,
+      raw_usage_sha256: input.rawUsageSha256,
+      target_binding_sha256: input.targetBindingSha256,
+      attempt_binding_sha256: input.attemptBindingSha256,
+      observation,
+    };
+  },
+};
+
+export function retainPrivateUsage(input: PrivateProviderUsageAttribution) {
+  const target: `sha256:${string}` = input.target_binding_sha256;
+  const count: number | undefined = input.usage.total_tokens;
+  return { target, count };
 }

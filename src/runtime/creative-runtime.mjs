@@ -8,6 +8,8 @@ import {
   validateEditPlan,
   computeDesignVersionHash,
 } from "../contracts/index.mjs";
+import { validateUsageObservation } from "../contracts/metering.mjs";
+import { readPrivateOpenAIImageTargetBindingSha256 } from "../models/openai-images.mjs";
 import {
   validateDecisionRequest,
   validateDecisionResult,
@@ -30,6 +32,7 @@ import {
   TelemetryBoundaryError,
   USAGE_PROFILE,
 } from "../telemetry/index.mjs";
+import { assertSafePublicIdentifier } from "../telemetry/privacy.mjs";
 import { hashArtifactBytes } from "../storage/content-addressed.mjs";
 import { buildCreativeBrief, CreativePlanningError } from "../planning/index.mjs";
 import { normalizeResearchPackage } from "../contracts/creative/v1.mjs";
@@ -61,6 +64,14 @@ const REQUEST_KEYS = [
   "source_refs", "operation", "action_id", "payload",
 ];
 const REQUEST_CONTRACT = "CreativeApiRequest";
+const IMAGE_REFERENCE_MANIFEST_KEYS = Object.freeze([
+  "contract", "schema_version", "tenant_id", "project_id", "brief_id", "brief_hash",
+  "research_package_id", "research_package_hash", "base_design_version_id", "base_design_hash", "references",
+]);
+const IMAGE_REFERENCE_KEYS = Object.freeze([
+  "source_ref", "asset_id", "content_hash", "media_type", "width", "height",
+]);
+const MAX_IMAGE_REFERENCES = 15;
 const ERROR_MESSAGES = Object.freeze({
   invalid_request: "The request does not match the supported API contract.",
   unsupported_version: "The requested API version is not supported.",
@@ -355,6 +366,50 @@ function validatePrincipal(principal, now) {
     permissions: [...new Set(principal.permissions)] });
 }
 
+function validateImageReferenceManifestShape(value) {
+  if (value === undefined) return undefined;
+  const operation = "edit";
+  if (!isRecord(value)) throw new CreativeApiError("invalid_request", operation, "image_reference_manifest");
+  assertOnlyKeys(value, IMAGE_REFERENCE_MANIFEST_KEYS, "image_reference_manifest");
+  if (value.contract !== "CreativeImageReferenceManifest" || value.schema_version !== "1.0") {
+    throw new CreativeApiError("unsupported_version", operation, "image_reference_manifest.schema_version");
+  }
+  for (const key of ["tenant_id", "project_id", "brief_id", "research_package_id", "base_design_version_id"]) {
+    boundedString(value[key], `image_reference_manifest.${key}`, 256);
+  }
+  for (const key of ["brief_hash", "research_package_hash", "base_design_hash"]) {
+    if (typeof value[key] !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value[key])) {
+      throw new CreativeApiError("invalid_request", operation, `image_reference_manifest.${key}`);
+    }
+  }
+  if (!Array.isArray(value.references) || value.references.length < 1 || value.references.length > MAX_IMAGE_REFERENCES) {
+    throw new CreativeApiError("invalid_request", operation, "image_reference_manifest.references");
+  }
+  const sourceRefs = new Set();
+  const assetIds = new Set();
+  for (let index = 0; index < value.references.length; index += 1) {
+    const reference = value.references[index];
+    const field = `image_reference_manifest.references[${index}]`;
+    if (!isRecord(reference)) throw new CreativeApiError("invalid_request", operation, field);
+    assertOnlyKeys(reference, IMAGE_REFERENCE_KEYS, field);
+    boundedString(reference.source_ref, `${field}.source_ref`, 300);
+    boundedString(reference.asset_id, `${field}.asset_id`, 256);
+    if (typeof reference.content_hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(reference.content_hash) ||
+        !["image/png", "image/jpeg", "image/webp"].includes(reference.media_type) ||
+        !Number.isSafeInteger(reference.width) || reference.width < 1 || reference.width > 4096 ||
+        !Number.isSafeInteger(reference.height) || reference.height < 1 || reference.height > 4096 ||
+        reference.width * reference.height > 16_777_216) {
+      throw new CreativeApiError("invalid_request", operation, field);
+    }
+    if (sourceRefs.has(reference.source_ref) || assetIds.has(reference.asset_id)) {
+      throw new CreativeApiError("invalid_request", operation, "image_reference_manifest.references");
+    }
+    sourceRefs.add(reference.source_ref);
+    assetIds.add(reference.asset_id);
+  }
+  return value;
+}
+
 function validateRequest(request) {
   assertOnlyKeys(request, REQUEST_KEYS, "request");
   if (request.contract !== REQUEST_CONTRACT) throw new CreativeApiError("invalid_request", "unknown", "contract");
@@ -390,7 +445,7 @@ function validateRequest(request) {
   if (!isRecord(request.payload)) throw new CreativeApiError("invalid_request", request.operation, "payload");
   const allowedPayloadKeys = {
     generate: ["brief_id", "plan", "decision_request"],
-    edit: ["brief_id", "design_version_id", "plan", "selection_mode", "decision_request"],
+    edit: ["brief_id", "design_version_id", "plan", "selection_mode", "decision_request", "image_reference_manifest"],
     inspect: ["brief_id", "design_version_id"],
     list: ["brief_id", "limit", "cursor"],
     compare: ["brief_id", "left_design_version_id", "right_design_version_id"],
@@ -449,6 +504,7 @@ function validateRequest(request) {
     !["advance", "branch"].includes(request.payload.selection_mode)) {
     throw new CreativeApiError("invalid_request", request.operation, "selection_mode");
   }
+  if (request.operation === "edit") validateImageReferenceManifestShape(request.payload.image_reference_manifest);
   if (request.payload.limit !== undefined && (!Number.isSafeInteger(request.payload.limit) || request.payload.limit < 1 || request.payload.limit > 100)) {
     throw new CreativeApiError("invalid_request", request.operation, "limit");
   }
@@ -664,16 +720,56 @@ function startDeadline(operation, durationMs, clock = Date.now) {
   });
 }
 
-function usageObservation(attempt, trustedScope, rawUsage, profile, transportAttemptId, idFactory) {
-  return createUsageObservation({
+async function usageObservation({ attempt, trustedScope, rawUsage, profile, transportAttemptId, idFactory,
+  usageProfileAuthority, targetBindingSha256, reservationRef, dispatchIntentRef, providerOutcome }) {
+  const sourceObservationId = `usage:${idFactory()}`;
+  const fallback = () => createUsageObservation({
     attempt,
     trustedScope,
     usage: isRecord(rawUsage) ? rawUsage : {},
     profile,
-    sourceObservationId: `usage:${idFactory()}`,
+    sourceObservationId,
     source: "provider_response",
     transportAttemptId,
   });
+  if (typeof usageProfileAuthority?.mapProviderUsage !== "function" || !isRecord(rawUsage) ||
+      typeof targetBindingSha256 !== "string" || !/^sha256:[a-f0-9]{64}$/.test(targetBindingSha256) ||
+      typeof reservationRef !== "string" || typeof dispatchIntentRef !== "string") return fallback();
+
+  const rawUsageSha256 = canonicalHash(rawUsage);
+  const attemptBindingSha256 = canonicalHash({ attempt, trusted_scope: trustedScope, reservation_ref: reservationRef,
+    dispatch_intent_ref: dispatchIntentRef, transport_attempt_id: transportAttemptId,
+    target_binding_sha256: targetBindingSha256, provider_outcome: providerOutcome, source_observation_id: sourceObservationId });
+  const profileInput = Object.freeze({ attempt, trustedScope, rawUsage, rawUsageSha256,
+    targetBindingSha256, attemptBindingSha256, sourceObservationId, transportAttemptId, providerOutcome,
+    reservationRef, dispatchIntentRef });
+  let mapped;
+  try { mapped = await usageProfileAuthority.mapProviderUsage(profileInput); }
+  catch { return fallback(); }
+  try {
+    if (!isRecord(mapped) || mapped.status !== "mapped" ||
+        typeof mapped.profile_ref !== "string" || typeof mapped.profile_sha256 !== "string" ||
+        !/^sha256:[a-f0-9]{64}$/.test(mapped.profile_sha256) ||
+        mapped.raw_usage_sha256 !== rawUsageSha256 || mapped.target_binding_sha256 !== targetBindingSha256 ||
+        mapped.attempt_binding_sha256 !== attemptBindingSha256) return fallback();
+    assertSafePublicIdentifier(mapped.profile_ref, { maxLength: 256 });
+    const rawMissing = Array.isArray(rawUsage.missing_fields) ? rawUsage.missing_fields : ["usage.missing_fields"];
+    // Only the adapter's explicit profile-pending marker may be resolved by a
+    // trusted owner map. Invalid or unmapped provider dimensions remain gaps.
+    const unresolved = rawMissing.filter((field) => field !== "usage.profile_mapping_pending");
+    if (unresolved.length > 0 && mapped.observation?.completeness === "complete") return fallback();
+    const observation = validateUsageObservation(mapped.observation, attempt);
+    if (observation.source !== "provider_response" || observation.source_observation_id !== sourceObservationId ||
+        observation.transport_attempt_id !== transportAttemptId || observation.provider_name !== attempt.provider.name ||
+        observation.model !== attempt.provider.model ||
+        (rawUsage.provider_request_id === undefined
+          ? observation.provider_request_id !== undefined
+          : observation.provider_request_id !== rawUsage.provider_request_id) ||
+        observation.rate_card_ref !== undefined || observation.valuation !== undefined) return fallback();
+    return observation;
+  } catch {
+    return fallback();
+  }
 }
 
 const OMIT_FAILURE_USAGE_VALUE = Symbol("omit_failure_usage_value");
@@ -841,7 +937,8 @@ function providerFailureUsage(error) {
     const reportedOutcome = outcomeDescriptor && Object.hasOwn(outcomeDescriptor, "value")
       ? outcomeDescriptor.value : undefined;
     const providerOutcome = ["failed", "partial", "unknown"].includes(reportedOutcome) ? reportedOutcome : "unknown";
-    return Object.freeze({ usage: projected.value, provider_outcome: providerOutcome });
+    return Object.freeze({ usage: projected.value, provider_outcome: providerOutcome,
+      target_binding_sha256: readPrivateOpenAIImageTargetBindingSha256(error) });
   } catch {
     return undefined;
   }
@@ -1171,7 +1268,8 @@ export function createCreativeApi(options = {}) {
     return currentBrief;
   }
 
-  async function verifyRequestedAssetPermissions(scope, brief, plan, operation) {
+  async function verifyRequestedAssetPermissions(scope, brief, plan, operation, imageReferenceManifest,
+    baseDesign, briefHash) {
     const explicit = new Map();
     const sourceRefs = new Set(Array.isArray(plan.source_refs) ? plan.source_refs : []);
     for (const step of plan.steps ?? []) {
@@ -1184,8 +1282,10 @@ export function createCreativeApi(options = {}) {
     }
     const getPackage = ports.planning?.getCurrentResearchPackage;
     if (typeof getPackage !== "function") {
-      if (explicit.size > 0) throw new CreativeApiError("unavailable", operation, "asset_permission_verifier");
-      return Object.freeze([]);
+      if (explicit.size > 0 || imageReferenceManifest !== undefined) {
+        throw new CreativeApiError("unavailable", operation, "asset_permission_verifier");
+      }
+      return Object.freeze({ proofs: Object.freeze([]), image_reference_manifest: undefined });
     }
     let research;
     try {
@@ -1199,12 +1299,57 @@ export function createCreativeApi(options = {}) {
       packageHash !== brief.research_package_ref.content_hash) {
       throw new CreativeApiError("stale_version", operation, "research_package_hash");
     }
+    let trustedImageReferenceManifest;
+    if (imageReferenceManifest !== undefined) {
+      if (operation !== "edit" || !baseDesign ||
+        imageReferenceManifest.tenant_id !== scope.tenant_id ||
+        imageReferenceManifest.project_id !== scope.project_id ||
+        imageReferenceManifest.brief_id !== brief.brief_id || imageReferenceManifest.brief_hash !== briefHash ||
+        imageReferenceManifest.research_package_id !== research.package_id ||
+        imageReferenceManifest.research_package_hash !== packageHash ||
+        imageReferenceManifest.base_design_version_id !== baseDesign.design_version_id ||
+        imageReferenceManifest.base_design_hash !== baseDesign.design_hash) {
+        throw new CreativeApiError("stale_version", operation, "image_reference_manifest.binding");
+      }
+      for (const reference of imageReferenceManifest.references) {
+        if (!plan.source_refs.includes(reference.source_ref) ||
+          !brief.source_identity.some((item) => item.source_id === reference.source_ref)) {
+          throw new CreativeApiError("scope_denied", operation, "image_reference_manifest.references.source_ref");
+        }
+        const asset = research.assets.items.find((item) => item.asset_id === reference.asset_id);
+        if (!asset || asset.source_id !== reference.source_ref || asset.content_hash !== reference.content_hash ||
+            asset.media_type !== reference.media_type) {
+          throw new CreativeApiError("stale_version", operation, "image_reference_manifest.references.asset_binding");
+        }
+        explicit.set(reference.asset_id, "modify");
+      }
+      trustedImageReferenceManifest = Object.freeze({
+        contract: "CreativeImageReferenceManifest",
+        schema_version: "1.0",
+        tenant_id: scope.tenant_id,
+        project_id: scope.project_id,
+        brief_id: brief.brief_id,
+        brief_hash: briefHash,
+        research_package_id: research.package_id,
+        research_package_hash: packageHash,
+        base_design_version_id: baseDesign.design_version_id,
+        base_design_hash: baseDesign.design_hash,
+        references: Object.freeze(imageReferenceManifest.references.map((reference) => Object.freeze({
+          source_ref: reference.source_ref,
+          asset_id: reference.asset_id,
+          content_hash: reference.content_hash,
+          media_type: reference.media_type,
+          width: reference.width,
+          height: reference.height,
+        }))),
+      });
+    }
     for (const asset of research.assets.items) {
       if (sourceRefs.has(asset.source_id) || sourceRefs.has(asset.asset_id) || sourceRefs.has(`asset:${asset.asset_id}`)) {
         explicit.set(asset.asset_id, explicit.get(asset.asset_id) ?? (operation === "generate" ? "reproduce" : "modify"));
       }
     }
-    if (explicit.size === 0) return Object.freeze([]);
+    if (explicit.size === 0) return Object.freeze({ proofs: Object.freeze([]), image_reference_manifest: undefined });
     const requestedAssets = [];
     for (const [assetId, action] of explicit) {
       const asset = research.assets.items.find((item) => item.asset_id === assetId);
@@ -1267,7 +1412,7 @@ export function createCreativeApi(options = {}) {
     if (acceptedProofs.some((proof) => proof.expires_at <= completedAt)) {
       throw new CreativeApiError("permission_denied", operation, "asset_permission_evidence");
     }
-    return Object.freeze(acceptedProofs);
+    return Object.freeze({ proofs: Object.freeze(acceptedProofs), image_reference_manifest: trustedImageReferenceManifest });
   }
 
   async function beginMutation(principal, request) {
@@ -1354,7 +1499,8 @@ export function createCreativeApi(options = {}) {
     return attemptId;
   }
 
-  async function authorizeJobDispatch(principal, request, started, transportAttemptId, billableAttemptId, contextFence) {
+  async function authorizeJobDispatch(principal, request, started, transportAttemptId, billableAttemptId,
+    reservationRef, contextFence, route) {
     const authorize = requiredPort(ports, "jobs.authorizeDispatch", request.operation);
     let result;
     try {
@@ -1366,6 +1512,9 @@ export function createCreativeApi(options = {}) {
         action_id: request.action_id,
         operation: request.operation,
         ...(billableAttemptId ? { billable_attempt_id: billableAttemptId } : {}),
+        ...(reservationRef ? { reservation_ref: reservationRef } : {}),
+        ...(route?.provider?.name ? { provider_name: route.provider.name } : {}),
+        ...(route?.provider?.model ? { provider_model: route.provider.model } : {}),
         transport_attempt_id: boundedString(transportAttemptId, "transport_attempt_id", 256),
         context_fence: contextFence,
       }));
@@ -1418,7 +1567,7 @@ export function createCreativeApi(options = {}) {
       }
       catch (error) { preDispatchError = error; throw error; }
     };
-    const authorizeTransport = async (transportAttemptId) => {
+    const authorizeTransport = async (transportAttemptId, reservationRef) => {
       boundedString(transportAttemptId, "transport_attempt_id", 256);
       await checkDispatchFence();
       const existing = dispatchIntentRefs.get(transportAttemptId);
@@ -1429,7 +1578,7 @@ export function createCreativeApi(options = {}) {
       let intentRef;
       try {
         intentRef = await authorizeJobDispatch(principal, request, started, transportAttemptId,
-          attempt.billable_attempt_id, contextFence);
+          attempt.billable_attempt_id, reservationRef, contextFence, checkedRoute);
       } catch (error) {
         preDispatchError = error;
         throw error;
@@ -1452,7 +1601,48 @@ export function createCreativeApi(options = {}) {
         throw new CreativeApiError("permission_denied", request.operation, "asset_permission_evidence");
       }
     };
-    const revalidateTransport = async ({ transport_attempt_id, billable_attempt_id, dispatch_intent_ref, signal }) => {
+    const revalidateMappedDispatch = async (dispatchContext) => {
+      const transportAttemptId = dispatchContext.transport_attempt_id;
+      const expectedIntentRef = dispatchIntentRefs.get(transportAttemptId);
+      if (!expectedIntentRef || dispatchContext.attempt.billable_attempt_id !== attempt.billable_attempt_id ||
+          dispatchContext.reservation_ref === undefined || dispatchContext.dispatch_intent_ref !== expectedIntentRef ||
+          dispatchContext.signal?.aborted || deadline.signal.aborted) {
+        const error = new CreativeApiError("cancelled", request.operation, "dispatch_authorization");
+        preDispatchError = error;
+        throw error;
+      }
+      // Usage-profile mapping is an asynchronous trusted boundary. Recheck
+      // current creative/package and per-asset rights after it, then make the
+      // job/lease/context authorization the final await before C03 can decide
+      // whether a complete observation is eligible for settlement.
+      await checkDispatchFence();
+      if (dispatchContext.signal?.aborted || deadline.signal.aborted) {
+        const error = new CreativeApiError("cancelled", request.operation, "dispatch_authorization");
+        preDispatchError = error;
+        throw error;
+      }
+      let currentIntentRef;
+      try {
+        currentIntentRef = await authorizeJobDispatch(principal, request, started, transportAttemptId,
+          attempt.billable_attempt_id, dispatchContext.reservation_ref, contextFence, checkedRoute);
+      } catch (error) {
+        preDispatchError = error;
+        throw error;
+      }
+      if (currentIntentRef !== expectedIntentRef || dispatchContext.signal?.aborted || deadline.signal.aborted) {
+        const error = new CreativeApiError(currentIntentRef !== expectedIntentRef ? "stale_version" : "cancelled",
+          request.operation, "dispatch_authorization");
+        preDispatchError = error;
+        throw error;
+      }
+      try { assertFinalDispatchEligibility(dispatchContext.signal); }
+      catch (error) {
+        preDispatchError = error;
+        throw error;
+      }
+    };
+    const revalidateTransport = async ({ transport_attempt_id, billable_attempt_id, reservation_ref,
+      dispatch_intent_ref, signal }) => {
       boundedString(transport_attempt_id, "transport_attempt_id", 256);
       if (billable_attempt_id !== attempt.billable_attempt_id || signal?.aborted || deadline.signal.aborted) {
         throw new CreativeApiError("cancelled", request.operation, "dispatch_authorization");
@@ -1466,7 +1656,7 @@ export function createCreativeApi(options = {}) {
         // This atomic, idempotent authorization is intentionally the final
         // awaited fence after the external Finance ACK and before dispatch.
         freshIntentRef = await authorizeJobDispatch(principal, request, started, transport_attempt_id,
-          billable_attempt_id, contextFence);
+          billable_attempt_id, reservation_ref, contextFence, checkedRoute);
       } catch (error) {
         preDispatchError = error;
         throw error;
@@ -1494,7 +1684,8 @@ export function createCreativeApi(options = {}) {
       idFactory,
       clock: () => new Date(now()),
       signal: deadline.signal,
-      authorizeTransport: async ({ transport_attempt_id }) => authorizeTransport(transport_attempt_id),
+      authorizeTransport: async ({ transport_attempt_id, reservation_ref }) =>
+        authorizeTransport(transport_attempt_id, reservation_ref),
       revalidateTransport,
       dispatch: async (dispatchContext) => {
         const transportAttemptId = dispatchContext.transport_attempt_id;
@@ -1531,7 +1722,7 @@ export function createCreativeApi(options = {}) {
             let finalIntentRef;
             try {
               finalIntentRef = await authorizeJobDispatch(principal, request, started, transportId,
-                dispatchContext.attempt.billable_attempt_id, contextFence);
+                dispatchContext.attempt.billable_attempt_id, dispatchContext.reservation_ref, contextFence, checkedRoute);
             } catch (error) {
               preDispatchError = error;
               throw error;
@@ -1552,14 +1743,22 @@ export function createCreativeApi(options = {}) {
         }); } catch (error) {
           const failed = providerFailureUsage(error);
           if (!failed) throw error;
-          const usage_observation = usageObservation(dispatchContext.attempt, meteredTrustedScope(principal),
-            failed.usage, usageProfile, transportAttemptId, idFactory);
+          const usage_observation = await usageObservation({ attempt: dispatchContext.attempt,
+            trustedScope: meteredTrustedScope(principal), rawUsage: failed.usage, profile: usageProfile,
+            transportAttemptId, idFactory, usageProfileAuthority: telemetry.usage_profile_authority,
+            targetBindingSha256: failed.target_binding_sha256, reservationRef: dispatchContext.reservation_ref,
+            dispatchIntentRef: dispatch_intent_ref, providerOutcome: failed.provider_outcome });
+          await revalidateMappedDispatch(dispatchContext);
           return { provider_outcome: failed.provider_outcome, usage_observation };
         }
         providerValue = dispatched?.value;
         const rawUsage = dispatched?.usage;
-        const usage_observation = usageObservation(dispatchContext.attempt, meteredTrustedScope(principal),
-          rawUsage, usageProfile, transportAttemptId, idFactory);
+        const usage_observation = await usageObservation({ attempt: dispatchContext.attempt,
+          trustedScope: meteredTrustedScope(principal), rawUsage, profile: usageProfile, transportAttemptId,
+          idFactory, usageProfileAuthority: telemetry.usage_profile_authority,
+          targetBindingSha256: dispatched?.value?.target_binding_sha256, reservationRef: dispatchContext.reservation_ref,
+          dispatchIntentRef: dispatch_intent_ref, providerOutcome: dispatched?.provider_outcome ?? "succeeded" });
+        await revalidateMappedDispatch(dispatchContext);
         return { provider_outcome: dispatched?.provider_outcome ?? "succeeded", usage_observation };
       },
     });
@@ -1735,10 +1934,14 @@ export function createCreativeApi(options = {}) {
     if (operation === "edit" && plan.operation === "correction.apply") {
       throw new CreativeApiError("unavailable", operation, "correction_handoff");
     }
+    let currentReferenceManifest;
     const assertImageContext = async () => {
       await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
         expectedCurrentDesignVersionId, expectedCurrentDesignHash);
-      const proofs = await verifyRequestedAssetPermissions(started.scope, brief, plan, operation);
+      const permissionContext = await verifyRequestedAssetPermissions(started.scope, brief, plan, operation,
+        request.payload.image_reference_manifest, baseDesign, briefHash);
+      const proofs = permissionContext.proofs;
+      currentReferenceManifest = permissionContext.image_reference_manifest;
       await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
         expectedCurrentDesignVersionId, expectedCurrentDesignHash);
       const checkedAt = new Date(now()).getTime();
@@ -1759,13 +1962,68 @@ export function createCreativeApi(options = {}) {
     const resolveRoute = requiredPort(ports, "provider.resolveRoute", operation);
     const route = routeFor(await resolveRoute(Object.freeze({ scope: started.scope, actor_id: principal.actor_id, operation, plan })), operation);
     await assertImageContext();
-    const metered = await runMetered(principal, request, started, operation === "generate" ? "image_generation" : "image_edit", route, method,
+      const privateAttributionPort = route.provider.name === "openai"
+        ? requiredPort(ports, "jobs.recordPrivateProviderAttribution", operation)
+        : ports.jobs?.recordPrivateProviderAttribution;
+      const privateUsageAttributionPort = route.provider.name === "openai"
+        ? requiredPort(ports, "jobs.recordPrivateProviderUsageAttribution", operation) : undefined;
+      const metered = await runMetered(principal, request, started, operation === "generate" ? "image_generation" : "image_edit", route, method,
       async ({ method: dispatch, scope, actor_id, started: job, route: resolved, attempt, signal, deadline_at,
         reservation_ref, transportAttemptId, dispatch_intent_ref, recordTransportAttempt }) => {
         const value = await dispatch(Object.freeze({ scope: started.scope, actor_id: principal.actor_id,
           job_id: started.job_id, attempt, route: resolved, brief, base_design: baseDesign, plan,
+          ...(currentReferenceManifest ? { image_reference_manifest: currentReferenceManifest } : {}),
           decision_result: decisionResult, reservation_ref, transport_attempt_id: transportAttemptId, dispatch_intent_ref,
           recordTransportAttempt,
+          ...(typeof privateAttributionPort === "function" ? {
+            async recordPrivateProviderRequestId(attribution) {
+              if (!isRecord(attribution) || typeof attribution.provider_request_id !== "string" ||
+                  typeof attribution.provider_request_ref !== "string") {
+                throw new CreativeApiError("failed", operation, "provider_attribution");
+              }
+              await privateAttributionPort(Object.freeze({
+                scope: started.scope,
+                actor_id: principal.actor_id,
+                job_id: started.job_id,
+                action_id: request.action_id,
+                request_hash: started.request_hash,
+                operation,
+                provider: "openai",
+                model: route.provider.model,
+                reservation_ref,
+                billable_attempt_id: attempt.billable_attempt_id,
+                transport_attempt_id: transportAttemptId,
+                dispatch_intent_ref,
+                provider_request_id: attribution.provider_request_id,
+                provider_request_ref: attribution.provider_request_ref,
+              }));
+            },
+          } : {}),
+          ...(typeof privateUsageAttributionPort === "function" ? {
+            async recordPrivateProviderUsage(attribution) {
+              if (!isRecord(attribution) || !isRecord(attribution.usage) ||
+                  typeof attribution.target_binding_sha256 !== "string") {
+                throw new CreativeApiError("failed", operation, "provider_usage_attribution");
+              }
+              await privateUsageAttributionPort(Object.freeze({
+                scope: started.scope,
+                actor_id: principal.actor_id,
+                job_id: started.job_id,
+                action_id: request.action_id,
+                request_hash: started.request_hash,
+                operation,
+                provider: "openai",
+                model: route.provider.model,
+                reservation_ref,
+                billable_attempt_id: attempt.billable_attempt_id,
+                transport_attempt_id: transportAttemptId,
+                dispatch_intent_ref,
+                target_binding_sha256: attribution.target_binding_sha256,
+                usage_sha256: canonicalHash(attribution.usage),
+                usage: attribution.usage,
+              }));
+            },
+          } : {}),
           signal, deadline_at }));
         return { value, usage: value?.usage, provider_outcome: "succeeded" };
       }, assertImageContext,
@@ -2114,7 +2372,7 @@ export function createCreativeApi(options = {}) {
       if (canonicalSerialize(beforeSubmit) !== canonicalSerialize(initialContext)) throw new CreativeApiError("stale_version", operation, "handoff_context");
       const transportAttemptId = boundedString(idFactory(), "transport_attempt_id", 256);
       const dispatchIntentRef = await authorizeJobDispatch(principal, request, started, transportAttemptId, undefined,
-        creativeContextFence(brief, design));
+        undefined, creativeContextFence(brief, design));
       const result = { handoff, receipt: null, handoff_created_at: handoffCreatedAt };
       const job = await publish(principal, request, started, result, async () => {
         const assertHandoffContextCurrent = async () => {

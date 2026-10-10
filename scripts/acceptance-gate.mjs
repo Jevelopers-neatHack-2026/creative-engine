@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalHash } from "../src/contracts/validation.mjs";
 import { evaluatePolicyAcceptance } from "../evals/creative/validator.mjs";
 import { createAccessPreflightGateReport } from "./access-preflight-check.mjs";
+import { createImageAdapterGateReport } from "./image-adapter-check.mjs";
 
 const requirements = {
   api: [
@@ -194,6 +195,20 @@ function writeAccessPreflightResult(gate) {
   process.exitCode = 2;
 }
 
+function writeImageAdapterAcceptanceResult(gate) {
+  process.stdout.write(JSON.stringify({
+    schema_version: "creative-image-adapter-acceptance-result/v1",
+    target: gate.target,
+    acceptance_allowed: false,
+    provider_dispatches: 0,
+    paid_provider_calls: 0,
+    provider_credentials_read: false,
+    model_selection: gate.model_selection,
+    missing_owner_evidence: [...gate.missing_owner_evidence],
+  }) + "\n");
+  process.exitCode = 2;
+}
+
 function writeBriefAcceptanceResult({ unmet, proposalState }) {
   process.stdout.write(JSON.stringify({
     schema_version: "creative-brief-acceptance-result/v1",
@@ -212,13 +227,17 @@ async function main() {
     writeAccessPreflightResult(createAccessPreflightGateReport());
     return;
   }
+  if (target === "image-adapter") {
+    writeImageAdapterAcceptanceResult(createImageAdapterGateReport());
+    return;
+  }
   if (target === "eval-policy") {
     const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
     writeCreativePolicyResult(evaluateCreativePolicy(repoRoot));
     return;
   }
   if (!Object.hasOwn(requirements, target) && target !== "all") {
-    process.stderr.write("Unknown acceptance target " + target + ". Use api, controls, contracts, brief, decision-contract, eval-policy, metering-contract, handoff-contract, versions, creative-metering, access-preflight, or all.\n");
+    process.stderr.write("Unknown acceptance target " + target + ". Use api, controls, contracts, brief, decision-contract, eval-policy, metering-contract, handoff-contract, versions, creative-metering, access-preflight, image-adapter, or all.\n");
     process.exitCode = 2;
     return;
   }
@@ -233,7 +252,8 @@ async function main() {
   }
   const creativePolicy = target === "all" ? evaluateCreativePolicy(repoRoot) : null;
   const accessPreflight = target === "all" ? createAccessPreflightGateReport() : null;
-  if (unmet.length > 0 || unresolved.length > 0 || creativePolicy && !creativePolicy.accepted || accessPreflight) {
+  const imageAdapter = target === "all" ? createImageAdapterGateReport() : null;
+  if (unmet.length > 0 || unresolved.length > 0 || creativePolicy && !creativePolicy.accepted || accessPreflight || imageAdapter) {
     process.stderr.write("Acceptance blocked: missing or unverified canonical owner agreement evidence or required integration evidence for " + target + " (proposal_state=" + proposalState + ").\n");
     for (const id of unmet) {
       const agreement = record.agreements?.[id];
@@ -251,6 +271,10 @@ async function main() {
       for (const cell of accessPreflight.cells) {
         process.stderr.write("- CE-A01 " + cell.cell_id + " (" + cell.reason_code + "; owner=" + cell.owner_role + ")\n");
       }
+    }
+    if (imageAdapter) {
+      process.stderr.write("Acceptance blocked: CE-03 provider selection, account access, Finance authority, and usage mapping remain pending.\n");
+      for (const evidence of imageAdapter.missing_owner_evidence) process.stderr.write("- CE-03 " + evidence + "\n");
     }
     process.exitCode = 2;
     return;

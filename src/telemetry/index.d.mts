@@ -133,6 +133,38 @@ export interface UsageObservationPersistencePort {
     authority_status: "accepted" | "duplicate";
   }): Promise<{ status: "acknowledged" | "mismatch"; source_observation_id: string }>;
 }
+
+export interface TrustedProviderUsageProfileInput {
+  readonly attempt: MeteredAttemptRequest;
+  readonly trustedScope: TrustedMeteringScope;
+  readonly rawUsage: unknown;
+  readonly rawUsageSha256: `sha256:${string}`;
+  readonly targetBindingSha256: `sha256:${string}`;
+  readonly attemptBindingSha256: `sha256:${string}`;
+  readonly sourceObservationId: string;
+  readonly transportAttemptId: string;
+  readonly reservationRef: string;
+  readonly dispatchIntentRef: string;
+  readonly providerOutcome: "succeeded" | "failed" | "partial" | "unknown";
+}
+
+export type TrustedProviderUsageProfileResult =
+  | Readonly<{ status: "unknown" }>
+  | Readonly<{
+      status: "mapped";
+      profile_ref: string;
+      profile_sha256: `sha256:${string}`;
+      raw_usage_sha256: `sha256:${string}`;
+      target_binding_sha256: `sha256:${string}`;
+      attempt_binding_sha256: `sha256:${string}`;
+      observation: UsageObservation;
+    }>;
+
+/** Trusted host owner mapping only; caller request data cannot install or select this port. */
+export interface TrustedProviderUsageProfileAuthority {
+  mapProviderUsage(input: TrustedProviderUsageProfileInput):
+    Promise<TrustedProviderUsageProfileResult> | TrustedProviderUsageProfileResult;
+}
 export declare function executeCreativeMeteredAttempt(args: {
   meteringPort: MeteringPort;
   evidencePort: TelemetryEvidencePort;
@@ -320,4 +352,6 @@ export interface CreativeTelemetryConfiguration {
   readonly modes: TelemetryModeContext;
   readonly usage_profiles: Readonly<Partial<Record<MeteredAttemptRequest["operation_kind"],
     typeof USAGE_PROFILE[keyof typeof USAGE_PROFILE]>>>;
+  /** Optional exact target/attempt-bound owner mapping. Without it, unmapped provider usage stays unknown. */
+  readonly usage_profile_authority?: TrustedProviderUsageProfileAuthority;
 }

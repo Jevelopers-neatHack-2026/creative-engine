@@ -1,6 +1,7 @@
 import type { CreativeVersionCreationEvidence } from "../api/v1.mjs";
 import type { CreativeBrief, DesignVersion, TrustedScope } from "../contracts/creative/v1.mjs";
-import type { CreativePublicationTransaction, DesignSelection } from "../api/v1.mjs";
+import type { CreativePublicationTransaction, DesignSelection, PrivateProviderRequestAttribution,
+  PrivateProviderUsageAttribution } from "../api/v1.mjs";
 
 export type VersionStoreErrorCode = "invalid_request" | "unsupported_version" | "scope_denied" | "not_found"
   | "conflict" | "stale_version" | "integrity_error" | "unknown_completion" | "unavailable" | "cancelled";
@@ -71,6 +72,12 @@ export class CreativeVersionStore {
     plan: import("../planning/index.mjs").CreativeBriefPlan; expected_brief_hash?: string | null }): BriefActionResult;
   recordAttemptEvidence(input: { scope: VersionScope; actor_id: string; job_id: string; lease_token: string;
     action_id: string; request_hash: string; creation: CreativeVersionCreationEvidence }):
+    Readonly<{ status: "recorded" | "replayed" }>;
+  /** Private backend-only request identity persistence; raw values are never returned by public job/version reads. */
+  recordPrivateProviderAttribution(input: PrivateProviderRequestAttribution):
+    Readonly<{ status: "recorded" | "replayed" }>;
+  /** Retain bounded sanitized provider usage separately from any owner mapping or Finance settlement. */
+  recordPrivateProviderUsageAttribution(input: PrivateProviderUsageAttribution):
     Readonly<{ status: "recorded" | "replayed" }>;
   saveDesignVersion(input: VersionWriteInput, options?: { faultInjector?: (point: string) => void }): Promise<VersionWriteResult>;
   prepareDesignVersion(input: VersionWriteInput, options?: { faultInjector?: (point: string) => void }): Promise<VersionWriteResult>;

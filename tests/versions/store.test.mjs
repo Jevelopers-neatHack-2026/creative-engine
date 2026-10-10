@@ -431,7 +431,7 @@ test("content-addressed storage snapshots caller bytes before its first await", 
     Buffer.from("immutable original bytes"));
 });
 
-test("storage schema v2 migrates additively to durable attempt evidence", async (t) => {
+test("storage schema v2 migrates additively to private provider attribution v5", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "creative-version-v2-migration-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const databasePath = join(root, "versions.sqlite");
@@ -446,8 +446,13 @@ test("storage schema v2 migrates additively to durable attempt evidence", async 
   ) STRICT; PRAGMA user_version=2;`);
   db.close();
   const migrated = new CreativeVersionStore({ databasePath, objectRoot });
-  assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, 4);
+  assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, 5);
   assert.equal(migrated.db.prepare("PRAGMA table_info(creative_jobs)").all()
     .some((column) => column.name === "attempt_evidence_json"), true);
+  const dispatchColumns = migrated.db.prepare("PRAGMA table_info(creative_dispatch_intents)").all();
+  for (const name of ["reservation_ref", "provider_name", "provider_model"]) {
+    assert.ok(dispatchColumns.some((column) => column.name === name));
+  }
+  assert.ok(migrated.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='private_provider_attributions'").get());
   migrated.close();
 });

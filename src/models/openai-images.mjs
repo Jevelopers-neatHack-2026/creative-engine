@@ -6,6 +6,7 @@ const GENERATION_ENDPOINT = "https://api.openai.com/v1/images/generations";
 const EDIT_ENDPOINT = "https://api.openai.com/v1/images/edits";
 const RETRY_MAPPING_REF = "openai-images-direct/retry-policy-v1";
 const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+const MAX_EDIT_INPUT_BYTES = 100 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = Math.ceil(MAX_IMAGE_BYTES * 4 / 3) + 1024 * 1024;
 const MAX_DECODED_BYTES = 64 * 1024 * 1024;
 const MAX_PROVIDER_CONTEXT_BYTES = 1024 * 1024;
@@ -26,6 +27,7 @@ const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
   return crc >>> 0;
 });
 const PRIVATE_PROVIDER_REQUEST_IDS = new WeakMap();
+const PRIVATE_TARGET_BINDING_SHA256 = new WeakMap();
 
 /** The documented candidate pin is explicit and never auto-selected. Owner capability evidence is still required. */
 export const OPENAI_IMAGE_CANDIDATE_PROFILES = Object.freeze({
@@ -76,6 +78,8 @@ function attachUsageObservation(error, usage, privateProviderRequestId) {
   }
   const rawId = privateProviderRequestId ?? (usage && PRIVATE_PROVIDER_REQUEST_IDS.get(usage));
   if (typeof rawId === "string") PRIVATE_PROVIDER_REQUEST_IDS.set(error, rawId);
+  const targetBindingSha256 = usage && PRIVATE_TARGET_BINDING_SHA256.get(usage);
+  if (typeof targetBindingSha256 === "string") PRIVATE_TARGET_BINDING_SHA256.set(error, targetBindingSha256);
 }
 
 function fail(code, message, options) {
@@ -88,6 +92,11 @@ function fail(code, message, options) {
 /** Internal runtime accessor; deliberately not re-exported from the public model barrel. */
 export function readPrivateOpenAIImageRequestId(value) {
   return value !== null && typeof value === "object" ? PRIVATE_PROVIDER_REQUEST_IDS.get(value) : undefined;
+}
+
+/** Internal runtime accessor; not exported from the public model subpath. */
+export function readPrivateOpenAIImageTargetBindingSha256(value) {
+  return value !== null && typeof value === "object" ? PRIVATE_TARGET_BINDING_SHA256.get(value) : undefined;
 }
 
 function isRecord(value) {
@@ -140,11 +149,20 @@ function snapshotProviderInput(value) {
     brief: snapshotJson(value.brief, "brief"),
     base_design: value.base_design === null ? null : snapshotJson(value.base_design, "base_design"),
     plan: snapshotJson(value.plan, "plan"),
+    ...(value.image_reference_manifest === undefined ? {} : {
+      image_reference_manifest: snapshotJson(value.image_reference_manifest, "image_reference_manifest"),
+    }),
     ...(value.decision_result === undefined ? {} : { decision_result: snapshotJson(value.decision_result, "decision_result") }),
     transport_attempt_id: value.transport_attempt_id,
     dispatch_intent_ref: value.dispatch_intent_ref,
     reservation_ref: value.reservation_ref,
     recordTransportAttempt: value.recordTransportAttempt,
+    ...(typeof value.recordPrivateProviderRequestId === "function" ? {
+      recordPrivateProviderRequestId: value.recordPrivateProviderRequestId,
+    } : {}),
+    ...(typeof value.recordPrivateProviderUsage === "function" ? {
+      recordPrivateProviderUsage: value.recordPrivateProviderUsage,
+    } : {}),
     signal: value.signal,
     deadline_at: value.deadline_at,
     attempt_number: value.attempt_number,
@@ -769,12 +787,14 @@ export function normalizeOpenAIImageUsage(raw, { transport_attempt_id, provider_
   return freezeUsageObservation(result);
 }
 
-function usageFromPayload(payload, transportAttemptId, rawProviderRequestId) {
+function usageFromPayload(payload, transportAttemptId, rawProviderRequestId, targetBindingSha256) {
   if (!isRecord(payload) || !Object.hasOwn(payload, "usage")) return undefined;
-  return normalizeOpenAIImageUsage(payload.usage, {
+  const usage = normalizeOpenAIImageUsage(payload.usage, {
     transport_attempt_id: transportAttemptId,
     provider_request_id: rawProviderRequestId,
   });
+  if (typeof targetBindingSha256 === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetBindingSha256);
+  return usage;
 }
 
 function parseRetryAfter(value, nowMs) {
@@ -810,7 +830,7 @@ export function evaluateOpenAIImageRetry({ retry_after, attempt_number, started_
 }
 
 function targetBinding({ attempt, operation, profile, config, endpoint, nodeVersion, deadlineAt,
-  inputSha256, promptSha256, planSha256, parentArtifactSha256, maskContentSha256 }) {
+  inputSha256, promptSha256, planSha256, parentArtifactSha256, maskContentSha256, imageReferenceManifestSha256 }) {
   return Object.freeze({
     service: "openai",
     endpoint,
@@ -825,6 +845,7 @@ function targetBinding({ attempt, operation, profile, config, endpoint, nodeVers
     plan_sha256: planSha256,
     ...(parentArtifactSha256 ? { parent_artifact_sha256: parentArtifactSha256 } : {}),
     ...(maskContentSha256 ? { mask_content_sha256: maskContentSha256 } : {}),
+    ...(imageReferenceManifestSha256 ? { image_reference_manifest_sha256: imageReferenceManifestSha256 } : {}),
     deadline_at: deadlineAt,
     transport_policy: Object.freeze({
       maximum_transport_attempts: 1,
@@ -864,10 +885,48 @@ function validateAttempt(input, operation, profile) {
     const allowedParameters = new Set(["design_version_id", "artifact_id", "instruction", "mask_source_ref"]);
     if (input.plan.steps.length !== 1 || step?.action !== "image.edit" || !isRecord(parameters) ||
         Object.keys(parameters).some((key) => !allowedParameters.has(key))) {
-      fail("unsupported_plan", "Only one parent-based edit with an optional mask is supported; extra image references require a typed contract.", {
+      fail("unsupported_plan", "Only one parent-based edit with an optional mask and a separately validated reference manifest is supported.", {
         outcome: "failed", field: "plan.steps",
       });
     }
+    const manifest = input.image_reference_manifest;
+    if (manifest !== undefined) {
+      const manifestKeys = ["contract", "schema_version", "tenant_id", "project_id", "brief_id", "brief_hash",
+        "research_package_id", "research_package_hash", "base_design_version_id", "base_design_hash", "references"];
+      if (!isRecord(manifest) || Object.keys(manifest).some((key) => !manifestKeys.includes(key)) ||
+          manifest.contract !== "CreativeImageReferenceManifest" || manifest.schema_version !== "1.0" ||
+          manifest.tenant_id !== input.scope.tenant_id || manifest.project_id !== input.scope.project_id ||
+          manifest.brief_id !== input.brief.brief_id || !HASH.test(manifest.brief_hash) ||
+          !HASH.test(manifest.research_package_hash) || manifest.research_package_id !== input.brief.research_package_ref?.package_id ||
+          manifest.base_design_version_id !== input.base_design?.design_version_id ||
+          manifest.base_design_hash !== input.base_design?.design_hash ||
+          !Array.isArray(manifest.references) || manifest.references.length < 1 || manifest.references.length > 15) {
+        fail("invalid_reference_manifest", "Edit image references must match a bounded trusted manifest.", { outcome: "failed", field: "image_reference_manifest" });
+      }
+      const refs = new Set();
+      const assets = new Set();
+      for (const [index, reference] of manifest.references.entries()) {
+        const keys = ["source_ref", "asset_id", "content_hash", "media_type", "width", "height"];
+        if (!isRecord(reference) || Object.keys(reference).some((key) => !keys.includes(key)) ||
+            typeof reference.source_ref !== "string" || !OPAQUE_REF.test(reference.source_ref) ||
+            typeof reference.asset_id !== "string" || !OPAQUE_REF.test(reference.asset_id) ||
+            !HASH.test(reference.content_hash) || !["image/png", "image/jpeg", "image/webp"].includes(reference.media_type) ||
+            !Number.isSafeInteger(reference.width) || !Number.isSafeInteger(reference.height) ||
+            reference.width < 1 || reference.height < 1 || reference.width > 4096 || reference.height > 4096 ||
+            reference.width * reference.height > MAX_PIXELS || refs.has(reference.source_ref) || assets.has(reference.asset_id) ||
+            !input.plan.source_refs?.includes(reference.source_ref)) {
+          fail("invalid_reference_manifest", "Edit image references must be distinct, scoped, and bounded.", {
+            outcome: "failed", field: `image_reference_manifest.references[${index}]`,
+          });
+        }
+        refs.add(reference.source_ref);
+        assets.add(reference.asset_id);
+      }
+    }
+  } else if (input.image_reference_manifest !== undefined) {
+    fail("invalid_reference_manifest", "Extra image inputs are supported only by the documented edit operation.", {
+      outcome: "failed", field: "image_reference_manifest",
+    });
   }
   if (input.signal.aborted) fail("cancelled_before_dispatch", "Image request was cancelled before provider dispatch.", { outcome: "failed" });
   const identities = [input.attempt.logical_operation_id, input.attempt.billable_attempt_id,
@@ -1005,6 +1064,32 @@ async function prepareEditAssets(input, assetPort) {
     fail("asset_unavailable", "A trusted immutable artifact reader is required for image edits.", { outcome: "failed" });
   }
   const parent = await maskAndReferenceBytes(input, assetPort, true);
+  const references = [];
+  let totalInputBytes = parent.bytes.byteLength;
+  for (const manifestReference of input.image_reference_manifest?.references ?? []) {
+    if (typeof assetPort.readReference !== "function") {
+      fail("asset_unavailable", "A scoped immutable image reference reader is required for image edits.", { outcome: "failed" });
+    }
+    const raw = await callTrustedPort("asset_unavailable", "A scoped immutable image reference could not be read.", () =>
+      assetPort.readReference({ scope: input.scope, source_ref: manifestReference.source_ref,
+        asset_id: manifestReference.asset_id, content_hash: manifestReference.content_hash,
+        expected_media_type: manifestReference.media_type, purpose: "image_input" }), "failed");
+    if (!(raw instanceof Uint8Array) || raw.byteLength === 0 || raw.byteLength > MAX_IMAGE_BYTES ||
+        sha256(raw) !== manifestReference.content_hash) {
+      fail("asset_integrity_error", "Reference image bytes do not match the immutable manifest.", { outcome: "failed" });
+    }
+    totalInputBytes += raw.byteLength;
+    if (totalInputBytes > MAX_EDIT_INPUT_BYTES) {
+      fail("asset_invalid", "Combined edit inputs exceed the bounded aggregate byte limit.", { outcome: "failed" });
+    }
+    const bytes = Buffer.from(raw);
+    const info = await inspectOpenAIImageBytes(bytes);
+    if (`image/${info.format}` !== manifestReference.media_type || info.width !== manifestReference.width ||
+        info.height !== manifestReference.height) {
+      fail("asset_integrity_error", "Reference image dimensions or media type do not match the immutable manifest.", { outcome: "failed" });
+    }
+    references.push({ bytes, info, manifest: manifestReference });
+  }
   let mask;
   const maskRef = parent.step.parameters.mask_source_ref;
   if (maskRef !== undefined) {
@@ -1017,13 +1102,20 @@ async function prepareEditAssets(input, assetPort) {
       fail("mask_invalid", "Mask bytes are empty or exceed the boundary limit.", { outcome: "failed" });
     }
     const bytes = Buffer.from(rawMask);
-    const info = inspectPng(bytes);
+    totalInputBytes += bytes.byteLength;
+    if (totalInputBytes > MAX_EDIT_INPUT_BYTES) {
+      fail("mask_invalid", "Combined edit inputs exceed the bounded aggregate byte limit.", { outcome: "failed" });
+    }
+    const info = await inspectOpenAIImageBytes(bytes);
+    if (info.format !== "png") {
+      fail("mask_invalid", "The edit mask must be a decodable PNG image.", { outcome: "failed" });
+    }
     if (!info.has_alpha || !info.has_transparency || info.width !== parent.info.width || info.height !== parent.info.height) {
       fail("mask_invalid", "Mask must contain transparent alpha pixels and match parent artwork dimensions.", { outcome: "failed" });
     }
     mask = { bytes, source_ref: maskRef };
   }
-  return { parent, mask };
+  return { parent, references, mask, total_input_bytes: totalInputBytes };
 }
 
 function makePrompt(input, promptPort, operation) {
@@ -1065,6 +1157,10 @@ function makeBody(operation, input, config, profile, prompt, editAssets) {
   form.set("background", config.background);
   form.set("moderation", config.moderation);
   form.append("image[]", new Blob([editAssets.parent.bytes], { type: input.base_design.artifact.media_type }), "parent-artwork");
+  for (let index = 0; index < editAssets.references.length; index += 1) {
+    const reference = editAssets.references[index];
+    form.append("image[]", new Blob([reference.bytes], { type: reference.manifest.media_type }), `reference-${index + 1}`);
+  }
   if (editAssets.mask) form.set("mask", new Blob([editAssets.mask.bytes], { type: "image/png" }), "edit-mask.png");
   return { content_type: undefined, body: form };
 }
@@ -1094,11 +1190,24 @@ function knownProviderError(payload, status) {
   return { code: "provider_request_failed", outcome: status >= 500 ? "unknown" : "failed" };
 }
 
-async function providerError(response, retryContext, providerRequestRef, rawProviderRequestId, transportAttemptId, now) {
+async function providerError(response, retryContext, providerRequestRef, rawProviderRequestId, transportAttemptId,
+  targetBindingSha256, recordPrivateProviderUsage, now) {
   let payload;
   try { payload = await readJsonBounded(response); } catch { payload = {}; }
   const mapped = knownProviderError(payload, response.status);
-  const usage = usageFromPayload(payload, transportAttemptId, rawProviderRequestId);
+  let usage = usageFromPayload(payload, transportAttemptId, rawProviderRequestId, targetBindingSha256);
+  if (usage && typeof recordPrivateProviderUsage === "function") {
+    try {
+      await recordPrivateProviderUsage(Object.freeze({ target_binding_sha256: targetBindingSha256, usage }));
+    } catch {
+      usage = normalizeOpenAIImageUsage({
+        ...usage,
+        completeness: "unknown",
+        missing_fields: [...usage.missing_fields, "private_usage_attribution_unavailable"],
+      }, { transport_attempt_id: transportAttemptId, provider_request_id: rawProviderRequestId });
+      if (typeof targetBindingSha256 === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetBindingSha256);
+    }
+  }
   let retry;
   if ((response.status === 429 && mapped.code === "provider_rate_limited") || response.status === 503) {
     const errorNow = now();
@@ -1182,14 +1291,20 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
     const planSha256 = hashJson(input.plan);
     const parentArtifactSha256 = editAssets ? sha256(editAssets.parent.bytes) : undefined;
     const maskContentSha256 = editAssets?.mask ? sha256(editAssets.mask.bytes) : undefined;
+    const imageReferenceManifestSha256 = input.image_reference_manifest
+      ? hashJson(input.image_reference_manifest) : undefined;
+    const referenceContentHashes = editAssets?.references.map((reference) => sha256(reference.bytes)) ?? [];
     const inputSha256 = hashJson({
       plan_sha256: planSha256,
       prompt_sha256: promptSha256,
       ...(parentArtifactSha256 ? { parent_artifact_sha256: parentArtifactSha256 } : {}),
+      ...(referenceContentHashes.length ? { reference_artifact_sha256s: referenceContentHashes } : {}),
+      ...(imageReferenceManifestSha256 ? { image_reference_manifest_sha256: imageReferenceManifestSha256 } : {}),
       ...(maskContentSha256 ? { mask_content_sha256: maskContentSha256 } : {}),
     });
     const binding = targetBinding({ attempt: input.attempt, operation, profile, config, endpoint, nodeVersion,
-      deadlineAt: input.deadline_at, inputSha256, promptSha256, planSha256, parentArtifactSha256, maskContentSha256 });
+      deadlineAt: input.deadline_at, inputSha256, promptSha256, planSha256, parentArtifactSha256,
+      maskContentSha256, imageReferenceManifestSha256 });
     const targetSha = hashJson(binding);
     const capabilityExpected = {
       scope: input.scope,
@@ -1297,16 +1412,39 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
     } catch {
       fail("provider_transport_unknown", "Image provider transport ended without a confirmed response.", { outcome: "unknown" });
     }
-    if (!response || typeof response.ok !== "boolean" || !Number.isInteger(response.status) || !response.body) {
-      fail("provider_response_invalid", "Provider transport returned an invalid response envelope.", { outcome: "unknown" });
-    }
     const rawProviderRequestId = responseHeader(response, "x-request-id");
     const providerRequestRef = safeProviderRequestRef(rawProviderRequestId);
+    if (typeof rawProviderRequestId === "string") {
+      if (!providerRequestRef || rawProviderRequestId.length > 16_384 || /[\u0000-\u001f\u007f]/.test(rawProviderRequestId)) {
+        fail("private_attribution_unavailable", "Private provider response attribution could not be durably recorded.", {
+          outcome: "unknown", provider_request_ref: providerRequestRef,
+        });
+      }
+      if (typeof input.recordPrivateProviderRequestId === "function") {
+        try {
+          await input.recordPrivateProviderRequestId(Object.freeze({
+            provider_request_id: rawProviderRequestId,
+            provider_request_ref: providerRequestRef,
+          }));
+        } catch {
+          fail("private_attribution_unavailable", "Private provider response attribution could not be durably recorded.", {
+            outcome: "unknown", provider_request_ref: providerRequestRef,
+          });
+        }
+      }
+    }
+    if (!response || typeof response.ok !== "boolean" || !Number.isInteger(response.status) || !response.body) {
+      fail("provider_response_invalid", "Provider transport returned an invalid response envelope.", {
+        outcome: "unknown", provider_request_ref: providerRequestRef,
+        private_provider_request_id: rawProviderRequestId,
+      });
+    }
     if (!response.ok) {
       await providerError(response, { attempt_number: input.attempt_number ?? 1,
         started_at: input.started_at ?? new Date(initialNow).toISOString(), deadline_at: input.deadline_at,
         max_attempts: retryPolicy.max_attempts ?? 3, max_elapsed_ms: retryPolicy.max_elapsed_ms ?? 60_000,
-        max_delay_ms: retryPolicy.max_delay_ms ?? 10_000 }, providerRequestRef, rawProviderRequestId, transportId, now);
+        max_delay_ms: retryPolicy.max_delay_ms ?? 10_000 }, providerRequestRef, rawProviderRequestId, transportId,
+        targetSha, input.recordPrivateProviderUsage, now);
     }
     let payload;
     try { payload = await readJsonBounded(response); } catch (error) {
@@ -1320,7 +1458,24 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
       transport_attempt_id: transportId,
       provider_request_id: rawProviderRequestId,
     });
+    if (typeof targetSha === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetSha);
     const observedUsage = Object.hasOwn(payload, "usage") ? usage : undefined;
+    if (observedUsage && typeof input.recordPrivateProviderUsage === "function") {
+      try {
+        await input.recordPrivateProviderUsage(Object.freeze({ target_binding_sha256: targetSha, usage: observedUsage }));
+      } catch {
+        const unavailableUsage = normalizeOpenAIImageUsage({
+          ...observedUsage,
+          completeness: "unknown",
+          missing_fields: [...observedUsage.missing_fields, "private_usage_attribution_unavailable"],
+        }, { transport_attempt_id: transportId, provider_request_id: rawProviderRequestId });
+        PRIVATE_TARGET_BINDING_SHA256.set(unavailableUsage, targetSha);
+        const error = new OpenAIImagesProviderError("private_usage_attribution_unavailable",
+          "Private provider usage attribution could not be durably recorded.", { outcome: "unknown" });
+        attachUsageObservation(error, unavailableUsage, rawProviderRequestId);
+        throw error;
+      }
+    }
     if (input.signal.aborted || now() >= deadlineMs) {
       fail("provider_outcome_unknown", "Cancellation or deadline occurred after transport; output remains unpublished.", {
         outcome: "unknown", provider_request_ref: providerRequestRef, usage: observedUsage,
@@ -1377,6 +1532,7 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
       artifact_bytes: Uint8Array.from(bytes),
       provider: "openai",
       model: profile.model_id,
+      target_binding_sha256: targetSha,
       usage,
     });
   }

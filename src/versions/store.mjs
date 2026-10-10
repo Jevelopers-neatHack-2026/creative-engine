@@ -18,7 +18,7 @@ import {
 import { createCreativeBriefStore } from "../planning/index.mjs";
 import { initializeCreativeBriefDatabase } from "../planning/store.mjs";
 
-const STORAGE_VERSION = 4;
+const STORAGE_VERSION = 5;
 const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 const ID_PATTERN = /^[A-Za-z0-9_.:-]{1,256}$/;
 const HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
@@ -329,7 +329,7 @@ function readStoredObjectSync(objectRoot, contentHash) {
 
 function makeSchema(db) {
   const version = db.prepare("PRAGMA user_version").get().user_version;
-  if (![0, 1, 2, 3, STORAGE_VERSION].includes(version)) {
+  if (![0, 1, 2, 3, 4, STORAGE_VERSION].includes(version)) {
     db.close();
     reject("unsupported_version", "storage_version");
   }
@@ -412,6 +412,9 @@ function makeSchema(db) {
       job_id TEXT NOT NULL,
       transport_attempt_id TEXT NOT NULL,
       billable_attempt_id TEXT,
+      reservation_ref TEXT,
+      provider_name TEXT,
+      provider_model TEXT,
       dispatch_intent_ref TEXT NOT NULL,
       context_fence_json TEXT NOT NULL,
       authorized_at TEXT NOT NULL,
@@ -420,6 +423,59 @@ function makeSchema(db) {
       FOREIGN KEY(tenant_id, project_id, job_id)
         REFERENCES creative_jobs(tenant_id, project_id, job_id)
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS private_provider_attributions (
+      tenant_id TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      action_id TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      operation TEXT NOT NULL CHECK(operation IN ('generate','edit')),
+      provider_name TEXT NOT NULL CHECK(provider_name='openai'),
+      provider_model TEXT NOT NULL,
+      reservation_ref TEXT NOT NULL,
+      billable_attempt_id TEXT NOT NULL,
+      transport_attempt_id TEXT NOT NULL,
+      dispatch_intent_ref TEXT NOT NULL,
+      provider_request_id TEXT NOT NULL,
+      provider_request_ref TEXT NOT NULL,
+      captured_at TEXT NOT NULL,
+      PRIMARY KEY(tenant_id,project_id,job_id,transport_attempt_id),
+      UNIQUE(tenant_id,project_id,dispatch_intent_ref),
+      FOREIGN KEY(tenant_id,project_id,job_id,transport_attempt_id)
+        REFERENCES creative_dispatch_intents(tenant_id,project_id,job_id,transport_attempt_id)
+    ) STRICT;
+    CREATE TRIGGER IF NOT EXISTS private_provider_attributions_no_update
+      BEFORE UPDATE ON private_provider_attributions BEGIN SELECT RAISE(ABORT,'private provider attribution is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS private_provider_attributions_no_delete
+      BEFORE DELETE ON private_provider_attributions BEGIN SELECT RAISE(ABORT,'private provider attribution is immutable'); END;
+    CREATE TABLE IF NOT EXISTS private_provider_usage_attributions (
+      tenant_id TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      action_id TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      operation TEXT NOT NULL CHECK(operation IN ('generate','edit')),
+      provider_name TEXT NOT NULL CHECK(provider_name='openai'),
+      provider_model TEXT NOT NULL,
+      reservation_ref TEXT NOT NULL,
+      billable_attempt_id TEXT NOT NULL,
+      transport_attempt_id TEXT NOT NULL,
+      dispatch_intent_ref TEXT NOT NULL,
+      target_binding_sha256 TEXT NOT NULL,
+      usage_sha256 TEXT NOT NULL,
+      usage_json TEXT NOT NULL,
+      captured_at TEXT NOT NULL,
+      PRIMARY KEY(tenant_id,project_id,job_id,transport_attempt_id),
+      UNIQUE(tenant_id,project_id,dispatch_intent_ref),
+      FOREIGN KEY(tenant_id,project_id,job_id,transport_attempt_id)
+        REFERENCES creative_dispatch_intents(tenant_id,project_id,job_id,transport_attempt_id)
+    ) STRICT;
+    CREATE TRIGGER IF NOT EXISTS private_provider_usage_attributions_no_update
+      BEFORE UPDATE ON private_provider_usage_attributions BEGIN SELECT RAISE(ABORT,'private provider usage attribution is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS private_provider_usage_attributions_no_delete
+      BEFORE DELETE ON private_provider_usage_attributions BEGIN SELECT RAISE(ABORT,'private provider usage attribution is immutable'); END;
     CREATE TABLE IF NOT EXISTS creative_cancel_requests (
       tenant_id TEXT NOT NULL,
       project_id TEXT NOT NULL,
@@ -509,6 +565,12 @@ function makeSchema(db) {
   const jobColumns = db.prepare("PRAGMA table_info(creative_jobs)").all();
   if (!jobColumns.some((column) => column.name === "attempt_evidence_json")) {
     db.exec("ALTER TABLE creative_jobs ADD COLUMN attempt_evidence_json TEXT");
+  }
+  const dispatchColumns = db.prepare("PRAGMA table_info(creative_dispatch_intents)").all();
+  for (const [name, type] of [["reservation_ref", "TEXT"], ["provider_name", "TEXT"], ["provider_model", "TEXT"]]) {
+    if (!dispatchColumns.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE creative_dispatch_intents ADD COLUMN ${name} ${type}`);
+    }
   }
   db.exec(`PRAGMA user_version=${STORAGE_VERSION};`);
 }
@@ -874,6 +936,179 @@ export class CreativeVersionStore {
       this.rollback();
       if (error instanceof VersionStoreError) throw error;
       reject("unavailable", "job.attempt_evidence", true);
+    }
+  }
+
+  /** Persist raw provider request identity in a private append-only table after an authorized dispatch. */
+  recordPrivateProviderAttribution(input) {
+    this.assertOpen();
+    if (!isRecord(input) || !isRecord(input.scope)) reject("invalid_request", "provider_attribution");
+    const tenant_id = reference(input.scope.tenant_id, "scope.tenant_id");
+    const project_id = reference(input.scope.project_id, "scope.project_id");
+    const actor_id = reference(input.actor_id, "actor_id");
+    const job_id = reference(input.job_id, "job_id");
+    const action_id = reference(input.action_id, "action_id");
+    const request_hash = hash(input.request_hash, "request_hash");
+    if (!['generate', 'edit'].includes(input.operation) || input.provider !== "openai") {
+      reject("invalid_request", "provider_attribution.operation");
+    }
+    const provider_model = reference(input.model, "provider_attribution.model", 256);
+    const reservation_ref = reference(input.reservation_ref, "reservation_ref");
+    const billable_attempt_id = reference(input.billable_attempt_id, "billable_attempt_id");
+    const transport_attempt_id = reference(input.transport_attempt_id, "transport_attempt_id");
+    const dispatch_intent_ref = reference(input.dispatch_intent_ref, "dispatch_intent_ref");
+    const provider_request_id = input.provider_request_id;
+    if (typeof provider_request_id !== "string" || provider_request_id.length < 1 ||
+        Buffer.byteLength(provider_request_id, "utf8") > 512 || /[\u0000-\u001f\u007f]/.test(provider_request_id)) {
+      reject("invalid_request", "provider_attribution.provider_request_id");
+    }
+    const provider_request_ref = reference(input.provider_request_ref, "provider_request_ref");
+    const expectedProviderRequestRef = `provider-request-${createHash("sha256").update(provider_request_id, "utf8").digest("hex")}`;
+    if (provider_request_ref !== expectedProviderRequestRef) reject("integrity_error", "provider_attribution.provider_request_ref");
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const job = this.db.prepare(`SELECT actor_id,action_id,request_hash,operation,status FROM creative_jobs
+        WHERE tenant_id=? AND project_id=? AND job_id=?`).get(tenant_id, project_id, job_id);
+      if (!job || job.actor_id !== actor_id || job.action_id !== action_id || job.request_hash !== request_hash ||
+          job.operation !== input.operation || !["running", "cancelled", "failed", "completed"].includes(job.status)) {
+        reject("scope_denied", "provider_attribution.job");
+      }
+      const dispatch = this.db.prepare(`SELECT billable_attempt_id,reservation_ref,dispatch_intent_ref,provider_name,provider_model
+        FROM creative_dispatch_intents WHERE tenant_id=? AND project_id=? AND job_id=? AND transport_attempt_id=?`)
+        .get(tenant_id, project_id, job_id, transport_attempt_id);
+      if (!dispatch || dispatch.billable_attempt_id !== billable_attempt_id ||
+          dispatch.reservation_ref !== reservation_ref || dispatch.dispatch_intent_ref !== dispatch_intent_ref ||
+          dispatch.provider_name !== "openai" || dispatch.provider_model !== provider_model) {
+        reject("integrity_error", "provider_attribution.dispatch");
+      }
+      const existing = this.db.prepare(`SELECT * FROM private_provider_attributions
+        WHERE tenant_id=? AND project_id=? AND job_id=? AND transport_attempt_id=?`)
+        .get(tenant_id, project_id, job_id, transport_attempt_id);
+      if (existing) {
+        const same = existing.action_id === action_id && existing.actor_id === actor_id &&
+          existing.request_hash === request_hash && existing.operation === input.operation &&
+          existing.provider_name === input.provider && existing.provider_model === provider_model &&
+          existing.reservation_ref === reservation_ref && existing.billable_attempt_id === billable_attempt_id &&
+          existing.dispatch_intent_ref === dispatch_intent_ref &&
+          existing.provider_request_id === provider_request_id && existing.provider_request_ref === provider_request_ref;
+        if (!same) reject("conflict", "provider_attribution.identity");
+        this.db.exec("COMMIT");
+        return freezeReturned({ status: "replayed" });
+      }
+      this.db.prepare(`INSERT INTO private_provider_attributions
+        (tenant_id,project_id,job_id,action_id,actor_id,request_hash,operation,provider_name,provider_model,
+          reservation_ref,billable_attempt_id,transport_attempt_id,dispatch_intent_ref,provider_request_id,
+          provider_request_ref,captured_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(tenant_id, project_id, job_id, action_id, actor_id, request_hash, input.operation, input.provider,
+          provider_model, reservation_ref, billable_attempt_id, transport_attempt_id, dispatch_intent_ref,
+          provider_request_id, provider_request_ref, this.timestamp());
+      this.db.exec("COMMIT");
+      return freezeReturned({ status: "recorded" });
+    } catch (error) {
+      this.rollback();
+      if (error instanceof VersionStoreError) throw error;
+      reject("unavailable", "provider_attribution", true);
+    }
+  }
+
+  /** Persist sanitized raw response counters separately from owner-normalized C03 units. */
+  recordPrivateProviderUsageAttribution(input) {
+    this.assertOpen();
+    if (!isRecord(input) || !isRecord(input.scope) || !isRecord(input.usage)) reject("invalid_request", "provider_usage_attribution");
+    const tenant_id = reference(input.scope.tenant_id, "scope.tenant_id");
+    const project_id = reference(input.scope.project_id, "scope.project_id");
+    const actor_id = reference(input.actor_id, "actor_id");
+    const job_id = reference(input.job_id, "job_id");
+    const action_id = reference(input.action_id, "action_id");
+    const request_hash = hash(input.request_hash, "request_hash");
+    if (!["generate", "edit"].includes(input.operation) || input.provider !== "openai") {
+      reject("invalid_request", "provider_usage_attribution.operation");
+    }
+    const provider_model = reference(input.model, "provider_usage_attribution.model", 256);
+    const reservation_ref = reference(input.reservation_ref, "reservation_ref");
+    const billable_attempt_id = reference(input.billable_attempt_id, "billable_attempt_id");
+    const transport_attempt_id = reference(input.transport_attempt_id, "transport_attempt_id");
+    const dispatch_intent_ref = reference(input.dispatch_intent_ref, "dispatch_intent_ref");
+    const target_binding_sha256 = hash(input.target_binding_sha256, "target_binding_sha256");
+    const usage = snapshotJson(input.usage, "invalid_request", "provider_usage_attribution.usage");
+    const allowed = new Set(["completeness", "input_tokens", "output_tokens", "total_tokens",
+      "input_tokens_details", "output_tokens_details", "provider_request_id", "transport_attempt_id", "missing_fields"]);
+    if (Object.keys(usage).some((key) => !allowed.has(key)) ||
+        !["complete", "partial", "incomplete", "unknown"].includes(usage.completeness) ||
+        usage.transport_attempt_id !== transport_attempt_id) {
+      reject("invalid_request", "provider_usage_attribution.usage");
+    }
+    for (const key of ["input_tokens", "output_tokens", "total_tokens"]) {
+      if (usage[key] !== undefined && (!Number.isSafeInteger(usage[key]) || usage[key] < 0)) {
+        reject("invalid_request", `provider_usage_attribution.usage.${key}`);
+      }
+    }
+    for (const key of ["input_tokens_details", "output_tokens_details"]) {
+      if (usage[key] === undefined) continue;
+      if (!isRecord(usage[key]) || Object.keys(usage[key]).some((name) => !["text_tokens", "image_tokens"].includes(name)) ||
+          Object.values(usage[key]).some((count) => !Number.isSafeInteger(count) || count < 0)) {
+        reject("invalid_request", `provider_usage_attribution.${key}`);
+      }
+    }
+    if (usage.provider_request_id !== undefined &&
+        !/^provider-request-[a-f0-9]{64}$/.test(usage.provider_request_id)) {
+      reject("invalid_request", "provider_usage_attribution.provider_request_id");
+    }
+    if (!Array.isArray(usage.missing_fields) || usage.missing_fields.length > 64 ||
+        usage.missing_fields.some((field) => typeof field !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(field))) {
+      reject("invalid_request", "provider_usage_attribution.missing_fields");
+    }
+    const usage_json = canonicalSerialize(usage);
+    if (Buffer.byteLength(usage_json, "utf8") > 32 * 1024) reject("invalid_request", "provider_usage_attribution.usage_size");
+    const usage_sha256 = canonicalHash(usage);
+    if (input.usage_sha256 !== usage_sha256) reject("integrity_error", "provider_usage_attribution.usage_sha256");
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const job = this.db.prepare(`SELECT actor_id,action_id,request_hash,operation,status FROM creative_jobs
+        WHERE tenant_id=? AND project_id=? AND job_id=?`).get(tenant_id, project_id, job_id);
+      if (!job || job.actor_id !== actor_id || job.action_id !== action_id || job.request_hash !== request_hash ||
+          job.operation !== input.operation || !["running", "cancelled", "failed", "completed"].includes(job.status)) {
+        reject("scope_denied", "provider_usage_attribution.job");
+      }
+      const dispatch = this.db.prepare(`SELECT billable_attempt_id,reservation_ref,dispatch_intent_ref,provider_name,provider_model
+        FROM creative_dispatch_intents WHERE tenant_id=? AND project_id=? AND job_id=? AND transport_attempt_id=?`)
+        .get(tenant_id, project_id, job_id, transport_attempt_id);
+      if (!dispatch || dispatch.billable_attempt_id !== billable_attempt_id ||
+          dispatch.reservation_ref !== reservation_ref || dispatch.dispatch_intent_ref !== dispatch_intent_ref ||
+          dispatch.provider_name !== "openai" || dispatch.provider_model !== provider_model) {
+        reject("integrity_error", "provider_usage_attribution.dispatch");
+      }
+      const existing = this.db.prepare(`SELECT * FROM private_provider_usage_attributions
+        WHERE tenant_id=? AND project_id=? AND job_id=? AND transport_attempt_id=?`)
+        .get(tenant_id, project_id, job_id, transport_attempt_id);
+      if (existing) {
+        const same = existing.action_id === action_id && existing.actor_id === actor_id &&
+          existing.request_hash === request_hash && existing.operation === input.operation &&
+          existing.provider_name === input.provider && existing.provider_model === provider_model &&
+          existing.reservation_ref === reservation_ref && existing.billable_attempt_id === billable_attempt_id &&
+          existing.dispatch_intent_ref === dispatch_intent_ref && existing.target_binding_sha256 === target_binding_sha256 &&
+          existing.usage_sha256 === usage_sha256 && existing.usage_json === usage_json;
+        if (!same) reject("conflict", "provider_usage_attribution.identity");
+        this.db.exec("COMMIT");
+        return freezeReturned({ status: "replayed" });
+      }
+      this.db.prepare(`INSERT INTO private_provider_usage_attributions
+        (tenant_id,project_id,job_id,action_id,actor_id,request_hash,operation,provider_name,provider_model,
+          reservation_ref,billable_attempt_id,transport_attempt_id,dispatch_intent_ref,target_binding_sha256,
+          usage_sha256,usage_json,captured_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(tenant_id, project_id, job_id, action_id, actor_id, request_hash, input.operation, input.provider,
+          provider_model, reservation_ref, billable_attempt_id, transport_attempt_id, dispatch_intent_ref,
+          target_binding_sha256, usage_sha256, usage_json, this.timestamp());
+      this.db.exec("COMMIT");
+      return freezeReturned({ status: "recorded" });
+    } catch (error) {
+      this.rollback();
+      if (error instanceof VersionStoreError) throw error;
+      reject("unavailable", "provider_usage_attribution", true);
     }
   }
 
