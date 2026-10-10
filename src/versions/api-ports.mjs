@@ -232,7 +232,7 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
       if (input.operation !== "brief.invalidate") throw new VersionStoreError("invalid_request", "operation");
       const key = `${scope.tenant_id}\u0000${scope.project_id}\u0000${action_id}`;
       const running = invalidationActionsInFlight.get(key);
-      if (running) return running.request_hash === request_hash
+      if (running) return running.actor_id === actor_id && running.request_hash === request_hash
         ? running.promise
         : Promise.resolve(Object.freeze({ public_action_status: "conflict" }));
       const perform = async () => {
@@ -268,7 +268,7 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
           invalidation: completed.result });
       };
       const promise = perform();
-      invalidationActionsInFlight.set(key, { request_hash, promise });
+      invalidationActionsInFlight.set(key, { actor_id, request_hash, promise });
       return promise.finally(() => {
         if (invalidationActionsInFlight.get(key)?.promise === promise) invalidationActionsInFlight.delete(key);
       });

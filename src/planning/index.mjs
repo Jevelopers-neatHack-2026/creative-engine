@@ -257,8 +257,15 @@ function safeJsonValue(value, field, depth = 0, state = { nodes: 0 }, screenPriv
       fail("invalid_input", "Input fields must be enumerable data properties.", field);
     }
     if (screenPrivacy && (SENSITIVE_KEY.test(key) || hasSensitivePublicText(key))) fail("sensitive_input", "Sensitive fields cannot be included in a brief output.", field);
+    // Never copy an arbitrary object key into a public diagnostic path. This
+    // snapshot is also used before privacy filtering for trusted-source input,
+    // so a malformed value under an email/credential-shaped key must not echo
+    // that key in CreativePlanningError.field.
+    const childField = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) &&
+      !SENSITIVE_KEY.test(key) && !hasSensitivePublicText(key)
+      ? `${field}.${key}` : `${field}.*`;
     Object.defineProperty(output, key, {
-      value: safeJsonValue(descriptor.value, `${field}.${key}`, depth + 1, state, screenPrivacy),
+      value: safeJsonValue(descriptor.value, childField, depth + 1, state, screenPrivacy),
       enumerable: true,
       configurable: false,
       writable: false,

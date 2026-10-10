@@ -726,6 +726,45 @@ test("an incomplete invalidation action remains retryable under the same identit
   assert.equal(system.counters.producerAck, 1);
 });
 
+test("a different actor cannot join an in-flight invalidation action with the same request hash", async (t) => {
+  let releaseApproval;
+  let approvalStartedResolve;
+  let secondApplyResolve;
+  const approvalGate = new Promise((resolve) => { releaseApproval = resolve; });
+  const approvalStarted = new Promise((resolve) => { approvalStartedResolve = resolve; });
+  const secondApplyStarted = new Promise((resolve) => { secondApplyResolve = resolve; });
+  let approvalCalls = 0;
+  const system = await setup(t, { planning: { approvalStaleness: { async markBriefStale(item) {
+    approvalCalls += 1;
+    approvalStartedResolve();
+    await approvalGate;
+    return { ...item, status: "acknowledged" };
+  } } } });
+  const created = await createBrief(system.api, "brief-inflight-actor-binding");
+  const event = invalidationEvent(created.result.brief, { eventId: "inflight-actor-binding-event", revision: 2 });
+  system.eventById.set(event.event_id, event);
+  const invalidate = request("brief.invalidate", "shared-inflight-invalidation-action", { event_id: event.event_id });
+  const firstPromise = system.api.invoke(actor(), invalidate);
+  await approvalStarted;
+
+  const originalApply = system.ports.planning.applyInvalidation;
+  system.ports.planning.applyInvalidation = (input) => {
+    if (input.actor_id === "actor-brief-api-other") secondApplyResolve();
+    return originalApply(input);
+  };
+  const otherActor = { ...actor(), actor_id: "actor-brief-api-other" };
+  const secondPromise = system.api.invoke(otherActor, invalidate);
+  await secondApplyStarted;
+  releaseApproval();
+  const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(second.ok, false);
+  assert.equal(second.error.code, "conflict");
+  assert.equal(approvalCalls, 1);
+  assert.equal(system.counters.producerAck, 1);
+});
+
 test("hard exit after local invalidation commit leaves a pending receipt that replays safely after reopen", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "creative-brief-hard-exit-"));
   const databasePath = join(directory, "creative.sqlite");

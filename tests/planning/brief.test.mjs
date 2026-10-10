@@ -175,6 +175,19 @@ test("public planning inputs are copied from bounded own data descriptors before
   assert.equal(JSON.stringify(currentPlan).includes(sensitive), false);
 });
 
+test("malformed trusted source values never echo sensitive object keys in public planning errors", () => {
+  const sensitiveKey = "person@example.test";
+  for (const invalidValue of [undefined, () => "private"]) {
+    const research = completeResearchPackage();
+    research.preferences.items[0][sensitiveKey] = invalidValue;
+    let failure;
+    try { plan(research); } catch (error) { failure = error; }
+    assert.equal(failure?.code, "invalid_input");
+    assert.equal(`${failure?.message ?? ""} ${failure?.field ?? ""} ${JSON.stringify(failure)}`.includes(sensitiveKey), false);
+    assert.equal(failure?.field?.includes("*") ?? false, true, "unsafe input keys are replaced by a stable path segment");
+  }
+});
+
 test("company-URL event evidence is hash-bound and remains a source reference rather than a permission grant", () => {
   const input = companyUrlResearchPackage();
   const result = plan(input);
