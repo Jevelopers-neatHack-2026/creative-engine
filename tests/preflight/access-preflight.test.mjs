@@ -582,6 +582,31 @@ test('plan candidate and provider identifiers reject credential and personal-add
   }
 });
 
+test('provider endpoint host and path reject encoded credentials and personal addresses while safe HTTPS paths remain valid', () => {
+  const credential = `ghp_${'SyntheticCredentialValue'.repeat(2)}`;
+  const cases = [
+    `https://provider.example.invalid/${credential}`,
+    'https://provider.example.invalid/person@example.invalid',
+    'https://provider.example.invalid/person%40example.invalid',
+    'https://provider.example.invalid/%67hp%5FSyntheticCredentialValueSyntheticCredentialValue',
+    'https://provider.example.invalid/%2567hp%255FSyntheticCredentialValueSyntheticCredentialValue',
+  ];
+  for (const endpoint of cases) {
+    const plan = structuredClone(createMockAccessFixture().plan);
+    plan.cells.find((entry) => entry.cell_id === 'image_generation').target.endpoint = endpoint;
+    const normalized = validateAccessPlan(plan, fixtureScope);
+    assert.equal(normalized.cells[0].input_status, 'invalid', endpoint);
+    assert.equal(normalized.cells[0].input_error_code, 'invalid_endpoint', endpoint);
+    assert.doesNotMatch(JSON.stringify(normalized), /ghp_|SyntheticCredentialValue|person@example\.invalid/, endpoint);
+  }
+
+  const safePlan = structuredClone(createMockAccessFixture().plan);
+  safePlan.cells.find((entry) => entry.cell_id === 'image_generation').target.endpoint = 'https://provider.example.invalid/v1/images/generate';
+  const normalizedSafePlan = validateAccessPlan(safePlan, fixtureScope);
+  assert.equal(normalizedSafePlan.cells[0].input_status, 'valid');
+  assert.equal(normalizedSafePlan.cells[0].target.endpoint, 'https://provider.example.invalid/v1/images/generate');
+});
+
 test('configuration screening catches canonical Basic credentials without rejecting ordinary prose and hides them from reports', async () => {
   const basicCredentials = [
     'Basic dTpw',

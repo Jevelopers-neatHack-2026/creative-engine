@@ -103,6 +103,22 @@ function hasSensitiveValue(value) {
   return SENSITIVE_VALUE.test(value) || hasBasicCredential(value);
 }
 
+function hasSensitiveUrlComponent(value) {
+  let decoded = value;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (hasSensitiveValue(decoded)) return true;
+    let next;
+    try {
+      next = decodeURIComponent(decoded);
+    } catch {
+      return true;
+    }
+    if (next === decoded) return false;
+    decoded = next;
+  }
+  return true;
+}
+
 export class AccessPreflightError extends Error {
   constructor(code, message, field = undefined) {
     super(message);
@@ -216,6 +232,9 @@ function validateTarget(target, expectedCell) {
   }
   if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash) {
     fail('invalid_endpoint', 'Endpoint must be an HTTPS URL without embedded credentials or query data.', 'target.endpoint');
+  }
+  if ([parsed.hostname, ...parsed.pathname.split('/')].some(hasSensitiveUrlComponent)) {
+    fail('invalid_endpoint', 'Endpoint host and path cannot contain credentials or personal data.', 'target.endpoint');
   }
   const model = target.model === null ? null : id(target.model, 'target.model');
   const sdk = target.sdk === null ? null : record(target.sdk, 'target.sdk');
