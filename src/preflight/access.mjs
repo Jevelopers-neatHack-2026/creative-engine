@@ -233,7 +233,7 @@ function validateTarget(target, expectedCell) {
   if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash) {
     fail('invalid_endpoint', 'Endpoint must be an HTTPS URL without embedded credentials or query data.', 'target.endpoint');
   }
-  if ([parsed.hostname, ...parsed.pathname.split('/')].some(hasSensitiveUrlComponent)) {
+  if ([parsed.hostname, parsed.pathname, ...parsed.pathname.split('/')].some(hasSensitiveUrlComponent)) {
     fail('invalid_endpoint', 'Endpoint host and path cannot contain credentials or personal data.', 'target.endpoint');
   }
   const model = target.model === null ? null : id(target.model, 'target.model');

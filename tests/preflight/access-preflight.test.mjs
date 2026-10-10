@@ -590,6 +590,8 @@ test('provider endpoint host and path reject encoded credentials and personal ad
     'https://provider.example.invalid/person%40example.invalid',
     'https://provider.example.invalid/%67hp%5FSyntheticCredentialValueSyntheticCredentialValue',
     'https://provider.example.invalid/%2567hp%255FSyntheticCredentialValueSyntheticCredentialValue',
+    'https://provider.example.invalid/Bearer%20/x',
+    'https://provider.example.invalid/Basic%20w7/DvzpwYXNzd29yZA==',
   ];
   for (const endpoint of cases) {
     const plan = structuredClone(createMockAccessFixture().plan);
