@@ -1,0 +1,167 @@
+import type {
+  MeteredAttemptOutcome,
+  MeteredAttemptRequest,
+  MeteringPort,
+  TrustedMeteringScope,
+  UsageObservation,
+} from "../contracts/metering.mjs";
+
+export declare const CREATIVE_TELEMETRY_SCHEMA: "creative.telemetry.evidence/v1";
+export declare const USAGE_PROFILE: Readonly<{
+  NORMALIZED: "creative.normalized-token-usage/1";
+  OPENAI_RESPONSES: "openai.responses-usage/2026-10-10";
+  OPENAI_GPT_IMAGE_1: "openai.gpt-image-1-usage/2026-10-10";
+  TYPESAFE_DECISION: "typesafe.systemone-usage/2026-10-10";
+}>;
+export declare const TELEMETRY_PROVIDER_MODES: readonly ["mock", "recorded", "sandbox", "live", "unknown"];
+export declare const TELEMETRY_COMMERCE_MODES: readonly ["simulated", "live", "unknown"];
+
+export interface TelemetryModeContext {
+  provider_execution_mode: typeof TELEMETRY_PROVIDER_MODES[number];
+  commerce_mode: typeof TELEMETRY_COMMERCE_MODES[number];
+}
+
+export interface CreativeTelemetryEvidence {
+  readonly schema_version: typeof CREATIVE_TELEMETRY_SCHEMA;
+  readonly event_id: string;
+  readonly tenant_id: string;
+  readonly project_id: string;
+  readonly budget_scope_id: string;
+  readonly producer: "creative-engine.telemetry";
+  readonly occurred_at: string;
+  readonly environment: MeteredAttemptRequest["environment"];
+  readonly billing_mode: MeteredAttemptRequest["billing_mode"];
+  readonly provider_execution_mode: TelemetryModeContext["provider_execution_mode"];
+  readonly commerce_mode: TelemetryModeContext["commerce_mode"];
+  readonly logical_operation_id: string;
+  readonly billable_attempt_id: string;
+  readonly operation_kind: MeteredAttemptRequest["operation_kind"];
+  readonly event_type: "attempt_intent" | "transport_intent" | "attempt_outcome";
+  readonly provider: Readonly<{ name: string; model: string }>;
+  readonly reservation_ref?: string;
+  readonly transport_attempt_id?: string;
+  readonly provider_request_id?: string;
+  readonly source_observation_id?: string;
+  readonly provider_outcome?: "succeeded" | "failed" | "partial" | "unknown";
+  readonly metering_status?: string;
+  readonly usage_completeness?: "complete" | "partial" | "unknown";
+  readonly missing_fields?: readonly string[];
+}
+
+export declare class TelemetryPrivacyError extends Error {
+  constructor(code?: string);
+  readonly code: string;
+  readonly field: "evidence";
+}
+export declare class TelemetryBoundaryError extends Error {
+  constructor(code?: string);
+  readonly code: string;
+  readonly field: "telemetry";
+}
+
+export declare function containsSensitivePublicText(value: unknown): value is string;
+export declare function isSensitivePublicField(value: unknown): value is string;
+export declare function assertSafePublicIdentifier(value: unknown, options?: { maxLength?: number }): string;
+export declare function projectPublicTelemetry(
+  value: unknown,
+  limits?: { maxDepth?: number; maxNodes?: number; maxBytes?: number },
+): Readonly<{ value: unknown; redactions: readonly Readonly<{ path: string; reason: "sensitive_value_redacted" | "sensitive_field_omitted" }>[] }>;
+
+export declare function createUsageObservation(args: {
+  attempt: MeteredAttemptRequest;
+  trustedScope: TrustedMeteringScope;
+  usage: unknown;
+  profile: typeof USAGE_PROFILE[keyof typeof USAGE_PROFILE];
+  sourceObservationId: string;
+  source?: UsageObservation["source"];
+  providerRequestId?: string;
+  transportAttemptId?: string;
+}): UsageObservation;
+export declare function deduplicateUsageObservations(observations: readonly UsageObservation[]): readonly UsageObservation[];
+
+export declare function createTelemetryEvidence(args: {
+  eventId: string;
+  type: CreativeTelemetryEvidence["event_type"];
+  attempt: MeteredAttemptRequest;
+  trustedScope: TrustedMeteringScope;
+  modes: TelemetryModeContext;
+  occurredAt: string;
+  reservationRef?: string;
+  transportAttemptId?: string;
+  providerRequestId?: string;
+  sourceObservationId?: string;
+  providerOutcome?: CreativeTelemetryEvidence["provider_outcome"];
+  meteringStatus?: string;
+  usageCompleteness?: CreativeTelemetryEvidence["usage_completeness"];
+  missingFields?: readonly string[];
+}): CreativeTelemetryEvidence;
+
+export interface TelemetryEvidencePort {
+  append(event: CreativeTelemetryEvidence): Promise<{
+    status: "recorded" | "duplicate";
+    event_id: string;
+  }>;
+}
+export type DeepReadonly<T> = T extends (...args: never[]) => unknown
+  ? T
+  : T extends object
+    ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+    : T;
+export interface MeteredDispatchWithEvidenceContext {
+  readonly attempt: DeepReadonly<MeteredAttemptRequest>;
+  readonly reservation_ref: string;
+  readonly transport_attempt_id: string;
+  readonly signal?: AbortSignal;
+  recordTransportAttempt(transportAttemptId: string): Promise<string>;
+}
+export declare function executeCreativeMeteredAttempt(args: {
+  meteringPort: MeteringPort;
+  evidencePort: TelemetryEvidencePort;
+  request: MeteredAttemptRequest;
+  trustedScope: TrustedMeteringScope;
+  modes: TelemetryModeContext;
+  dispatch(context: MeteredDispatchWithEvidenceContext): Promise<{
+    provider_outcome?: "succeeded" | "failed" | "partial" | "unknown";
+    usage_observation?: UsageObservation;
+  }> | {
+    provider_outcome?: "succeeded" | "failed" | "partial" | "unknown";
+    usage_observation?: UsageObservation;
+  };
+  idFactory?: (kind: string) => string;
+  clock?: () => Date | string;
+  signal?: AbortSignal;
+}): Promise<Readonly<{
+  outcome: MeteredAttemptOutcome;
+  evidence_delivery: "recorded" | "duplicate" | "pending";
+  pending_evidence?: CreativeTelemetryEvidence;
+}>>;
+
+export interface PendingUsageObservationRecord {
+  record_ref: string;
+  attempt: MeteredAttemptRequest;
+  observation: UsageObservation;
+}
+export interface UsageObservationOutboxPort {
+  claimPending(args: { limit: number }): Promise<{ status: "claimed"; records: PendingUsageObservationRecord[] }>;
+  acknowledge(args: {
+    record_ref: string;
+    source_observation_id: string;
+    effective_billable_attempt_id: string;
+    authority_status: "accepted" | "duplicate";
+  }): Promise<{ status: "acknowledged"; source_observation_id: string }>;
+  defer(args: {
+    record_ref: string;
+    reason: "trusted_scope_or_record_unavailable" | "metering_observation_unconfirmed" | "metering_acknowledgement_mismatch" | "outbox_acknowledgement_unconfirmed";
+  }): Promise<{ status: "retained" }>;
+}
+export declare function deliverPendingUsageObservations(args: {
+  meteringPort: Pick<MeteringPort, "recordUsageObservation">;
+  outbox: UsageObservationOutboxPort;
+  trustedScopeForRecord(input: Readonly<{ record_ref: string }>): Promise<TrustedMeteringScope> | TrustedMeteringScope;
+  limit?: number;
+}): Promise<Readonly<{
+  status: "complete" | "pending" | "outbox_unavailable";
+  attempted: number;
+  acknowledged: number;
+  retained: number;
+}>>;

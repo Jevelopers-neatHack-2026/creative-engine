@@ -1,0 +1,10 @@
+{
+  "synthetic_only": true,
+  "cases": [
+    { "api_key": "SYNTHETIC-NOT-A-REAL-CREDENTIAL" },
+    { "authorization": "Bearer synthetic-token-not-a-secret" },
+    { "header": "Basic OnBhc3N3b3Jk" },
+    { "url": "https://example.invalid/path?signature=SYNTHETIC-NOT-A-REAL-SIGNATURE" },
+    { "contact": "fixture@example.invalid" }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "openai_image_edit_gpt_image_1_documented_shape": {
+    "total_tokens": 100,
+    "input_tokens": 50,
+    "output_tokens": 50,
+    "input_tokens_details": { "text_tokens": 10, "image_tokens": 40 },
+    "output_tokens_details": { "image_tokens": 48, "text_tokens": 2 }
+  },
+  "openai_responses_documented_shape": {
+    "total_tokens": 48,
+    "input_tokens": 37,
+    "output_tokens": 11,
+    "input_tokens_details": { "cached_tokens": 0, "cache_write_tokens": 0 },
+    "output_tokens_details": { "reasoning_tokens": 0 }
+  },
+  "typesafe_decision_documented_shape": { "input_tokens": 296, "output_tokens": 20 },
+  "missing_usage": null,
+  "contradictory_usage": { "total_tokens": 49, "input_tokens": 37, "output_tokens": 11 }
+}
