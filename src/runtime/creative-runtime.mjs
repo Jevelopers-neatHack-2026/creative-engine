@@ -132,7 +132,7 @@ function hasBasicAuthMaterial(value) {
     const canonical = decoded.toString("base64");
     if (canonical !== token && canonical.replace(/=+$/, "") !== token) continue;
     const colon = decoded.indexOf(0x3a);
-    if (colon <= 0 || [...decoded].some((byte) => byte < 0x20 || byte === 0x7f)) continue;
+    if (colon < 0 || [...decoded].some((byte) => byte < 0x20 || byte === 0x7f)) continue;
     return true;
   }
   return false;

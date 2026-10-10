@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import test from "node:test";
@@ -902,12 +903,24 @@ test("public projection rejects sensitive object keys and Basic credentials with
   const privateText = "sk-syntheticPublicIdentifierSecret123456789";
   const basicCredential = "Basic dXNlcjpwYXNzd29yZA==";
   const shortBasicCredential = "Basic dTpw";
+  const emptyUsernameCredential = "Basic OnBhc3N3b3Jk";
+  const emptyUsernamePaddedCredential = "Basic OnA=";
+  const emptyUserPassCredential = "Basic Og==";
+  const emptyPasswordCredential = "Basic dTo=";
+  const extraPasswordColonCredential = `Basic ${Buffer.from("user:p:a:ss", "utf8").toString("base64")}`;
+  const utf8Credential = `Basic ${Buffer.from("usér:päss", "utf8").toString("base64")}`;
   const cases = [
     { extra: { nested: { [privateKey]: "cobalt" } }, secrets: [privateKey], field: "result.design.artifact.extra.nested" },
     { extra: { nested: { "owner@example.test": "cobalt" } }, secrets: ["owner@example.test"], field: "result.design.artifact.extra.nested" },
     { extra: { nested: { [privateKey]: privateText } }, secrets: [privateKey, privateText], field: "result.design.artifact.extra.nested" },
     { extra: { display: basicCredential }, secrets: [basicCredential, "dXNlcjpwYXNzd29yZA=="], field: "result.design.artifact.extra.display" },
     { extra: { display: shortBasicCredential }, secrets: [shortBasicCredential, "dTpw"], field: "result.design.artifact.extra.display" },
+    { extra: { display: emptyUsernameCredential }, secrets: [emptyUsernameCredential, "OnBhc3N3b3Jk"], field: "result.design.artifact.extra.display" },
+    { extra: { display: emptyUsernamePaddedCredential }, secrets: [emptyUsernamePaddedCredential, "OnA="], field: "result.design.artifact.extra.display" },
+    { extra: { display: emptyUserPassCredential }, secrets: [emptyUserPassCredential, "Og=="], field: "result.design.artifact.extra.display" },
+    { extra: { display: emptyPasswordCredential }, secrets: [emptyPasswordCredential, "dTo="], field: "result.design.artifact.extra.display" },
+    { extra: { display: extraPasswordColonCredential }, secrets: [extraPasswordColonCredential], field: "result.design.artifact.extra.display" },
+    { extra: { display: utf8Credential }, secrets: [utf8Credential], field: "result.design.artifact.extra.display" },
   ];
   const markerAbsent = (response, secrets) => {
     assert.equal(response.ok, false, JSON.stringify(response));
