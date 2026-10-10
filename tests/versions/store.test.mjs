@@ -446,7 +446,7 @@ test("storage schema v2 migrates additively to durable attempt evidence", async 
   ) STRICT; PRAGMA user_version=2;`);
   db.close();
   const migrated = new CreativeVersionStore({ databasePath, objectRoot });
-  assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, 3);
+  assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, 4);
   assert.equal(migrated.db.prepare("PRAGMA table_info(creative_jobs)").all()
     .some((column) => column.name === "attempt_evidence_json"), true);
   migrated.close();

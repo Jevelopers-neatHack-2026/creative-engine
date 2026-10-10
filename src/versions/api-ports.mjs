@@ -212,32 +212,66 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
   };
 
   const externalPlanning = otherPorts.planning ?? {};
+  const invalidationActionsInFlight = new Map();
   const planning = {
     ...externalPlanning,
     saveBriefAction(input) { return serial(() => store.saveBriefAction(input)); },
+    getBriefAction(input) { return serial(() => store.getBriefAction(input)); },
     getBriefVersionByHash(input) { return serial(() => store.getBriefVersionByHash(input)); },
     isBriefUsable(input) { return serial(() => store.isBriefUsable(input)); },
-    async applyInvalidation(input) {
+    applyInvalidation(input) {
       if (!record(input?.trusted_scope)) throw new VersionStoreError("scope_denied", "planning.trusted_scope");
       const scope = Object.freeze({
         tenant_id: safeReference(input.trusted_scope.tenant_id, "scope.tenant_id"),
         project_id: safeReference(input.trusted_scope.project_id, "scope.project_id"),
       });
-      if (typeof externalPlanning.getInvalidationEvent !== "function") {
-        throw new VersionStoreError("unavailable", "planning.invalidation_event", true);
-      }
+      const actor_id = safeReference(input.actor_id, "actor_id");
+      const action_id = safeReference(input.action_id, "action_id");
+      const request_hash = safeHash(input.request_hash, "request_hash");
       const event_id = safeReference(input.event_id, "event_id");
-      const event = await externalPlanning.getInvalidationEvent({ scope, event_id });
-      if (!record(event) || event.event_id !== event_id) {
-        throw new VersionStoreError("unavailable", "planning.invalidation_event", true);
-      }
-      return applyResearchInvalidation({ trusted_scope: scope, event, ports: {
-        clock: { now: () => store.timestamp() },
-        store: store.planningStore(scope),
-        verifier: externalPlanning.invalidationVerifier,
-        approvalStaleness: externalPlanning.approvalStaleness,
-        producerAcknowledgment: externalPlanning.producerAcknowledgment,
-      } });
+      if (input.operation !== "brief.invalidate") throw new VersionStoreError("invalid_request", "operation");
+      const key = `${scope.tenant_id}\u0000${scope.project_id}\u0000${action_id}`;
+      const running = invalidationActionsInFlight.get(key);
+      if (running) return running.request_hash === request_hash
+        ? running.promise
+        : Promise.resolve(Object.freeze({ public_action_status: "conflict" }));
+      const perform = async () => {
+        const actionInput = { scope, actor_id, action_id, operation: "brief.invalidate", request_hash, event_id };
+        const admitted = await serial(() => store.beginInvalidationAction(actionInput));
+        if (admitted.status === "conflict") return Object.freeze({ public_action_status: "conflict" });
+        if (admitted.status === "replayed") {
+          return Object.freeze({ public_action_status: "replayed", invalidation: admitted.result });
+        }
+        if (admitted.status !== "started" && admitted.status !== "pending") {
+          throw new VersionStoreError("unavailable", "invalidation_action", true);
+        }
+        if (typeof externalPlanning.getInvalidationEvent !== "function") {
+          throw new VersionStoreError("unavailable", "planning.invalidation_event", true);
+        }
+        const event = await externalPlanning.getInvalidationEvent({ scope, event_id });
+        if (!record(event) || event.event_id !== event_id) {
+          throw new VersionStoreError("unavailable", "planning.invalidation_event", true);
+        }
+        const invalidation = await applyResearchInvalidation({ trusted_scope: scope, event, ports: {
+          clock: { now: () => store.timestamp() },
+          store: store.planningStore(scope),
+          verifier: externalPlanning.invalidationVerifier,
+          approvalStaleness: externalPlanning.approvalStaleness,
+          producerAcknowledgment: externalPlanning.producerAcknowledgment,
+        } });
+        const completed = await serial(() => store.completeInvalidationAction({
+          ...actionInput, result: invalidation,
+        }));
+        if (completed.status === "conflict") throw new VersionStoreError("conflict", "action_id");
+        return Object.freeze({ public_action_status: completed.status === "replayed" ? "replayed"
+          : completed.status === "pending" ? "pending" : "completed",
+          invalidation: completed.result });
+      };
+      const promise = perform();
+      invalidationActionsInFlight.set(key, { request_hash, promise });
+      return promise.finally(() => {
+        if (invalidationActionsInFlight.get(key)?.promise === promise) invalidationActionsInFlight.delete(key);
+      });
     },
   };
 

@@ -18,7 +18,7 @@ import {
 import { createCreativeBriefStore } from "../planning/index.mjs";
 import { initializeCreativeBriefDatabase } from "../planning/store.mjs";
 
-const STORAGE_VERSION = 3;
+const STORAGE_VERSION = 4;
 const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 const ID_PATTERN = /^[A-Za-z0-9_.:-]{1,256}$/;
 const HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
@@ -329,7 +329,7 @@ function readStoredObjectSync(objectRoot, contentHash) {
 
 function makeSchema(db) {
   const version = db.prepare("PRAGMA user_version").get().user_version;
-  if (![0, 1, 2, STORAGE_VERSION].includes(version)) {
+  if (![0, 1, 2, 3, STORAGE_VERSION].includes(version)) {
     db.close();
     reject("unsupported_version", "storage_version");
   }
@@ -362,6 +362,30 @@ function makeSchema(db) {
       BEFORE UPDATE ON creative_brief_actions BEGIN SELECT RAISE(ABORT,'brief actions are immutable'); END;
     CREATE TRIGGER IF NOT EXISTS creative_brief_actions_no_delete
       BEFORE DELETE ON creative_brief_actions BEGIN SELECT RAISE(ABORT,'brief actions are immutable'); END;
+    CREATE TABLE IF NOT EXISTS creative_invalidation_actions (
+      tenant_id TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      action_id TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      operation TEXT NOT NULL CHECK(operation='brief.invalidate'),
+      request_hash TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending','completed')),
+      result_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(tenant_id,project_id,action_id),
+      CHECK((status='pending' AND result_json IS NULL) OR (status='completed' AND result_json IS NOT NULL))
+    ) STRICT;
+    CREATE TRIGGER IF NOT EXISTS creative_invalidation_actions_transition
+      BEFORE UPDATE ON creative_invalidation_actions
+      WHEN OLD.status!='pending' OR NEW.status!='completed' OR
+        NEW.tenant_id!=OLD.tenant_id OR NEW.project_id!=OLD.project_id OR NEW.action_id!=OLD.action_id OR
+        NEW.actor_id!=OLD.actor_id OR NEW.operation!=OLD.operation OR NEW.request_hash!=OLD.request_hash OR
+        NEW.event_id!=OLD.event_id OR NEW.created_at!=OLD.created_at
+      BEGIN SELECT RAISE(ABORT,'invalidation action identity is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS creative_invalidation_actions_no_delete
+      BEFORE DELETE ON creative_invalidation_actions BEGIN SELECT RAISE(ABORT,'invalidation actions are immutable'); END;
     CREATE TABLE IF NOT EXISTS creative_jobs (
       tenant_id TEXT NOT NULL,
       project_id TEXT NOT NULL,
@@ -607,6 +631,31 @@ export class CreativeVersionStore {
     return freezeReturned(validated);
   }
 
+  getBriefAction({ scope: inputScope, actor_id, action_id, request_hash }) {
+    this.assertOpen();
+    if (!isRecord(inputScope)) reject("scope_denied", "scope");
+    const tenant_id = reference(inputScope.tenant_id, "scope.tenant_id");
+    const project_id = reference(inputScope.project_id, "scope.project_id");
+    const actorId = reference(actor_id, "actor_id");
+    const actionId = reference(action_id, "action_id");
+    const requestHash = hash(request_hash, "request_hash");
+    const prior = this.db.prepare(`SELECT actor_id,request_hash,brief_id,brief_hash,result_json
+      FROM creative_brief_actions WHERE tenant_id=? AND project_id=? AND action_id=?`)
+      .get(tenant_id, project_id, actionId);
+    if (!prior) return null;
+    if (prior.actor_id !== actorId || prior.request_hash !== requestHash) return freezeReturned({ status: "conflict" });
+    const plan = snapshotJson(JSON.parse(prior.result_json), "integrity_error", "brief_action.result");
+    const briefId = reference(plan?.brief?.brief_id, "brief_action.brief_id");
+    if (briefId !== prior.brief_id || prior.brief_hash !== plan.brief_hash) reject("integrity_error", "brief_action.identity");
+    const scope = validScope({ tenant_id, project_id }, briefId);
+    const brief = validateCreativeBrief(plan.brief, { trustedScope: scope });
+    const { plan_hash: planHash, ...planBody } = plan;
+    if (canonicalHash(brief) !== prior.brief_hash || planHash !== canonicalHash(planBody)) {
+      reject("integrity_error", "brief_action.plan_hash");
+    }
+    return freezeReturned({ status: "replayed", brief_hash: prior.brief_hash, plan });
+  }
+
   #persistBrief(scope, brief, expectedBriefHash) {
     const current = this.getBrief({ scope, brief_id: brief.brief_id });
     const currentHash = current ? canonicalHash(current) : null;
@@ -685,6 +734,94 @@ export class CreativeVersionStore {
       this.rollback();
       if (error instanceof VersionStoreError) throw error;
       reject("unavailable", "brief_action", true);
+    }
+  }
+
+  beginInvalidationAction({ scope: inputScope, actor_id, action_id, operation, request_hash, event_id }) {
+    this.assertOpen();
+    if (!isRecord(inputScope)) reject("scope_denied", "scope");
+    const tenant_id = reference(inputScope.tenant_id, "scope.tenant_id");
+    const project_id = reference(inputScope.project_id, "scope.project_id");
+    const actorId = reference(actor_id, "actor_id");
+    const actionId = reference(action_id, "action_id");
+    const requestHash = hash(request_hash, "request_hash");
+    const eventId = reference(event_id, "event_id");
+    if (operation !== "brief.invalidate") reject("invalid_request", "operation");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const prior = this.db.prepare(`SELECT actor_id,operation,request_hash,event_id,status,result_json
+        FROM creative_invalidation_actions WHERE tenant_id=? AND project_id=? AND action_id=?`)
+        .get(tenant_id, project_id, actionId);
+      if (prior) {
+        this.db.exec("COMMIT");
+        if (prior.actor_id !== actorId || prior.operation !== operation || prior.request_hash !== requestHash ||
+          prior.event_id !== eventId) return freezeReturned({ status: "conflict" });
+        if (prior.status === "completed") {
+          return freezeReturned({ status: "replayed", result: snapshotJson(JSON.parse(prior.result_json), "integrity_error", "invalidation_action.result") });
+        }
+        return freezeReturned({ status: "pending" });
+      }
+      const timestamp = this.timestamp();
+      this.db.prepare(`INSERT INTO creative_invalidation_actions
+        (tenant_id,project_id,action_id,actor_id,operation,request_hash,event_id,status,result_json,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,'pending',NULL,?,?)`).run(tenant_id, project_id, actionId, actorId,
+        operation, requestHash, eventId, timestamp, timestamp);
+      this.db.exec("COMMIT");
+      return freezeReturned({ status: "started" });
+    } catch (error) {
+      this.rollback();
+      if (error instanceof VersionStoreError) throw error;
+      reject("unavailable", "invalidation_action", true);
+    }
+  }
+
+  completeInvalidationAction({ scope: inputScope, actor_id, action_id, operation, request_hash, event_id, result }) {
+    this.assertOpen();
+    if (!isRecord(inputScope)) reject("scope_denied", "scope");
+    const tenant_id = reference(inputScope.tenant_id, "scope.tenant_id");
+    const project_id = reference(inputScope.project_id, "scope.project_id");
+    const actorId = reference(actor_id, "actor_id");
+    const actionId = reference(action_id, "action_id");
+    const requestHash = hash(request_hash, "request_hash");
+    const eventId = reference(event_id, "event_id");
+    if (operation !== "brief.invalidate" || !isRecord(result) || result.event_id !== eventId) {
+      reject("invalid_request", "invalidation_action.result");
+    }
+    const safeResult = snapshotJson(result, "invalid_request", "invalidation_action.result");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const prior = this.db.prepare(`SELECT actor_id,operation,request_hash,event_id,status,result_json
+        FROM creative_invalidation_actions WHERE tenant_id=? AND project_id=? AND action_id=?`)
+        .get(tenant_id, project_id, actionId);
+      if (!prior || prior.actor_id !== actorId || prior.operation !== operation ||
+        prior.request_hash !== requestHash || prior.event_id !== eventId) {
+        this.db.exec("ROLLBACK");
+        return freezeReturned({ status: "conflict" });
+      }
+      if (prior.status === "completed") {
+        const stored = snapshotJson(JSON.parse(prior.result_json), "integrity_error", "invalidation_action.result");
+        this.db.exec("COMMIT");
+        if (canonicalSerialize(stored) !== canonicalSerialize(safeResult)) return freezeReturned({ status: "conflict" });
+        return freezeReturned({ status: "replayed", result: stored });
+      }
+      if (safeResult.approval_staleness?.status !== "acknowledged" || !safeResult.producer_acknowledgment) {
+        this.db.exec("COMMIT");
+        return freezeReturned({ status: "pending", result: safeResult });
+      }
+      const updated = this.db.prepare(`UPDATE creative_invalidation_actions
+        SET status='completed',result_json=?,updated_at=?
+        WHERE tenant_id=? AND project_id=? AND action_id=? AND status='pending'`)
+        .run(canonicalSerialize(safeResult), this.timestamp(), tenant_id, project_id, actionId);
+      if (updated.changes !== 1) {
+        this.db.exec("ROLLBACK");
+        return freezeReturned({ status: "conflict" });
+      }
+      this.db.exec("COMMIT");
+      return freezeReturned({ status: "completed", result: safeResult });
+    } catch (error) {
+      this.rollback();
+      if (error instanceof VersionStoreError) throw error;
+      reject("unavailable", "invalidation_action", true);
     }
   }
 

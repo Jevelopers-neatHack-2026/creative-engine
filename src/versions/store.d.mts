@@ -52,6 +52,16 @@ export class CreativeVersionStore {
   constructor(options: { databasePath: string; objectRoot: string; now?: () => number; maxArtifactBytes?: number });
   close(): void;
   getBrief(input: { scope: VersionScope | Omit<VersionScope, "brief_id">; brief_id: string }): CreativeBrief | null;
+  getBriefAction(input: { scope: Omit<VersionScope, "brief_id">; actor_id: string; action_id: string; request_hash: string }):
+    Readonly<{ status: "conflict" }> | Readonly<{ status: "replayed"; brief_hash: string; plan: import("../planning/index.mjs").CreativeBriefPlan }> | null;
+  beginInvalidationAction(input: { scope: Omit<VersionScope, "brief_id">; actor_id: string; action_id: string;
+    operation: "brief.invalidate"; request_hash: string; event_id: string }):
+    Readonly<{ status: "started" | "pending" }> | Readonly<{ status: "conflict" }> |
+    Readonly<{ status: "replayed"; result: import("../api/v1.mjs").CreativeInvalidationResult }>;
+  completeInvalidationAction(input: { scope: Omit<VersionScope, "brief_id">; actor_id: string; action_id: string;
+    operation: "brief.invalidate"; request_hash: string; event_id: string;
+    result: import("../api/v1.mjs").CreativeInvalidationResult }):
+    Readonly<{ status: "conflict" }> | Readonly<{ status: "completed" | "pending" | "replayed"; result: import("../api/v1.mjs").CreativeInvalidationResult }>;
   getBriefVersionByHash(input: { scope: VersionScope | Omit<VersionScope, "brief_id">; brief_id: string; brief_hash: string }): CreativeBrief | null;
   isBriefUsable(input: { scope: VersionScope | Omit<VersionScope, "brief_id">; brief_id: string; brief_hash?: string }): boolean;
   isAssetFenced(input: { scope: VersionScope | Omit<VersionScope, "brief_id">; asset_id: string; content_hash: string }): boolean;

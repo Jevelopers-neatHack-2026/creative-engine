@@ -203,25 +203,62 @@ function validateTrustedScope(value, field = "trusted_scope") {
   };
 }
 
-function safeJsonValue(value, field, depth = 0) {
-  if (depth > 32) fail("invalid_input", "Input exceeds the supported nesting depth.", field);
+function safeJsonValue(value, field, depth = 0, state = { nodes: 0 }, screenPrivacy = true) {
+  state.nodes += 1;
+  if (depth > 32 || state.nodes > 50_000) fail("invalid_input", "Input exceeds the supported structural limits.", field);
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "string") {
     if (value.length > 20_000) fail("invalid_input", "Text exceeds the supported size.", field);
-    if (hasSensitivePublicText(value)) fail("sensitive_input", "Sensitive content cannot be included in a brief output.", field);
+    if (screenPrivacy && hasSensitivePublicText(value)) fail("sensitive_input", "Sensitive content cannot be included in a brief output.", field);
     return value;
   }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) fail("invalid_input", "Only finite JSON numbers are supported.", field);
     return value;
   }
-  if (Array.isArray(value)) return value.map((entry, index) => safeJsonValue(entry, `${field}[${index}]`, depth + 1));
-  if (!isRecord(value)) fail("invalid_input", "Input must contain only plain JSON values.", field);
+  let prototype;
+  let descriptors;
+  try {
+    prototype = Object.getPrototypeOf(value);
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    fail("invalid_input", "Input must contain only inspectable JSON data.", field);
+  }
+  if (Array.isArray(value)) {
+    if (prototype !== Array.prototype) fail("invalid_input", "Arrays must use the standard array prototype.", field);
+    const length = descriptors.length?.value;
+    if (!Number.isSafeInteger(length) || length < 0 || length > 10_000) {
+      fail("invalid_input", "Array exceeds the supported size.", field);
+    }
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (key === "length") continue;
+      if (typeof key !== "string" || !/^(?:0|[1-9]\d*)$/.test(key) || Number(key) >= length) {
+        fail("invalid_input", "Arrays may contain only indexed JSON values.", field);
+      }
+    }
+    const output = new Array(length);
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (!descriptor || !Object.hasOwn(descriptor, "value") || !descriptor.enumerable) {
+        fail("invalid_input", "Arrays must be dense data arrays.", `${field}[${index}]`);
+      }
+      output[index] = safeJsonValue(descriptor.value, `${field}[${index}]`, depth + 1, state, screenPrivacy);
+    }
+    return output;
+  }
+  if (prototype !== Object.prototype && prototype !== null) {
+    fail("invalid_input", "Input must contain only plain JSON objects.", field);
+  }
   const output = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (SENSITIVE_KEY.test(key) || hasSensitivePublicText(key)) fail("sensitive_input", "Sensitive fields cannot be included in a brief output.", field);
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== "string") fail("invalid_input", "Symbol fields are not supported.", field);
+    const descriptor = descriptors[key];
+    if (!descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+      fail("invalid_input", "Input fields must be enumerable data properties.", field);
+    }
+    if (screenPrivacy && (SENSITIVE_KEY.test(key) || hasSensitivePublicText(key))) fail("sensitive_input", "Sensitive fields cannot be included in a brief output.", field);
     Object.defineProperty(output, key, {
-      value: safeJsonValue(entry, field, depth + 1),
+      value: safeJsonValue(descriptor.value, `${field}.${key}`, depth + 1, state, screenPrivacy),
       enumerable: true,
       configurable: false,
       writable: false,
@@ -388,6 +425,7 @@ function validatePlanningContext(context, research) {
  * This function performs no network, provider, budget, rights, or approval calls.
  */
 export function buildCreativeBrief(input) {
+  input = safeJsonValue(input, "input", 0, undefined, false);
   expectRecord(input, "input");
   const trustedScope = validateTrustedScope(input.trusted_scope);
   const research = validateContractCall(() => normalizeResearchPackage(input.research_package, trustedScope));
@@ -596,6 +634,7 @@ export function buildCreativeBrief(input) {
 }
 
 export function createResearchInvalidationRequest(input) {
+  input = safeJsonValue(input, "input", 0, undefined, false);
   expectRecord(input, "input");
   const trustedScope = validateTrustedScope(input.trusted_scope);
   const event = expectRecord(input.event, "event");

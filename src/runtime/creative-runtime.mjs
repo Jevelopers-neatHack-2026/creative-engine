@@ -97,7 +97,58 @@ function isRecord(value) {
 }
 
 function immutableRequestSnapshot(value) {
-  const snapshot = JSON.parse(canonicalSerialize(value));
+  let nodes = 0;
+  function copy(current, depth = 0) {
+    nodes += 1;
+    if (depth > 32 || nodes > 50_000) throw new CreativeApiError("invalid_request", "unknown", "request");
+    if (current === null || typeof current === "string" || typeof current === "boolean") return current;
+    if (typeof current === "number" && Number.isFinite(current)) return current;
+    let prototype;
+    let descriptors;
+    try {
+      prototype = Object.getPrototypeOf(current);
+      descriptors = Object.getOwnPropertyDescriptors(current);
+    } catch {
+      throw new CreativeApiError("invalid_request", "unknown", "request");
+    }
+    if (Array.isArray(current)) {
+      if (prototype !== Array.prototype) throw new CreativeApiError("invalid_request", "unknown", "request");
+      const length = descriptors.length?.value;
+      if (!Number.isSafeInteger(length) || length < 0 || length > 10_000) {
+        throw new CreativeApiError("invalid_request", "unknown", "request");
+      }
+      for (const key of Reflect.ownKeys(descriptors)) {
+        if (key === "length") continue;
+        if (typeof key !== "string" || !/^(?:0|[1-9]\d*)$/.test(key) || Number(key) >= length) {
+          throw new CreativeApiError("invalid_request", "unknown", "request");
+        }
+      }
+      const result = new Array(length);
+      for (let index = 0; index < length; index += 1) {
+        const descriptor = descriptors[String(index)];
+        if (!descriptor || !Object.hasOwn(descriptor, "value") || !descriptor.enumerable) {
+          throw new CreativeApiError("invalid_request", "unknown", "request");
+        }
+        result[index] = copy(descriptor.value, depth + 1);
+      }
+      return result;
+    }
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new CreativeApiError("invalid_request", "unknown", "request");
+    }
+    const result = {};
+    for (const key of Reflect.ownKeys(descriptors)) {
+      const descriptor = typeof key === "string" ? descriptors[key] : undefined;
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+        throw new CreativeApiError("invalid_request", "unknown", "request");
+      }
+      Object.defineProperty(result, key, {
+        value: copy(descriptor.value, depth + 1), enumerable: true, configurable: false, writable: false,
+      });
+    }
+    return result;
+  }
+  const snapshot = copy(value);
   const freeze = (current) => {
     if (current !== null && typeof current === "object") {
       for (const child of Object.values(current)) freeze(child);
@@ -953,10 +1004,44 @@ export function createCreativeApi(options = {}) {
     return validateCreativeBrief(brief, { trustedScope: scope });
   }
 
+  function validateSavedBriefPlan(value, scope, expectedHash, operation) {
+    let plan;
+    try { plan = immutableRequestSnapshot(value); }
+    catch { throw new CreativeApiError("unavailable", operation, "brief_persistence"); }
+    if (!isRecord(plan) || plan.contract !== "CreativeBriefPlan" || plan.schema_version !== "1.0" ||
+      !isRecord(plan.brief)) throw new CreativeApiError("unavailable", operation, "brief_persistence");
+    const briefId = boundedString(plan.brief.brief_id, "brief_id");
+    let brief;
+    try { brief = validateCreativeBrief(plan.brief, { trustedScope: { ...scope, brief_id: briefId } }); }
+    catch { throw new CreativeApiError("unavailable", operation, "brief_persistence"); }
+    const { plan_hash: planHash, ...planBody } = plan;
+    let calculatedPlanHash;
+    try { calculatedPlanHash = canonicalHash(planBody); }
+    catch { throw new CreativeApiError("unavailable", operation, "brief_persistence"); }
+    if (plan.brief_hash !== canonicalHash(brief) || plan.brief_hash !== expectedHash ||
+      typeof planHash !== "string" || planHash !== calculatedPlanHash) {
+      throw new CreativeApiError("unavailable", operation, "brief_persistence");
+    }
+    return plan;
+  }
+
   async function createBrief(principal, request) {
     const scope = scopeFor(principal);
+    const requestHash = actionRequestHash(request);
+    const getAction = requiredPort(ports, "planning.getBriefAction", request.operation);
     const getPackage = requiredPort(ports, "planning.getCurrentResearchPackage", request.operation);
     const saveAction = requiredPort(ports, "planning.saveBriefAction", request.operation);
+    const priorAction = await getAction(Object.freeze({ scope, actor_id: principal.actor_id,
+      action_id: request.action_id, request_hash: requestHash }));
+    if (priorAction !== null && !isRecord(priorAction)) throw new CreativeApiError("unavailable", request.operation, "brief_persistence");
+    if (priorAction?.status === "conflict") throw new CreativeApiError("conflict", request.operation, "action_id");
+    if (priorAction?.status === "replayed") {
+      const result = validateSavedBriefPlan(priorAction.plan, scope, priorAction.brief_hash, request.operation);
+      assertPublicIdentifiers(result, request.operation, "brief_plan");
+      return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse",
+        schema_version: CREATIVE_API_VERSION, operation_id: result.brief.brief_id, replayed: true, result }), request.operation);
+    }
+    if (priorAction !== null) throw new CreativeApiError("unavailable", request.operation, "brief_persistence");
     const rawPackage = await getPackage(Object.freeze({ scope }));
     let researchPackage;
     try { researchPackage = immutableRequestSnapshot(rawPackage); }
@@ -979,16 +1064,17 @@ export function createCreativeApi(options = {}) {
     }
     const expectedBriefHash = requestedExpectedHash ?? currentHash;
     const saved = await saveAction(Object.freeze({ scope, actor_id: principal.actor_id,
-      action_id: request.action_id, request_hash: actionRequestHash(request), plan,
+      action_id: request.action_id, request_hash: requestHash, plan,
       expected_brief_hash: expectedBriefHash }));
     if (!isRecord(saved)) throw new CreativeApiError("unavailable", request.operation, "brief_persistence");
     if (saved.status === "conflict") throw new CreativeApiError("conflict", request.operation, "action_id");
     if (saved.status === "stale") throw new CreativeApiError("stale_version", request.operation, "expected_brief_hash");
     if (!["saved", "replayed"].includes(saved.status) || !isRecord(saved.plan) ||
-      saved.brief_hash !== saved.plan.brief_hash || saved.plan.brief?.brief_id !== plan.brief.brief_id) {
+      saved.brief_hash !== saved.plan.brief_hash ||
+      (saved.status === "saved" && saved.plan.brief?.brief_id !== plan.brief.brief_id)) {
       throw new CreativeApiError("unavailable", request.operation, "brief_persistence");
     }
-    const result = saved.plan;
+    const result = validateSavedBriefPlan(saved.plan, scope, saved.brief_hash, request.operation);
     assertPublicIdentifiers(result, request.operation, "brief_plan");
     return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse",
       schema_version: CREATIVE_API_VERSION, operation_id: result.brief.brief_id,
@@ -997,16 +1083,29 @@ export function createCreativeApi(options = {}) {
 
   async function invalidateBrief(principal, request) {
     const apply = requiredPort(ports, "planning.applyInvalidation", request.operation);
-    const result = await apply(Object.freeze({
+    const action = await apply(Object.freeze({
       trusted_scope: scopeFor(principal),
+      actor_id: principal.actor_id,
+      action_id: request.action_id,
+      operation: request.operation,
+      request_hash: actionRequestHash(request),
       event_id: request.payload.event_id,
     }));
+    if (!isRecord(action) || action.public_action_status === "conflict") {
+      if (action?.public_action_status === "conflict") throw new CreativeApiError("conflict", request.operation, "action_id");
+      throw new CreativeApiError("unavailable", request.operation, "invalidation_action");
+    }
+    if (!["completed", "replayed", "pending"].includes(action.public_action_status) || !isRecord(action.invalidation)) {
+      throw new CreativeApiError("unavailable", request.operation, "invalidation_action");
+    }
+    const result = action.invalidation;
     if (!isRecord(result) || result.event_id !== request.payload.event_id || !isRecord(result.durable_receipt)) {
       throw new CreativeApiError("unavailable", request.operation, "invalidation_receipt");
     }
     assertPublicIdentifiers(result, request.operation, "invalidation");
     return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse",
       schema_version: CREATIVE_API_VERSION, operation_id: result.event_id,
+      replayed: action.public_action_status === "replayed",
       result: Object.freeze({ invalidation: result,
         local_status: result.producer_acknowledgment ? "acknowledged" : "pending" }) }), request.operation);
   }
@@ -1086,7 +1185,7 @@ export function createCreativeApi(options = {}) {
     const getPackage = ports.planning?.getCurrentResearchPackage;
     if (typeof getPackage !== "function") {
       if (explicit.size > 0) throw new CreativeApiError("unavailable", operation, "asset_permission_verifier");
-      return;
+      return Object.freeze([]);
     }
     let research;
     try {
@@ -1105,7 +1204,7 @@ export function createCreativeApi(options = {}) {
         explicit.set(asset.asset_id, explicit.get(asset.asset_id) ?? (operation === "generate" ? "reproduce" : "modify"));
       }
     }
-    if (explicit.size === 0) return;
+    if (explicit.size === 0) return Object.freeze([]);
     const requestedAssets = [];
     for (const [assetId, action] of explicit) {
       const asset = research.assets.items.find((item) => item.asset_id === assetId);
@@ -1122,6 +1221,7 @@ export function createCreativeApi(options = {}) {
       typeof ports.storage?.isAssetFenced !== "function") {
       throw new CreativeApiError("unavailable", operation, "asset_permission_verifier");
     }
+    const acceptedProofs = [];
     for (const { asset, action } of requestedAssets) {
       const requestedAt = new Date(now()).toISOString();
       let proof;
@@ -1142,6 +1242,8 @@ export function createCreativeApi(options = {}) {
         !Number.isFinite(checkedAt) || checkedAt > verifiedAt || !Number.isFinite(expiresAt) || expiresAt <= verifiedAt) {
         throw new CreativeApiError("permission_denied", operation, "asset_permission_evidence");
       }
+      acceptedProofs.push(Object.freeze({ asset_id: asset.asset_id, content_hash: asset.content_hash, action,
+        package_id: research.package_id, package_hash: packageHash, checked_at: checkedAt, expires_at: expiresAt }));
     }
     // Bind the permission result to the still-current package after all owner
     // verifier awaits. The caller then performs its final same-DB fence/CAS.
@@ -1161,6 +1263,11 @@ export function createCreativeApi(options = {}) {
         throw new CreativeApiError("permission_denied", operation, "asset_invalidation");
       }
     }
+    const completedAt = new Date(now()).getTime();
+    if (acceptedProofs.some((proof) => proof.expires_at <= completedAt)) {
+      throw new CreativeApiError("permission_denied", operation, "asset_permission_evidence");
+    }
+    return Object.freeze(acceptedProofs);
   }
 
   async function beginMutation(principal, request) {
@@ -1301,10 +1408,14 @@ export function createCreativeApi(options = {}) {
     let providerValue;
     let validatedDecisionRequest;
     let preDispatchError;
+    let currentPermissionProofs = Object.freeze([]);
     const dispatchIntentRefs = new Map();
     const checkDispatchFence = async () => {
       if (!preDispatchGuard) return;
-      try { await preDispatchGuard(); }
+      try {
+        const current = await preDispatchGuard();
+        if (Array.isArray(current)) currentPermissionProofs = current;
+      }
       catch (error) { preDispatchError = error; throw error; }
     };
     const authorizeTransport = async (transportAttemptId) => {
@@ -1327,6 +1438,16 @@ export function createCreativeApi(options = {}) {
       await checkDispatchFence();
       dispatchIntentRefs.set(transportAttemptId, intentRef);
       return intentRef;
+    };
+    const assertFinalDispatchEligibility = (signal) => {
+      const currentTime = new Date(now()).getTime();
+      if (signal?.aborted || deadline.signal.aborted || !Number.isFinite(currentTime) ||
+        Date.parse(principal.expires_at) <= currentTime) {
+        throw new CreativeApiError("cancelled", request.operation, "dispatch_authorization");
+      }
+      if (currentPermissionProofs.some((proof) => proof.expires_at <= currentTime)) {
+        throw new CreativeApiError("permission_denied", request.operation, "asset_permission_evidence");
+      }
     };
     const revalidateTransport = async ({ transport_attempt_id, billable_attempt_id, dispatch_intent_ref, signal }) => {
       boundedString(transport_attempt_id, "transport_attempt_id", 256);
@@ -1397,11 +1518,31 @@ export function createCreativeApi(options = {}) {
             await dispatchContext.recordTransportAttempt(transportId);
             // C03 transport acknowledgment is an async boundary. Recheck
             // owner rights, current package, and same-database fences after it
-            // and before returning control to a provider adapter that sends.
+            // and then do one final uncached atomic job/lease/context check.
+            // Nothing asynchronous follows that authorization: these local
+            // checks run synchronously immediately before returning the send
+            // permit to the trusted provider adapter.
             await checkDispatchFence();
             const intentRef = dispatchIntentRefs.get(transportId);
             if (!intentRef) throw new CreativeApiError("unavailable", request.operation, "dispatch_authorization");
-            if (dispatchContext.signal?.aborted) throw new CreativeApiError("cancelled", request.operation, "deadline");
+            let finalIntentRef;
+            try {
+              finalIntentRef = await authorizeJobDispatch(principal, request, started, transportId,
+                dispatchContext.attempt.billable_attempt_id, contextFence);
+            } catch (error) {
+              preDispatchError = error;
+              throw error;
+            }
+            if (finalIntentRef !== intentRef) {
+              const error = new CreativeApiError("stale_version", request.operation, "dispatch_authorization");
+              preDispatchError = error;
+              throw error;
+            }
+            try { assertFinalDispatchEligibility(dispatchContext.signal); }
+            catch (error) {
+              preDispatchError = error;
+              throw error;
+            }
             return intentRef;
           },
           setDecisionRequest(value) { validatedDecisionRequest = value; },
@@ -1594,9 +1735,14 @@ export function createCreativeApi(options = {}) {
     const assertImageContext = async () => {
       await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
         expectedCurrentDesignVersionId, expectedCurrentDesignHash);
-      await verifyRequestedAssetPermissions(started.scope, brief, plan, operation);
+      const proofs = await verifyRequestedAssetPermissions(started.scope, brief, plan, operation);
       await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
         expectedCurrentDesignVersionId, expectedCurrentDesignHash);
+      const checkedAt = new Date(now()).getTime();
+      if (proofs.some((proof) => proof.expires_at <= checkedAt)) {
+        throw new CreativeApiError("permission_denied", operation, "asset_permission_evidence");
+      }
+      return proofs;
     };
     const branchMode = operation === "edit" && request.payload.selection_mode === "branch";
     const expectedCurrentDesignVersionId = branchMode ? undefined
@@ -2015,7 +2161,25 @@ export function createCreativeApi(options = {}) {
     }
     if (["generate", "edit"].includes(request.operation)) {
       assertStoredOnlyKeys(job.result, ["design", "usage", "attempt_id", "telemetry_evidence"], request.operation, "stored_result");
-      const brief = await loadBrief(started.scope, request.payload.brief_id, request.operation);
+      const currentBrief = await loadBrief(started.scope, request.payload.brief_id, request.operation);
+      const storedDesignInput = job.result.design;
+      if (!isRecord(storedDesignInput) || storedDesignInput.brief_id !== currentBrief.brief_id ||
+        typeof storedDesignInput.brief_hash !== "string") {
+        throw new CreativeApiError("unavailable", request.operation, "stored_result");
+      }
+      let brief = currentBrief;
+      if (storedDesignInput.brief_hash !== canonicalHash(currentBrief)) {
+        const getBriefVersion = requiredPort(ports, "storage.getBriefVersionByHash", request.operation);
+        const historical = await getBriefVersion(Object.freeze({ scope: started.scope,
+          brief_id: currentBrief.brief_id, brief_hash: storedDesignInput.brief_hash }));
+        if (!historical) throw new CreativeApiError("unavailable", request.operation, "stored_result.brief_history");
+        assertScopedRecord(historical, started.scope, request.operation, currentBrief.brief_id);
+        try { brief = validateCreativeBrief(historical, { trustedScope: { ...started.scope, brief_id: currentBrief.brief_id } }); }
+        catch { throw new CreativeApiError("unavailable", request.operation, "stored_result.brief_history"); }
+        if (canonicalHash(brief) !== storedDesignInput.brief_hash) {
+          throw new CreativeApiError("unavailable", request.operation, "stored_result.brief_history");
+        }
+      }
       const stored = validateDesignVersion(job.result.design, {
         trustedScope: { ...started.scope, design_version_id: job.result.design?.design_version_id },
         brief_hash: canonicalHash(brief), known_source_refs: brief.source_identity.map((source) => source.source_id),

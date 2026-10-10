@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   applyResearchInvalidation,
   buildCreativeBrief,
+  createResearchInvalidationRequest,
   persistCreativeBrief,
   resolveAssetUse,
 } from "creative-engine/planning";
@@ -129,6 +130,49 @@ test("brief planning is repeatable, separates source facts/preferences/interpret
   assert.equal(first.execution_policy.provider_calls, 0);
   assert.equal(first.execution_policy.provider_dispatch_allowed, false);
   assert.equal(JSON.stringify(first).includes("dispatch_authorized\":true"), false);
+});
+
+test("public planning inputs are copied from bounded own data descriptors before validation or hashing", () => {
+  const sensitive = "Bearer synthetic-review-secret";
+  let mapCalls = 0;
+  for (const field of ["customer_preferences", "artistic_intent", "additional_required_fact_keys", "locked_fields", "fact_corrections"]) {
+    const inputArray = [];
+    Object.defineProperty(inputArray, "map", { enumerable: true, value() {
+      mapCalls += 1;
+      return [{ preference_id: "replacement", value: sensitive }];
+    } });
+    expectCode("invalid_input", () => plan(completeResearchPackage(), baseTime, { [field]: inputArray }));
+  }
+  assert.equal(mapCalls, 0, "own Array.map hooks are never invoked");
+
+  let inheritedMapCalls = 0;
+  const inherited = [];
+  Object.setPrototypeOf(inherited, Object.create(Array.prototype, { map: { value() {
+    inheritedMapCalls += 1;
+    return [{ preference_id: "replacement", value: sensitive }];
+  } } }));
+  expectCode("invalid_input", () => plan(completeResearchPackage(), baseTime, { customer_preferences: inherited }));
+  assert.equal(inheritedMapCalls, 0, "nonstandard array prototypes are rejected without dispatching inherited methods");
+
+  let getterCalls = 0;
+  const getterItem = {};
+  Object.defineProperty(getterItem, "value", { enumerable: true, get() {
+    getterCalls += 1;
+    return sensitive;
+  } });
+  expectCode("invalid_input", () => plan(completeResearchPackage(), baseTime,
+    { customer_preferences: [getterItem] }));
+  assert.equal(getterCalls, 0, "property accessors are rejected without running them");
+
+  const currentPlan = plan();
+  const event = invalidationEvent(currentPlan);
+  Object.defineProperty(event.affected_briefs, "map", { enumerable: true, value() {
+    mapCalls += 1;
+    return [{ brief_id: sensitive, brief_hash: currentPlan.brief_hash }];
+  } });
+  expectCode("invalid_input", () => createResearchInvalidationRequest({ trusted_scope: trustedScope, event }));
+  assert.equal(mapCalls, 0, "invalidation references use the same descriptor-only boundary");
+  assert.equal(JSON.stringify(currentPlan).includes(sensitive), false);
 });
 
 test("company-URL event evidence is hash-bound and remains a source reference rather than a permission grant", () => {

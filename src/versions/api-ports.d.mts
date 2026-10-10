@@ -69,6 +69,9 @@ export type CreativeVersionRuntimePorts = Omit<CreativeRuntimePorts, "storage" |
 };
 
 export interface CreativeVersionRuntimePlanning extends BasePlanning {
+  getBriefAction(input: { scope: import("../planning/index.mjs").PlanningScope; actor_id: string; action_id: string;
+    request_hash: string }): Promise<Readonly<{ status: "conflict" }> |
+      Readonly<{ status: "replayed"; brief_hash: string; plan: import("../planning/index.mjs").CreativeBriefPlan }> | null>;
   saveBriefAction(input: { scope: import("../planning/index.mjs").PlanningScope; actor_id: string; action_id: string;
     request_hash: string; plan: import("../planning/index.mjs").CreativeBriefPlan; expected_brief_hash: string | null }):
     ReturnType<NonNullable<BasePlanning["saveBriefAction"]>>;
@@ -77,8 +80,10 @@ export interface CreativeVersionRuntimePlanning extends BasePlanning {
     import("../contracts/creative/v1.mjs").CreativeBrief | null;
   isBriefUsable(input: { scope: import("../planning/index.mjs").PlanningScope; brief_id: string; brief_hash: string }):
     Promise<boolean> | boolean;
-  applyInvalidation(input: { trusted_scope: import("../planning/index.mjs").PlanningScope; event_id: string }):
-    Promise<CreativeInvalidationResult> | CreativeInvalidationResult;
+  applyInvalidation(input: { trusted_scope: import("../planning/index.mjs").PlanningScope; actor_id: string;
+    action_id: string; operation: "brief.invalidate"; request_hash: string; event_id: string }):
+    Promise<Readonly<{ public_action_status: "conflict" }> |
+      Readonly<{ public_action_status: "completed" | "pending" | "replayed"; invalidation: CreativeInvalidationResult }>>;
 }
 
 export interface CreateCreativeVersionApiPortsOptions {

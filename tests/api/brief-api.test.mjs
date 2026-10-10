@@ -207,6 +207,7 @@ async function setup(t, { research = scopedResearch(), planning = {}, now = () =
       },
     },
   };
+  Object.assign(externalPlanning, planning);
   const idFactory = (() => { let id = 0; return () => `fixture-id-${++id}`; })();
   const adapted = createCreativeVersionApiPorts({ store, idFactory, otherPorts: {
     provider, metering, planning: externalPlanning,
@@ -251,9 +252,18 @@ test("brief.create loads trusted research, is deterministic and replayable, and 
   assert.equal(first.result.asset_readiness[0].state, "verification_required");
   assert.equal(first.result.brief.preferences.items.some((item) => item.value === "bright colors"), true);
   assert.equal(first.result.brief.interpretations.items.some((item) => item.text === "warm, welcoming layout"), true);
-  assert.equal(system.counters.package, 2);
+  assert.equal(system.counters.package, 1, "a completed action replays before loading mutable research again");
   assert.equal(system.counters.provider, 0);
   assert.equal(system.counters.reserve, 0);
+
+  const changedPackage = scopedResearch();
+  changedPackage.package_id = "current-package-replaced";
+  system.research = changedPackage;
+  const replayAfterPackageChange = await createBrief(system.api, "brief-create-repeatable", input);
+  assert.equal(replayAfterPackageChange.ok, true, JSON.stringify(replayAfterPackageChange));
+  assert.equal(replayAfterPackageChange.replayed, true);
+  assert.equal(replayAfterPackageChange.result.plan_hash, first.result.plan_hash);
+  assert.equal(system.counters.package, 1, "historical create replay does not re-plan against the current source package");
 
   system.research = scopedResearch(missingDateResearchPackage());
   const missing = await createBrief(system.api, "brief-create-missing-date");
@@ -263,6 +273,22 @@ test("brief.create loads trusted research, is deterministic and replayable, and 
   assert.match(missing.result.clarification_requests.find((fact) => fact.fact_key === "event_date").question, /exact event date/i);
   assert.equal(system.counters.provider, 0);
   assert.equal(system.counters.reserve, 0);
+});
+
+test("the API boundary rejects caller-owned array hooks before invoking them or loading research", async (t) => {
+  const system = await setup(t);
+  let mapCalls = 0;
+  const preferences = [];
+  Object.defineProperty(preferences, "map", { enumerable: true, value() {
+    mapCalls += 1;
+    return [{ preference_id: "replacement", value: "Bearer synthetic-review-secret" }];
+  } });
+  const result = await createBrief(system.api, "brief-array-hook", { customer_preferences: preferences });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "invalid_request");
+  assert.equal(JSON.stringify(result).includes("synthetic-review-secret"), false);
+  assert.equal(mapCalls, 0);
+  assert.equal(system.counters.package, 0);
 });
 
 test("brief corrections remain requests, source instructions are inert, and admission credentials stay absent", async (t) => {
@@ -410,13 +436,129 @@ test("asset revocation during the C03 transport acknowledgment blocks the provid
   assert.equal(system.store.isBriefUsable({ scope: SCOPE, brief_id: brief.brief_id, brief_hash: canonicalHash(brief) }), false);
 });
 
+test("asset proof expiry during a later current-package read blocks the request", async (t) => {
+  let now = NOW;
+  let proofReturned = false;
+  const system = await setup(t, { now: () => now, planning: { assetPermissionVerifier: { async verifyAssetUse(input) {
+    proofReturned = true;
+    return { status: "granted", owner_evidence_status: "verified", tenant_id: input.tenant_id,
+      project_id: input.project_id, asset_id: input.asset_id, content_hash: input.content_hash,
+      action: input.action, package_id: input.package_id, package_hash: input.package_hash,
+      evidence_ref: "synthetic:short-lived-proof", checked_at: new Date(now).toISOString(),
+      expires_at: new Date(now + 100).toISOString() };
+  } } } });
+  const created = await createBrief(system.api, "brief-short-lived-proof");
+  const brief = created.result.brief;
+  const getPackage = system.ports.planning.getCurrentResearchPackage;
+  system.ports.planning.getCurrentResearchPackage = async (input) => {
+    const result = await getPackage(input);
+    if (proofReturned) {
+      proofReturned = false;
+      now += 200;
+    }
+    return result;
+  };
+  const result = await system.api.invoke(actor(), request("generate", "generate-short-lived-proof", {
+    brief_id: brief.brief_id, plan: createPlan(brief, { useAsset: true, planId: "plan-short-lived-proof" }),
+  }, ["page-1"]));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "permission_denied");
+  assert.equal(system.counters.reserve, 0);
+  assert.equal(system.counters.transport, 0);
+  assert.equal(system.counters.provider_dispatch, 0);
+  assert.ok(now >= NOW + 200);
+});
+
+test("asset proof expiry during final atomic job authorization prevents provider dispatch", async (t) => {
+  let now = NOW;
+  let providerEntered = false;
+  let providerAuthorizations = 0;
+  const system = await setup(t, { now: () => now, planning: { assetPermissionVerifier: { async verifyAssetUse(input) {
+    return { status: "granted", owner_evidence_status: "verified", tenant_id: input.tenant_id,
+      project_id: input.project_id, asset_id: input.asset_id, content_hash: input.content_hash,
+      action: input.action, package_id: input.package_id, package_hash: input.package_hash,
+      evidence_ref: "synthetic:final-send-proof", checked_at: new Date(now).toISOString(),
+      expires_at: new Date(now + 100).toISOString() };
+  } } } });
+  const created = await createBrief(system.api, "brief-final-send-proof");
+  const brief = created.result.brief;
+  const generate = system.ports.provider.generate;
+  system.ports.provider.generate = async (input) => {
+    providerEntered = true;
+    return generate(input);
+  };
+  const authorize = system.ports.jobs.authorizeDispatch;
+  system.ports.jobs.authorizeDispatch = async (input) => {
+    const result = await authorize(input);
+    if (providerEntered) {
+      providerAuthorizations += 1;
+      if (providerAuthorizations === 2) now += 200;
+    }
+    return result;
+  };
+  const result = await system.api.invoke(actor(), request("generate", "generate-final-send-proof", {
+    brief_id: brief.brief_id, plan: createPlan(brief, { useAsset: true, planId: "plan-final-send-proof" }),
+  }, ["page-1"]));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "permission_denied");
+  assert.equal(providerAuthorizations, 2, "the expiration occurs in the final job authorization after a fresh rights check");
+  assert.equal(system.counters.reserve, 1);
+  assert.equal(system.counters.transport, 1);
+  assert.equal(system.counters.provider, 1);
+  assert.equal(system.counters.provider_dispatch, 0);
+});
+
+test("persisted cancellation during the post-ACK context lookup is caught by the final job authorization", async (t) => {
+  const system = await setup(t);
+  const created = await createBrief(system.api, "brief-final-cancel-fence");
+  const brief = created.result.brief;
+  let providerEntered = false;
+  let postEntryAuthorization = false;
+  let cancellationIssued = false;
+  let cancelResult;
+  const generate = system.ports.provider.generate;
+  system.ports.provider.generate = async (input) => {
+    providerEntered = true;
+    return generate(input);
+  };
+  const authorize = system.ports.jobs.authorizeDispatch;
+  system.ports.jobs.authorizeDispatch = async (input) => {
+    const result = await authorize(input);
+    if (providerEntered) postEntryAuthorization = true;
+    return result;
+  };
+  const getPackage = system.ports.planning.getCurrentResearchPackage;
+  system.ports.planning.getCurrentResearchPackage = async (input) => {
+    const result = await getPackage(input);
+    if (postEntryAuthorization && !cancellationIssued) {
+      cancellationIssued = true;
+      const job = system.store.db.prepare("SELECT job_id FROM creative_jobs WHERE action_id=?")
+        .get("generate-final-cancel-fence");
+      cancelResult = await system.api.invoke(actor(), request("cancel", "cancel-during-post-ack-context",
+        { job_id: job.job_id }));
+    }
+    return result;
+  };
+  const generation = await system.api.invoke(actor(), request("generate", "generate-final-cancel-fence", {
+    brief_id: brief.brief_id, plan: createPlan(brief, { planId: "plan-final-cancel-fence" }),
+  }));
+  assert.equal(cancelResult?.ok, true, JSON.stringify(cancelResult));
+  assert.equal(generation.ok, false);
+  assert.equal(generation.error.code, "cancelled");
+  assert.equal(system.counters.provider, 1);
+  assert.equal(system.counters.provider_dispatch, 0, "the fixture adapter never receives the post-ACK send permit");
+  assert.equal(system.counters.reserve, 1);
+  assert.equal(system.counters.transport, 1);
+});
+
 test("a changed trusted package appends immutable brief history while old and new designs remain comparable", async (t) => {
   const system = await setup(t);
   const firstBriefResponse = await createBrief(system.api, "brief-history-version-1");
   const firstBrief = firstBriefResponse.result.brief;
-  const firstGeneration = await system.api.invoke(actor(), request("generate", "generate-brief-version-1", {
+  const firstGenerationRequest = request("generate", "generate-brief-version-1", {
     brief_id: firstBrief.brief_id, plan: createPlan(firstBrief, { planId: "plan-brief-version-1" }),
-  }));
+  });
+  const firstGeneration = await system.api.invoke(actor(), firstGenerationRequest);
   assert.equal(firstGeneration.ok, true, JSON.stringify(firstGeneration));
   const firstDesign = firstGeneration.result.design_version;
   assert.equal(firstDesign.brief_hash, canonicalHash(firstBrief));
@@ -429,6 +571,13 @@ test("a changed trusted package appends immutable brief history while old and ne
   const secondBrief = secondBriefResponse.result.brief;
   assert.equal(secondBrief.brief_id, firstBrief.brief_id);
   assert.notEqual(secondBriefResponse.result.brief_hash, canonicalHash(firstBrief));
+
+  const replayedFirstGeneration = await system.api.invoke(actor(), firstGenerationRequest);
+  assert.equal(replayedFirstGeneration.ok, true, JSON.stringify(replayedFirstGeneration));
+  assert.equal(replayedFirstGeneration.replayed, true);
+  assert.equal(replayedFirstGeneration.result.design_version.design_version_id, firstDesign.design_version_id);
+  assert.equal(system.counters.provider, 1, "historical replay reads its exact immutable brief without a new dispatch");
+  assert.equal(system.counters.reserve, 1);
 
   const secondGeneration = await system.api.invoke(actor(), request("generate", "generate-brief-version-2", {
     brief_id: secondBrief.brief_id, plan: createPlan(secondBrief, { planId: "plan-brief-version-2" }),
@@ -516,6 +665,65 @@ test("invalidation callbacks follow durable fences, duplicate and out-of-order r
   assert.equal(canonicalHash(history[0].brief), canonicalHash(brief));
   assert.equal(canonicalHash(history[1].brief), newBrief.result.brief_hash);
   assert.equal(system.counters.provider, 0);
+});
+
+test("brief.invalidate binds one public action identity to one event while retaining event replay", async (t) => {
+  const system = await setup(t);
+  const created = await createBrief(system.api, "brief-public-invalidation-action");
+  const brief = created.result.brief;
+  const firstEvent = invalidationEvent(brief, { eventId: "public-action-event-one", revision: 2 });
+  const secondEvent = invalidationEvent(brief, { eventId: "public-action-event-two", revision: 3 });
+  system.eventById.set(firstEvent.event_id, firstEvent);
+  system.eventById.set(secondEvent.event_id, secondEvent);
+
+  const first = await system.api.invoke(actor(), request("brief.invalidate", "same-public-invalidation-action",
+    { event_id: firstEvent.event_id }));
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const replay = await system.api.invoke(actor(), request("brief.invalidate", "same-public-invalidation-action",
+    { event_id: firstEvent.event_id }));
+  assert.equal(replay.ok, true, JSON.stringify(replay));
+  assert.equal(replay.replayed, true);
+  assert.equal(system.counters.approval, 1);
+  assert.equal(system.counters.producerAck, 1);
+
+  const conflict = await system.api.invoke(actor(), request("brief.invalidate", "same-public-invalidation-action",
+    { event_id: secondEvent.event_id }));
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.error.code, "conflict");
+  assert.equal(system.store.planningStore(SCOPE).getInvalidationReceipt(SCOPE.tenant_id, SCOPE.project_id,
+    secondEvent.event_id), null);
+  assert.equal(system.counters.approval, 1);
+  assert.equal(system.counters.producerAck, 1);
+
+  const distinctAction = await system.api.invoke(actor(), request("brief.invalidate", "distinct-public-invalidation-action",
+    { event_id: secondEvent.event_id }));
+  assert.equal(distinctAction.ok, true, JSON.stringify(distinctAction));
+  assert.equal(system.counters.approval, 2);
+  assert.equal(system.counters.producerAck, 2);
+});
+
+test("an incomplete invalidation action remains retryable under the same identity", async (t) => {
+  let denyApproval = true;
+  let approvalCalls = 0;
+  const system = await setup(t, { planning: { approvalStaleness: { async markBriefStale(item) {
+    approvalCalls += 1;
+    if (denyApproval) return { status: "denied", request_id: item.request_id };
+    return { ...item, status: "acknowledged" };
+  } } } });
+  const created = await createBrief(system.api, "brief-pending-public-action");
+  const event = invalidationEvent(created.result.brief, { eventId: "pending-public-event", revision: 2 });
+  system.eventById.set(event.event_id, event);
+  const first = await system.api.invoke(actor(), request("brief.invalidate", "retryable-public-action",
+    { event_id: event.event_id }));
+  assert.equal(first.ok, false);
+  assert.equal(system.counters.producerAck, 0);
+  denyApproval = false;
+  const retry = await system.api.invoke(actor(), request("brief.invalidate", "retryable-public-action",
+    { event_id: event.event_id }));
+  assert.equal(retry.ok, true, JSON.stringify(retry));
+  assert.equal(retry.result.local_status, "acknowledged");
+  assert.equal(approvalCalls, 2);
+  assert.equal(system.counters.producerAck, 1);
 });
 
 test("hard exit after local invalidation commit leaves a pending receipt that replays safely after reopen", async (t) => {
