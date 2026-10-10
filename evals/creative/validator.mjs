@@ -79,21 +79,47 @@ function isSha256(value) {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 }
 
+function safePathPart(value, fallback = 'invalid') {
+  if (typeof value === 'string' && value.length > 0) return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
+  return fallback;
+}
+
+function safeContextPart(value, fallback) {
+  if (typeof value !== 'string'
+    || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)
+    || SENSITIVE_KEY.test(value)
+    || SENSITIVE_VALUE.test(value)) return fallback;
+  return value;
+}
+
 function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
   if (!isRecord(value)) return JSON.stringify(value);
   return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
 }
 
+function canonicalSortKey(value) {
+  const encoded = canonical(value);
+  return typeof encoded === 'string' ? encoded : 'null';
+}
+
 function add(findings, key, reason) {
-  const safeKey = String(key).split(/([.:()[\]])/).map((segment) => {
+  const rawKey = typeof key === 'string' ? key : 'validation';
+  const safeKey = rawKey.split(/([.:()[\]])/).map((segment) => {
     if (/^[.:()[\]]+$/.test(segment)) return segment;
     if (segment === '') return segment;
     if (SAFE_SCHEMA_FINDING_SEGMENTS.has(segment)) return segment;
     if (/^[A-Za-z0-9_-]{1,64}$/.test(segment) && !SENSITIVE_KEY.test(segment) && !SENSITIVE_VALUE.test(segment)) return segment;
     return '[redacted]';
   }).join('');
-  findings.push({ key: safeKey, reason });
+  const safeReason = typeof reason === 'string'
+    && /^[A-Za-z0-9_-]{1,96}$/.test(reason)
+    && !SENSITIVE_KEY.test(reason)
+    && !SENSITIVE_VALUE.test(reason)
+    ? reason
+    : 'validation_failed';
+  findings.push({ key: safeKey, reason: safeReason });
 }
 
 function verifyExternalEvidence(verifier, evidence, context) {
@@ -111,6 +137,18 @@ function getPath(value, path) {
 
 function sameJson(left, right) {
   return canonical(left) === canonical(right);
+}
+
+function evaluationCellKey(questionId, stratumId) {
+  const safeQuestionId = typeof questionId === 'string' ? questionId : '';
+  const safeStratumId = typeof stratumId === 'string' ? stratumId : '';
+  return `${safeQuestionId}::${safeStratumId}`;
+}
+
+function evaluationCellIdentity(questionId, stratumId) {
+  if (typeof questionId !== 'string' || questionId.length === 0
+    || typeof stratumId !== 'string' || stratumId.length === 0) return null;
+  return JSON.stringify([questionId, stratumId]);
 }
 
 function assertExpectedTree(actual, expected, prefix, findings) {
@@ -280,7 +318,7 @@ export function validatePolicy(policy) {
 }
 
 function validateQuestionRecord(question, index, findings) {
-  const prefix = `questionRegister.questions.${question?.question_id ?? index}`;
+  const prefix = `questionRegister.questions.${safePathPart(question?.question_id, index)}`;
   if (!isRecord(question)) {
     add(findings, prefix, 'question_record_must_be_object');
     return;
@@ -295,7 +333,7 @@ function validateQuestionRecord(question, index, findings) {
   if (typeof question.version !== 'string' || question.version.length === 0) add(findings, `${prefix}.version`, 'required_nonempty_question_version');
   if (!['CE-06', 'CE-09'].includes(question.owner_issue_key)) add(findings, `${prefix}.owner_issue_key`, 'must_be_owned_by_CE-06_or_CE-09');
   if (question.owner_role !== 'Creative and fulfillment') add(findings, `${prefix}.owner_role`, 'question_owner_role_must_be_preserved');
-  if (!Object.hasOwn(REQUIRED_FIXTURES_BY_PRIMITIVE, question.primitive)) add(findings, `${prefix}.primitive`, 'must_be_choice_score_or_noul');
+  if (typeof question.primitive !== 'string' || !Object.hasOwn(REQUIRED_FIXTURES_BY_PRIMITIVE, question.primitive)) add(findings, `${prefix}.primitive`, 'must_be_choice_score_or_noul');
   if (!isSha256(question.schema_sha256)) add(findings, `${prefix}.schema_sha256`, 'pinned_schema_hash_required');
   if (!isRecord(question.model_pin)) add(findings, `${prefix}.model_pin`, 'model_configuration_pin_required');
   else {
@@ -340,29 +378,42 @@ export function validateQuestionRegister(register, {
     if (!owner) add(findings, `questionRegister.owner_sources.${expectedOwner.issue_key}`, 'question_owner_source_missing');
     else if (owner.owner_role !== expectedOwner.owner_role) add(findings, `questionRegister.owner_sources.${expectedOwner.issue_key}.owner_role`, 'question_owner_role_must_be_preserved');
   }
-  if (!Array.isArray(requiredQuestionIds) || requiredQuestionIds.length === 0) {
+  const requiredIdsAreStrings = Array.isArray(requiredQuestionIds)
+    && requiredQuestionIds.length > 0
+    && requiredQuestionIds.every((id) => typeof id === 'string' && id.length > 0);
+  const safeRequiredQuestionIds = Array.isArray(requiredQuestionIds)
+    ? requiredQuestionIds.filter((id) => typeof id === 'string' && id.length > 0)
+    : [];
+  if (!requiredIdsAreStrings) {
     add(findings, 'questionRegister.inventory_pin.required_question_ids', 'independently_pinned_nonempty_owner_inventory_required');
-  } else {
-    if (requiredQuestionIds.some((id) => typeof id !== 'string' || id.length === 0)) add(findings, 'questionRegister.inventory_pin.required_question_ids', 'question_ids_must_be_nonempty_strings');
-    if (new Set(requiredQuestionIds).size !== requiredQuestionIds.length) add(findings, 'questionRegister.inventory_pin.required_question_ids', 'question_ids_must_be_unique');
+    if (Array.isArray(requiredQuestionIds) && requiredQuestionIds.length > 0) {
+      add(findings, 'questionRegister.inventory_pin.required_question_ids', 'question_ids_must_be_nonempty_strings');
+    }
   }
+  if (new Set(safeRequiredQuestionIds).size !== safeRequiredQuestionIds.length) add(findings, 'questionRegister.inventory_pin.required_question_ids', 'question_ids_must_be_unique');
   if (!isRecord(expectedQuestionDefinitions) || Object.keys(expectedQuestionDefinitions).length === 0) {
     add(findings, 'questionRegister.inventory_pin.question_definitions', 'independently_pinned_question_definitions_required');
   }
-  if (Array.isArray(requiredQuestionIds) && requiredQuestionIds.length > 0 && isRecord(expectedQuestionDefinitions)) {
+  if (requiredIdsAreStrings && isRecord(expectedQuestionDefinitions)) {
     const definitionIds = Object.keys(expectedQuestionDefinitions).sort();
-    if (!sameJson(definitionIds, [...requiredQuestionIds].sort())) add(findings, 'questionRegister.inventory_pin.question_definitions', 'definitions_must_match_independent_question_id_inventory');
+    if (!sameJson(definitionIds, [...safeRequiredQuestionIds].sort())) add(findings, 'questionRegister.inventory_pin.question_definitions', 'definitions_must_match_independent_question_id_inventory');
     for (const [id, definition] of Object.entries(expectedQuestionDefinitions)) {
       if (!isRecord(definition) || definition.question_id !== id) add(findings, `questionRegister.inventory_pin.question_definitions.${id}`, 'definition_id_must_match_inventory_key');
     }
   }
   const claimedInventory = register.inventory_pin?.required_question_ids;
-  if (!Array.isArray(claimedInventory) || claimedInventory.length === 0) {
+  const claimedInventoryAreStrings = Array.isArray(claimedInventory)
+    && claimedInventory.length > 0
+    && claimedInventory.every((id) => typeof id === 'string' && id.length > 0);
+  if (!claimedInventoryAreStrings) {
     add(findings, 'questionRegister.inventory_pin.required_question_ids', 'empty_inventory_cannot_pass_vacuously');
-  } else if (Array.isArray(requiredQuestionIds) && requiredQuestionIds.length > 0) {
-    if (!sameJson([...claimedInventory].sort(), [...requiredQuestionIds].sort())) add(findings, 'questionRegister.inventory_pin.required_question_ids', 'does_not_match_independent_expected_inventory');
+    if (Array.isArray(claimedInventory) && claimedInventory.length > 0) {
+      add(findings, 'questionRegister.inventory_pin.required_question_ids', 'question_ids_must_be_nonempty_strings');
+    }
+  } else if (requiredIdsAreStrings) {
+    if (!sameJson([...claimedInventory].sort(), [...safeRequiredQuestionIds].sort())) add(findings, 'questionRegister.inventory_pin.required_question_ids', 'does_not_match_independent_expected_inventory');
     const expectedDefinitions = isRecord(expectedQuestionDefinitions)
-      ? Object.values(expectedQuestionDefinitions).filter(isRecord).sort((left, right) => String(left.question_id ?? '').localeCompare(String(right.question_id ?? '')))
+      ? Object.entries(expectedQuestionDefinitions).sort(([left], [right]) => left.localeCompare(right)).map(([, definition]) => definition).filter(isRecord)
       : [];
     const definitionHashes = expectedDefinitions.length === Object.keys(expectedQuestionDefinitions ?? {}).length && expectedDefinitions.length > 0
       ? canonicalSha256(expectedDefinitions)
@@ -381,11 +432,11 @@ export function validateQuestionRegister(register, {
     add(findings, 'questionRegister.questions', 'empty_register_cannot_pass_vacuously');
   }
 
-  const actualIds = registeredQuestions.map((item) => item?.question_id).filter((id) => typeof id === 'string');
+  const actualIds = registeredQuestions.map((item) => item?.question_id).filter((id) => typeof id === 'string' && id.length > 0);
   if (new Set(actualIds).size !== actualIds.length) add(findings, 'questionRegister.questions', 'duplicate_question_id');
-  if (Array.isArray(requiredQuestionIds) && requiredQuestionIds.length > 0) {
-    for (const id of requiredQuestionIds) if (!actualIds.includes(id)) add(findings, `questionRegister.questions.${id}`, 'required_question_missing_from_register');
-    for (const id of actualIds) if (!requiredQuestionIds.includes(id)) add(findings, `questionRegister.questions.${id}`, 'unregistered_question_id');
+  if (requiredIdsAreStrings) {
+    for (const id of safeRequiredQuestionIds) if (!actualIds.includes(id)) add(findings, `questionRegister.questions.${id}`, 'required_question_missing_from_register');
+    for (const id of actualIds) if (!safeRequiredQuestionIds.includes(id)) add(findings, `questionRegister.questions.${id}`, 'unregistered_question_id');
   }
 
   if (Array.isArray(register.questions)) register.questions.forEach((question, index) => validateQuestionRecord(question, index, findings));
@@ -421,19 +472,20 @@ export function validateQuestionRegister(register, {
   const telemetryRequiredFields = Array.isArray(telemetrySchema?.required_fields) ? telemetrySchema.required_fields : [];
   for (const question of registeredQuestions) {
     const id = question?.question_id;
-    if (!id) continue;
+    if (typeof id !== 'string' || id.length === 0 || !isRecord(question)) continue;
     const event = events.find((candidate) => candidate?.id === question.telemetry_event);
     if (!event) add(findings, `questionRegister.questions.${id}.telemetry_event`, 'event_missing_from_telemetry_schema');
     else {
-      if (!Array.isArray(event.question_ids) || !event.question_ids.includes(id)) add(findings, `telemetrySchema.events.${event.id}.question_ids.${id}`, 'question_event_binding_missing');
+      const eventPath = safePathPart(event?.id, 'invalid');
+      if (!Array.isArray(event.question_ids) || !event.question_ids.includes(id)) add(findings, `telemetrySchema.events.${eventPath}.question_ids.${id}`, 'question_event_binding_missing');
       for (const field of REQUIRED_TELEMETRY_FIELDS) {
         const eventFields = Array.isArray(event.fields) ? event.fields : [];
-        if (!telemetryRequiredFields.includes(field) || !eventFields.includes(field)) add(findings, `telemetrySchema.events.${event.id}.fields.${field}`, 'required_evaluation_telemetry_field_missing');
+        if (!telemetryRequiredFields.includes(field) || !eventFields.includes(field)) add(findings, `telemetrySchema.events.${eventPath}.fields.${field}`, 'required_evaluation_telemetry_field_missing');
       }
     }
 
     const fixture = fixtureRows.find((candidate) => candidate?.question_id === id);
-    const requiredFixtures = Object.hasOwn(REQUIRED_FIXTURES_BY_PRIMITIVE, question.primitive)
+    const requiredFixtures = typeof question.primitive === 'string' && Object.hasOwn(REQUIRED_FIXTURES_BY_PRIMITIVE, question.primitive)
       ? REQUIRED_FIXTURES_BY_PRIMITIVE[question.primitive]
       : [];
     if (!fixture) add(findings, `questionFixtures.${id}`, 'primitive_fixture_record_missing');
@@ -451,14 +503,16 @@ export function validateQuestionRegister(register, {
       const stratumKey = typeof stratum === 'string' ? stratum : stratum?.id;
       const splitId = typeof stratum === 'string' ? null : stratum?.split_id;
       const minimum = typeof stratum === 'string' ? 1 : stratum?.minimum;
-      if (!stratumKey || !Number.isInteger(minimum) || minimum < 1) {
+      if (typeof stratumKey !== 'string' || stratumKey.length === 0
+        || (splitId !== null && typeof splitId !== 'string')
+        || !Number.isInteger(minimum) || minimum < 1) {
         add(findings, `questionRegister.questions.${id}.required_strata`, 'stratum_requires_id_and_positive_minimum');
         continue;
       }
       const candidates = corpusSplits
         .filter((split) => !splitId || split?.id === splitId)
         .flatMap((split) => Array.isArray(split?.samples) ? split.samples : []);
-      const count = candidates.filter((sample) => Array.isArray(sample.question_ids) && sample.question_ids.includes(id) && Array.isArray(sample.strata) && sample.strata.includes(stratumKey)).length;
+      const count = candidates.filter((sample) => Array.isArray(sample?.question_ids) && sample.question_ids.includes(id) && Array.isArray(sample?.strata) && sample.strata.includes(stratumKey)).length;
       if (count < minimum) add(findings, `corpusManifest.questions.${id}.strata.${stratumKey}`, `requires_${minimum}_found_${count}`);
     }
   }
@@ -478,9 +532,11 @@ export function validateTelemetrySchema(schema) {
   else {
     const ids = schema.events.map((event) => event?.id).filter((id) => typeof id === 'string');
     if (ids.length !== schema.events.length || new Set(ids).size !== ids.length) add(findings, 'telemetrySchema.events', 'event_ids_must_be_present_and_unique');
-    for (const event of schema.events) {
-      if (!Array.isArray(event?.question_ids) || event.question_ids.length === 0) add(findings, `telemetrySchema.events.${event?.id ?? 'unknown'}.question_ids`, 'event_must_bind_question_ids');
-      if (!Array.isArray(event?.fields)) add(findings, `telemetrySchema.events.${event?.id ?? 'unknown'}.fields`, 'event_fields_must_be_array');
+    for (const [index, event] of schema.events.entries()) {
+      const eventPath = safePathPart(event?.id, `index_${index}`);
+      if (typeof event?.id !== 'string' || event.id.length === 0) add(findings, `telemetrySchema.events.${eventPath}.id`, 'event_id_must_be_nonempty_string');
+      if (!Array.isArray(event?.question_ids) || event.question_ids.length === 0) add(findings, `telemetrySchema.events.${eventPath}.question_ids`, 'event_must_bind_question_ids');
+      if (!Array.isArray(event?.fields)) add(findings, `telemetrySchema.events.${eventPath}.fields`, 'event_fields_must_be_array');
     }
   }
   return findings;
@@ -507,13 +563,17 @@ export function digestSampleHashes(sampleHashes) {
 
 export function digestSampleRecords(samples) {
   const records = [...samples].map((sample) => ({
-    sha256: sample.sha256,
-    family_id: sample.family_id ?? null,
-    gold_label_ref: sample.gold_label_ref ?? null,
-    fixture_label: sample.fixture_label ?? null,
-    question_ids: Array.isArray(sample.question_ids) ? [...sample.question_ids].sort() : [],
-    strata: Array.isArray(sample.strata) ? [...sample.strata].sort() : [],
-  })).sort((left, right) => left.sha256.localeCompare(right.sha256));
+    sha256: sample?.sha256 ?? null,
+    family_id: sample?.family_id ?? null,
+    gold_label_ref: sample?.gold_label_ref ?? null,
+    fixture_label: sample?.fixture_label ?? null,
+    question_ids: Array.isArray(sample?.question_ids)
+      ? [...sample.question_ids].sort((left, right) => canonicalSortKey(left).localeCompare(canonicalSortKey(right)))
+      : [],
+    strata: Array.isArray(sample?.strata)
+      ? [...sample.strata].sort((left, right) => canonicalSortKey(left).localeCompare(canonicalSortKey(right)))
+      : [],
+  })).sort((left, right) => canonicalSortKey(left.sha256).localeCompare(canonicalSortKey(right.sha256)));
   return sha256(canonical(records));
 }
 
@@ -551,9 +611,12 @@ export function validateCorpusManifest(manifest, { allowSyntheticFixture = false
   if (manifest.review_requirements?.owner_acceptance_required !== true) add(findings, 'corpusManifest.review_requirements.owner_acceptance_required', 'must_be_true');
   const splits = Array.isArray(manifest.splits) ? manifest.splits : [];
   const byId = new Map();
-  for (const split of splits) {
-    if (byId.has(split?.id)) add(findings, `corpusManifest.splits.${split?.id}`, 'duplicate_split_id');
-    else if (typeof split?.id === 'string') byId.set(split.id, split);
+  for (const [index, split] of splits.entries()) {
+    const splitId = split?.id;
+    const splitPath = safePathPart(splitId, `index_${index}`);
+    if (typeof splitId !== 'string' || splitId.length === 0) add(findings, `corpusManifest.splits.${splitPath}.id`, 'nonempty_split_id_required');
+    else if (byId.has(splitId)) add(findings, `corpusManifest.splits.${splitPath}`, 'duplicate_split_id');
+    else byId.set(splitId, split);
   }
   for (const [id, requirement] of Object.entries(SPLITS)) {
     const split = byId.get(id);
@@ -626,12 +689,13 @@ export function validateCorpusManifest(manifest, { allowSyntheticFixture = false
 
   const hashes = new Map();
   const allSamples = [];
-  for (const split of splits) {
+  for (const [splitIndex, split] of splits.entries()) {
     for (const sample of Array.isArray(split?.samples) ? split.samples : []) {
       if (!isSha256(sample?.sha256)) continue;
       const previous = hashes.get(sample.sha256);
-      if (previous) add(findings, `corpusManifest.splits.${split?.id}.samples.${sample.sha256}`, `hash_reused_from_${previous}`);
-      else hashes.set(sample.sha256, split?.id ?? 'unknown');
+      const splitPath = safePathPart(split?.id, `index_${splitIndex}`);
+      if (previous) add(findings, `corpusManifest.splits.${splitPath}.samples.${sample.sha256}`, 'sample_hash_reused_across_splits');
+      else hashes.set(sample.sha256, typeof split?.id === 'string' ? split.id : `index_${splitIndex}`);
       allSamples.push(sample);
     }
   }
@@ -648,7 +712,7 @@ export function validateCorpusManifest(manifest, { allowSyntheticFixture = false
         const familyKey = sample.family_id.trim().toLowerCase();
         const previous = familyOwner.get(familyKey);
         if (previous && previous !== splitId) {
-          add(findings, `corpusManifest.splits.${splitId}.samples.${sampleIndex}.family_id`, `family_reused_from_${previous}`);
+          add(findings, `corpusManifest.splits.${splitId}.samples.${sampleIndex}.family_id`, 'family_reused_across_disjoint_splits');
         } else {
           familyOwner.set(familyKey, splitId);
         }
@@ -707,26 +771,45 @@ export function validateEvaluationReport(report, { requiredCells } = {}) {
   const cells = Array.isArray(requiredCells) ? requiredCells : [];
   if (!Array.isArray(requiredCells) || cells.length === 0) add(findings, 'evaluationReport.required_cells', 'independent_question_stratum_matrix_required');
   const rows = Array.isArray(report.question_strata) ? report.question_strata : [];
-  const rowByKey = new Map();
-  for (const row of rows) {
-    const key = `${row?.question_id ?? ''}::${row?.stratum_id ?? ''}`;
-    if (rowByKey.has(key)) add(findings, `evaluationReport.question_strata.${key}`, 'duplicate_question_stratum_result');
-    else rowByKey.set(key, row);
-    if (!isRecord(row)) add(findings, `evaluationReport.question_strata.${key}`, 'result_row_must_be_object');
+  const rowByIdentity = new Map();
+  for (const [index, row] of rows.entries()) {
+    if (!isRecord(row)) {
+      add(findings, `evaluationReport.question_strata.${index}`, 'result_row_must_be_object');
+      continue;
+    }
+    const key = evaluationCellKey(row?.question_id, row?.stratum_id);
+    const identity = evaluationCellIdentity(row.question_id, row.stratum_id);
+    if (typeof row.question_id !== 'string' || row.question_id.length === 0) add(findings, `evaluationReport.question_strata.${key}.question_id`, 'nonempty_question_id_required');
+    if (typeof row.stratum_id !== 'string' || row.stratum_id.length === 0) add(findings, `evaluationReport.question_strata.${key}.stratum_id`, 'nonempty_stratum_id_required');
+    if (identity === null) continue;
+    if (rowByIdentity.has(identity)) add(findings, `evaluationReport.question_strata.${key}`, 'duplicate_question_stratum_result');
+    else rowByIdentity.set(identity, { row, key });
   }
-  for (const cell of cells) {
-    const key = `${cell?.question_id ?? ''}::${cell?.stratum_id ?? ''}`;
+  const requiredIdentities = new Set();
+  for (const [index, cell] of cells.entries()) {
+    if (!isRecord(cell)) {
+      add(findings, `evaluationReport.required_cells.${index}`, 'required_cell_must_be_object');
+      continue;
+    }
+    const key = evaluationCellKey(cell?.question_id, cell?.stratum_id);
     if (typeof cell?.question_id !== 'string' || cell.question_id.length === 0) add(findings, `evaluationReport.required_cells.${key}.question_id`, 'nonempty_question_id_required');
     if (typeof cell?.stratum_id !== 'string' || cell.stratum_id.length === 0) add(findings, `evaluationReport.required_cells.${key}.stratum_id`, 'nonempty_stratum_id_required');
     if (typeof cell?.question_version !== 'string' || cell.question_version.length === 0) add(findings, `evaluationReport.required_cells.${key}.question_version`, 'pinned_question_version_required');
     if (!isSha256(cell?.schema_sha256)) add(findings, `evaluationReport.required_cells.${key}.schema_sha256`, 'pinned_question_schema_hash_required');
     if (!Number.isInteger(cell?.expected_count) || cell.expected_count < 1) add(findings, `evaluationReport.required_cells.${key}.expected_count`, 'independently_pinned_positive_expected_count_required');
-    const row = rowByKey.get(key);
-    if (!row) {
+    const identity = evaluationCellIdentity(cell.question_id, cell.stratum_id);
+    if (identity === null) continue;
+    if (requiredIdentities.has(identity)) {
+      add(findings, `evaluationReport.required_cells.${key}`, 'duplicate_required_question_stratum_cell');
+      continue;
+    }
+    requiredIdentities.add(identity);
+    const entry = rowByIdentity.get(identity);
+    if (!entry) {
       add(findings, `evaluationReport.question_strata.${key}`, 'required_question_stratum_result_missing');
       continue;
     }
-    if (!isRecord(row)) continue;
+    const row = entry.row;
     for (const field of ['false_negatives', 'abstention_count', 'latency_ms', 'downstream_cost', 'uncertainty', 'failure_count', 'denominator', 'attempted_count', 'bootstrap_interval', 'negative_findings']) {
       if (!(field in row)) add(findings, `evaluationReport.question_strata.${key}.${field}`, 'required_metric_missing');
     }
@@ -759,10 +842,8 @@ export function validateEvaluationReport(report, { requiredCells } = {}) {
       if (row.downstream_cost.status === 'unknown' && report.economy_claim === true) add(findings, 'evaluationReport.economy_claim', 'unknown_total_cost_blocks_economy_claim');
     }
   }
-  for (const key of rowByKey.keys()) {
-    if (cells.length > 0 && !cells.some((cell) => `${cell?.question_id ?? ''}::${cell?.stratum_id ?? ''}` === key)) {
-      add(findings, `evaluationReport.question_strata.${key}`, 'unregistered_question_stratum_result');
-    }
+  for (const [identity, { key }] of rowByIdentity) {
+    if (!requiredIdentities.has(identity)) add(findings, `evaluationReport.question_strata.${key}`, 'unregistered_question_stratum_result');
   }
   return findings;
 }
@@ -780,17 +861,17 @@ export function validatePublicEvidence(value) {
       return;
     }
     if (!isRecord(node)) {
-      if (typeof node === 'string' && SENSITIVE_VALUE.test(node)) add(findings, path, 'possible_secret_or_personal_data');
+      if (typeof node === 'string' && SENSITIVE_VALUE.test(node)) add(findings, path, 'sensitive_value_or_personal_data');
       return;
     }
     for (const [key, child] of Object.entries(node)) {
+      const sensitiveKey = SENSITIVE_KEY.test(key) || SENSITIVE_VALUE.test(key);
       const safeKey = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key)
-        && !SENSITIVE_KEY.test(key)
-        && !SENSITIVE_VALUE.test(key)
+        && !sensitiveKey
         ? key
         : '[redacted]';
       const next = path ? `${path}.${safeKey}` : safeKey;
-      if (SENSITIVE_KEY.test(key)) add(findings, next, 'sensitive_field_name');
+      if (sensitiveKey) add(findings, next, 'sensitive_field_name');
       visit(child, next);
     }
   }
@@ -835,42 +916,47 @@ export function evaluatePolicyAcceptance({
       add(findings, `acceptance.${id}`, 'independent_verification_failed');
     }
   }
-  for (const split of Array.isArray(corpusManifest?.splits) ? corpusManifest.splits : []) {
+  for (const [splitIndex, split] of (Array.isArray(corpusManifest?.splits) ? corpusManifest.splits : []).entries()) {
+    const splitPath = safePathPart(split?.id, `index_${splitIndex}`);
+    const splitContext = safeContextPart(split?.id, `split-${splitIndex}`);
     if (split?.license?.status !== 'licensed' || !isSha256(split.license.provenance_sha256)) {
-      add(findings, `acceptance.corpus.${split?.id}.license`, 'licensed_corpus_provenance_required');
-    } else if (!verifyExternalEvidence(trustedEvidenceVerifier, split.license, { id: `license:${split.id}`, role: 'corpus-rights-owner', subject_sha256: split.content_sha256 })) {
-      add(findings, `acceptance.corpus.${split.id}.license`, 'independent_verification_failed');
+      add(findings, `acceptance.corpus.${splitPath}.license`, 'licensed_corpus_provenance_required');
+    } else if (!verifyExternalEvidence(trustedEvidenceVerifier, split.license, { id: `license:${splitContext}`, role: 'corpus-rights-owner', subject_sha256: split.content_sha256 })) {
+      add(findings, `acceptance.corpus.${splitPath}.license`, 'independent_verification_failed');
     }
     if (split?.owner_acceptance?.status !== 'accepted' || !isSha256(split.owner_acceptance.evidence_sha256)) {
-      add(findings, `acceptance.corpus.${split?.id}.owner_acceptance`, 'independently_verified_owner_acceptance_required');
-    } else if (!verifyExternalEvidence(trustedEvidenceVerifier, split.owner_acceptance, { id: `corpus:${split.id}`, role: 'Finance and reliability', subject_sha256: split.content_sha256 })) {
-      add(findings, `acceptance.corpus.${split.id}.owner_acceptance`, 'independent_verification_failed');
+      add(findings, `acceptance.corpus.${splitPath}.owner_acceptance`, 'independently_verified_owner_acceptance_required');
+    } else if (!verifyExternalEvidence(trustedEvidenceVerifier, split.owner_acceptance, { id: `corpus:${splitContext}`, role: 'Finance and reliability', subject_sha256: split.content_sha256 })) {
+      add(findings, `acceptance.corpus.${splitPath}.owner_acceptance`, 'independent_verification_failed');
     }
     const reviewers = Array.isArray(split?.labeling?.reviewers) ? split.labeling.reviewers : [];
-    for (const reviewer of reviewers) {
+    for (const [reviewerIndex, reviewer] of reviewers.entries()) {
+      const reviewerPath = safePathPart(reviewer?.reviewer_id, `index_${reviewerIndex}`);
+      const reviewerContext = safeContextPart(reviewer?.reviewer_id, `reviewer-${reviewerIndex}`);
       if (!verifyExternalEvidence(trustedEvidenceVerifier, reviewer, {
-        id: `reviewer:${split?.id}:${reviewer?.reviewer_id}`,
+        id: `reviewer:${splitContext}:${reviewerContext}`,
         role: 'independent-human-reviewer',
         subject_sha256: split?.content_sha256,
-      })) add(findings, `acceptance.corpus.${split?.id}.reviewers.${reviewer?.reviewer_id}`, 'independent_reviewer_verification_failed');
+      })) add(findings, `acceptance.corpus.${splitPath}.reviewers.${reviewerPath}`, 'independent_reviewer_verification_failed');
     }
     if (isRecord(split?.labeling) && !verifyExternalEvidence(trustedEvidenceVerifier, split.labeling, {
-      id: `adjudication:${split?.id}`,
+      id: `adjudication:${splitContext}`,
       role: 'independent-adjudicator',
       subject_sha256: split?.content_sha256,
-    })) add(findings, `acceptance.corpus.${split?.id}.adjudication`, 'independent_adjudication_verification_failed');
+    })) add(findings, `acceptance.corpus.${splitPath}.adjudication`, 'independent_adjudication_verification_failed');
   }
   const inventoryIds = questionRegister?.inventory_pin?.required_question_ids;
-  if (questionRegister?.status !== 'owner-published' || !Array.isArray(inventoryIds) || inventoryIds.length === 0 || !isSha256(questionRegister?.inventory_pin?.sha256)) {
+  const inventoryHash = questionRegister?.inventory_pin?.sha256;
+  if (questionRegister?.status !== 'owner-published' || !Array.isArray(inventoryIds) || inventoryIds.length === 0 || !isSha256(inventoryHash)) {
     add(findings, 'acceptance.question_register', 'owner_published_inventory_with_pinned_hash_required');
   } else if (!Array.isArray(verifiedQuestionInventory?.question_ids) || !isRecord(verifiedQuestionInventory?.definitions)) {
     add(findings, 'acceptance.question_register.inventory_pin', 'separately_verified_owner_inventory_required');
-  } else if (!verifyExternalEvidence(trustedEvidenceVerifier, verifiedQuestionInventory, { id: 'question-inventory', roles: ['CE-06', 'CE-09'], subject_sha256: questionRegister.inventory_pin.sha256 })) {
+  } else if (!verifyExternalEvidence(trustedEvidenceVerifier, verifiedQuestionInventory, { id: 'question-inventory', roles: ['CE-06', 'CE-09'], subject_sha256: inventoryHash })) {
     add(findings, 'acceptance.question_register.inventory_pin', 'independent_question_owner_verification_failed');
   }
   if (questionRegister?.owner_acceptance?.status !== 'accepted' || !isSha256(questionRegister?.owner_acceptance?.evidence_sha256)) {
     add(findings, 'acceptance.question_register.owner_acceptance', 'independently_verified_question_owner_acceptance_required');
-  } else if (!verifyExternalEvidence(trustedEvidenceVerifier, questionRegister.owner_acceptance, { id: 'question-register-acceptance', roles: ['CE-06', 'CE-09'], subject_sha256: questionRegister.inventory_pin.sha256 })) {
+  } else if (!isSha256(inventoryHash) || !verifyExternalEvidence(trustedEvidenceVerifier, questionRegister.owner_acceptance, { id: 'question-register-acceptance', roles: ['CE-06', 'CE-09'], subject_sha256: inventoryHash })) {
     add(findings, 'acceptance.question_register.owner_acceptance', 'independent_question_owner_verification_failed');
   }
   if (policy?.visual_workload?.budget_authorization?.status !== 'accepted' || !isSha256(policy?.visual_workload?.budget_authorization?.evidence_sha256)) {

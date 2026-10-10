@@ -316,7 +316,7 @@ test('corpus hashes are disjoint, content-bound, and cover required held-out cla
   repeatedHash.splits[1].samples[0].sha256 = repeatedHash.splits[0].samples[0].sha256;
   refreezeCorpus(repeatedHash);
   findings = validateCorpusManifest(repeatedHash, { allowSyntheticFixture: true, policy });
-  assert.ok(findings.some((finding) => finding.key.includes(repeatedHash.splits[1].samples[0].sha256) && finding.reason.startsWith('hash_reused_from_')));
+  assert.ok(findings.some((finding) => finding.key.includes(repeatedHash.splits[1].samples[0].sha256) && finding.reason === 'sample_hash_reused_across_splits'));
 
   const noncanonicalHash = clone(valid);
   noncanonicalHash.splits[0].samples[0].sha256 = 'a'.repeat(64);
@@ -335,7 +335,7 @@ test('corpus hashes are disjoint, content-bound, and cover required held-out cla
   for (const sample of reusedFamily.splits.find((split) => split.id === 'routing_held_out').samples) sample.family_id = 'SHARED-FAMILY';
   refreezeCorpus(reusedFamily);
   findings = validateCorpusManifest(reusedFamily, { allowSyntheticFixture: true, policy });
-  assert.ok(findings.some((finding) => finding.key.startsWith('corpusManifest.splits.routing_held_out.samples.') && finding.reason === 'family_reused_from_routing_calibration'));
+  assert.ok(findings.some((finding) => finding.key.startsWith('corpusManifest.splits.routing_held_out.samples.') && finding.reason === 'family_reused_across_disjoint_splits'));
 
   const missingReviewer = clone(valid);
   missingReviewer.splits[0].labeling.reviewers.pop();
@@ -429,6 +429,26 @@ test('report validation requires question-by-stratum negatives, uncertainty, lat
   assert.ok(hasKey(validateEvaluationReport({ ...report, question_strata: [] }, { requiredCells: [cell] }), `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}`));
   const malformedRowFindings = validateEvaluationReport({ ...report, question_strata: [null] }, { requiredCells: [cell] });
   assert.ok(malformedRowFindings.some((finding) => finding.reason === 'result_row_must_be_object'));
+
+  const malformedCellFindings = validateEvaluationReport({
+    ...report,
+    question_strata: [{ question_id: '', stratum_id: '' }],
+  }, { requiredCells: [null] });
+  assert.ok(malformedCellFindings.some((finding) => finding.reason === 'required_cell_must_be_object'));
+  assert.ok(malformedCellFindings.some((finding) => finding.reason === 'nonempty_question_id_required'));
+  assert.ok(malformedCellFindings.some((finding) => finding.reason === 'nonempty_stratum_id_required'));
+
+  const leftCell = { ...cell, question_id: 'fixture.q::fixture', stratum_id: 'rest' };
+  const rightCell = { ...cell, question_id: 'fixture.q', stratum_id: 'fixture::rest' };
+  const ambiguousReport = {
+    ...report,
+    question_strata: [{ ...report.question_strata[0], ...leftCell }],
+  };
+  const ambiguousFindings = validateEvaluationReport(ambiguousReport, { requiredCells: [leftCell, rightCell] });
+  assert.ok(ambiguousFindings.some((finding) => finding.reason === 'required_question_stratum_result_missing'));
+
+  const duplicateCellFindings = validateEvaluationReport(report, { requiredCells: [cell, cell] });
+  assert.ok(duplicateCellFindings.some((finding) => finding.reason === 'duplicate_required_question_stratum_cell'));
 });
 
 test('public evidence scanner rejects credentials and personal identifiers', () => {
@@ -441,7 +461,7 @@ test('public evidence scanner rejects credentials and personal identifiers', () 
   };
   const findings = validatePublicEvidence(evidence);
   assert.ok(hasKey(findings, 'evidence.[redacted]'));
-  assert.ok(findings.some((finding) => finding.reason === 'possible_secret_or_personal_data'));
+  assert.ok(findings.some((finding) => finding.reason === 'sensitive_value_or_personal_data'));
   assert.ok(!JSON.stringify(findings).includes(hostileKey));
   assert.ok(!JSON.stringify(findings).includes('synthetic-secret-token'));
 
@@ -451,6 +471,74 @@ test('public evidence scanner rejects credentials and personal identifiers', () 
   assert.ok(identifierFindings.length > 0);
   assert.ok(!JSON.stringify(identifierFindings).includes(hostileKey));
   assert.ok(!JSON.stringify(identifierFindings).includes('secret-private-value'));
+});
+
+test('malformed JSON-safe identifiers fail as findings without coercion or diagnostic leaks', () => {
+  const malformed = { toString: null };
+
+  const questionId = makeSyntheticEvaluationPackage(policy);
+  questionId.questionRegister.questions[0].question_id = malformed;
+  let findings = validateQuestionRegister(questionId.questionRegister, questionOptions(questionId));
+  assert.ok(hasKey(findings, 'questionRegister.questions.0.question_id'));
+
+  const primitive = makeSyntheticEvaluationPackage(policy);
+  primitive.questionRegister.questions[0].primitive = malformed;
+  findings = validateQuestionRegister(primitive.questionRegister, questionOptions(primitive));
+  assert.ok(findings.some((finding) => finding.key.endsWith('.primitive') && finding.reason === 'must_be_choice_score_or_noul'));
+
+  const stratum = makeSyntheticEvaluationPackage(policy);
+  stratum.questionRegister.questions[0].required_strata[0].id = malformed;
+  findings = validateQuestionRegister(stratum.questionRegister, questionOptions(stratum));
+  assert.ok(findings.some((finding) => finding.key.endsWith('.required_strata') && finding.reason === 'stratum_requires_id_and_positive_minimum'));
+
+  const independentlyPinned = makeSyntheticEvaluationPackage(policy);
+  findings = validateQuestionRegister(independentlyPinned.questionRegister, {
+    ...questionOptions(independentlyPinned),
+    requiredQuestionIds: [malformed],
+  });
+  assert.ok(findings.some((finding) => finding.key === 'questionRegister.inventory_pin.required_question_ids'));
+
+  const claimedInventory = makeSyntheticEvaluationPackage(policy);
+  claimedInventory.questionRegister.inventory_pin.required_question_ids = [malformed];
+  findings = validateQuestionRegister(claimedInventory.questionRegister, questionOptions(claimedInventory));
+  assert.ok(findings.some((finding) => finding.key === 'questionRegister.inventory_pin.required_question_ids'));
+
+  const eventSchema = makeSyntheticEvaluationPackage(policy).telemetrySchema;
+  eventSchema.events[0].id = malformed;
+  findings = validateTelemetrySchema(eventSchema);
+  assert.ok(findings.some((finding) => finding.key.startsWith('telemetrySchema.events.index_0.')));
+
+  const corpus = makeSyntheticEvaluationPackage(policy).corpusManifest;
+  corpus.splits[0].id = malformed;
+  findings = validateCorpusManifest(corpus, { allowSyntheticFixture: true, policy });
+  assert.ok(findings.some((finding) => finding.key === 'corpusManifest.splits.index_0.id'));
+
+  const reportFindings = validateEvaluationReport({
+    question_strata: [{ question_id: malformed, stratum_id: [] }],
+  }, {
+    requiredCells: [{ question_id: malformed, stratum_id: [], question_version: '1', schema_sha256: 'a'.repeat(64), expected_count: 1 }],
+  });
+  assert.ok(reportFindings.some((finding) => finding.reason === 'nonempty_question_id_required'));
+  assert.ok(reportFindings.some((finding) => finding.reason === 'nonempty_stratum_id_required'));
+});
+
+test('sensitive property names are reported with redacted paths and reused split IDs never enter reasons', () => {
+  const bearerKey = 'Bearer abcdef0123456789';
+  const emailKey = 'person@example.invalid';
+  const evidenceFindings = validatePublicEvidence({ [bearerKey]: 'opaque', [emailKey]: 'opaque' });
+  assert.equal(evidenceFindings.length, 2);
+  assert.ok(evidenceFindings.every((finding) => finding.reason === 'sensitive_field_name'));
+  assert.ok(!JSON.stringify(evidenceFindings).includes(bearerKey));
+  assert.ok(!JSON.stringify(evidenceFindings).includes(emailKey));
+
+  const corpus = makeSyntheticEvaluationPackage(policy).corpusManifest;
+  const reusedSample = clone(corpus.splits[0].samples[0]);
+  corpus.splits.push({ ...clone(corpus.splits[0]), id: bearerKey, samples: [reusedSample] });
+  const findings = validateCorpusManifest(corpus, { allowSyntheticFixture: true, policy });
+  assert.ok(findings.some((finding) => finding.reason === 'sample_hash_reused_across_splits'));
+  const serialized = JSON.stringify(findings);
+  assert.ok(!serialized.includes(bearerKey));
+  assert.ok(!serialized.includes('abcdef0123456789'));
 });
 
 test('local status strings and hashes cannot authenticate missing owner or corpus acceptance', () => {
@@ -528,6 +616,30 @@ test('the integrated acceptance gate can pass only through an injected independe
   assert.equal(policy.status, 'proposed');
   assert.equal(corpusManifest.status, 'pending-owner-corpus');
   assert.equal(questionRegister.status, 'missing-owner-publication');
+});
+
+test('integrated acceptance reports malformed owner containers and corpus sample records without throwing', () => {
+  const missingInventoryPin = makeInjectedAcceptanceScenario();
+  missingInventoryPin.questionRegister.inventory_pin = null;
+  const inventoryGate = evaluatePolicyAcceptance({
+    ...missingInventoryPin,
+    trustedEvidenceVerifier: (evidence, context) => Boolean(evidence && (context.role || context.roles) && context.subject_sha256),
+  });
+  assert.equal(inventoryGate.accepted, false);
+  assert.ok(hasKey(inventoryGate.findings, 'acceptance.question_register'));
+  assert.ok(hasKey(inventoryGate.findings, 'acceptance.question_register.owner_acceptance'));
+
+  for (const splitIndex of [1, 4]) {
+    const malformedCorpus = makeInjectedAcceptanceScenario();
+    const split = malformedCorpus.corpusManifest.splits[splitIndex];
+    split.samples[0] = null;
+    const gate = evaluatePolicyAcceptance({
+      ...malformedCorpus,
+      trustedEvidenceVerifier: (evidence, context) => Boolean(evidence && (context.role || context.roles) && context.subject_sha256),
+    });
+    assert.equal(gate.accepted, false);
+    assert.ok(hasKey(gate.findings, `corpusManifest.splits.${split.id}.samples.0`));
+  }
 });
 
 test('synthetic labels never satisfy actual acceptance and unresolved model pins block paid evaluation', () => {
