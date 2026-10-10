@@ -285,7 +285,8 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
       current.set(input.brief_id, input.design_version_id);
       selectionRevisions.set(input.brief_id, revision + 1);
       return { status: "selected", selection: { tenant_id: brief.tenant_id, project_id: brief.project_id,
-        brief_id: input.brief_id, design_version_id: input.design_version_id, revision: revision + 1 } };
+        brief_id: input.brief_id, design_version_id: input.design_version_id,
+        design_hash: designs.get(input.design_version_id).design_hash, revision: revision + 1 } };
     },
     getBriefForDesign(input) {
       calls.storage.push({ method: "getBriefForDesign", scope: input.scope });
@@ -1135,7 +1136,7 @@ test("restore selects the existing immutable version by selection CAS without cr
   }, "action-restore-1"));
   assert.equal(restored.ok, true, JSON.stringify(restored));
   assert.deepEqual(restored.result.selection, { tenant_id: "tenant-api-1", project_id: "project-api-1", brief_id: "brief-api-1",
-    design_version_id: "design-api-1", revision: 2 });
+    design_version_id: "design-api-1", design_hash: initialDesign.design_hash, revision: 2 });
   assert.equal(state.designs.size, 2);
   assert.equal(state.designs.get("design-api-1").design_hash, initialDesign.design_hash);
   assert.equal(state.designs.has("design-api-2"), true);
@@ -1152,6 +1153,7 @@ test("completed restore replay reports its original selection after later select
   const first = await api.invoke(actor(), firstRequest);
   assert.equal(first.ok, true, JSON.stringify(first));
   assert.equal(first.result.selection.revision, 2);
+  assert.equal(first.result.selection.design_hash, initialDesign.design_hash);
 
   const later = await api.invoke(actor(), request("restore", {
     brief_id: "brief-api-1", target_design_version_id: "design-api-2", expected_selection_revision: 2,
@@ -1169,11 +1171,13 @@ test("completed restore replay reports its original selection after later select
   assert.equal(repeated.replayed, true);
   assert.equal(repeated.result.selection.design_version_id, "design-api-1");
   assert.equal(repeated.result.selection.revision, 2);
+  assert.equal(repeated.result.selection.design_hash, initialDesign.design_hash);
   assert.equal(state.current.get("brief-api-1"), "design-api-2");
   assert.equal(state.selectionRevisions.get("brief-api-1"), 3);
   assert.equal(state.calls.provider, 0);
 
   const stored = [...state.jobs.values()].find((job) => job.action_id === "action-restore-replay");
+  assert.equal(stored.result.selection.design_hash, initialDesign.design_hash);
   stored.result.selection.authorization = "SYNTHETIC-NOT-A-REAL-CREDENTIAL";
   const privateReplay = structuredClone(firstRequest);
   privateReplay.event_id += ":private";

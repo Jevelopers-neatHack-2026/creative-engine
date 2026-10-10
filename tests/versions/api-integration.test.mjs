@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createCreativeApi } from "../../src/api/v1.mjs";
-import { canonicalHash } from "../../src/contracts/index.mjs";
+import { canonicalHash, canonicalSerialize } from "../../src/contracts/index.mjs";
 import { createCreativeVersionApiPorts } from "../../src/versions/api-ports.mjs";
 import { CreativeVersionStore, VersionStoreError } from "../../src/versions/store.mjs";
 
@@ -33,6 +33,13 @@ function request(actionId, plan) {
     occurred_at: "2026-10-10T12:20:00.000Z", ingested_at: "2026-10-10T12:20:00.000Z",
     environment: "test", billing_mode: "simulated", source_refs: ["source-api-1"],
     operation: "generate", action_id: actionId, payload: { brief_id: SCOPE.brief_id, plan } };
+}
+
+function substituteAttemptIdentity(intentJson) {
+  const intent = JSON.parse(intentJson);
+  intent.evidence.creation.billable_attempt_id = "billable-substituted-after-prepare";
+  intent.evidence.attempt_identities.billable_attempt_id = "billable-substituted-after-prepare";
+  return canonicalSerialize(intent);
 }
 
 function portsFor(store, counters, idFactory) {
@@ -136,6 +143,46 @@ test("real API invocation commits job, exact artifact bytes, version and selecti
   assert.equal(counters.provider, 1, "conflicting action replay must not dispatch again");
 });
 
+test("paired API rejects a changed commit intent before publication and replay never redispatches", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-version-intent-integrity-api-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const plan = await fixture("generate-plan");
+  const brief = await fixture("brief");
+  const store = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now: () => NOW });
+  t.after(() => store.close());
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief });
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const ports = portsFor(store, counters, () => `intent-integrity-port-${++id}`);
+  const prepare = ports.storage.prepareDesignVersion.bind(ports.storage);
+  ports.storage.prepareDesignVersion = async (input) => {
+    const prepared = await prepare(input);
+    const row = store.db.prepare("SELECT intent_json FROM creation_actions WHERE action_id=?")
+      .get("intent-integrity-api");
+    store.db.prepare("UPDATE creation_actions SET intent_json=? WHERE action_id=?")
+      .run(substituteAttemptIdentity(row.intent_json), "intent-integrity-api");
+    return prepared;
+  };
+  const api = createCreativeApi({ ports, now: () => NOW, idFactory: () => `intent-integrity-api-${++id}` });
+  const body = request("intent-integrity-api", plan);
+  const first = await api.invoke(actor(), body);
+  assert.equal(first.ok, false);
+  assert.equal(counters.provider, 1);
+  assert.equal(counters.reserved, 1);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM design_versions WHERE action_id=?")
+    .get("intent-integrity-api").count, 0);
+  assert.equal(store.getSelection({ scope: SCOPE, brief_id: SCOPE.brief_id }), null);
+  const job = store.db.prepare("SELECT status,result_json FROM creative_jobs WHERE action_id=?")
+    .get("intent-integrity-api");
+  assert.equal(job.status, "failed");
+  assert.equal(job.result_json, null);
+  const repeated = await api.invoke(actor(), body);
+  assert.equal(counters.provider, 1, "corrupt intent replay cannot make a new provider call");
+  assert.equal(counters.reserved, 1, "corrupt intent replay cannot make a new reservation");
+  if (repeated.ok) assert.equal(repeated.job.status, "failed");
+});
+
 test("paired API persists explicit A/B/C branches and restore-by-selection without creating versions", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "creative-version-api-branches-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
@@ -180,11 +227,12 @@ test("paired API persists explicit A/B/C branches and restore-by-selection witho
   const selectedB = await restore("branch-select-B", b, 1);
   assert.equal(selectedB.ok, true, JSON.stringify(selectedB));
   assert.deepEqual(selectedB.result.selection, { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id,
-    brief_id: SCOPE.brief_id, design_version_id: b.design_version_id, revision: 2 });
+    brief_id: SCOPE.brief_id, design_version_id: b.design_version_id, design_hash: b.design_hash, revision: 2 });
   const beforeRestoreCount = store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length;
   const restoreA = await restore("branch-restore-A", a, 2);
   assert.equal(restoreA.ok, true, JSON.stringify(restoreA));
   assert.equal(restoreA.result.selection.design_version_id, a.design_version_id);
+  assert.equal(restoreA.result.selection.design_hash, a.design_hash);
   assert.equal(restoreA.result.selection.revision, 3);
   assert.equal(store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, beforeRestoreCount,
     "restore selects an existing immutable record and creates no version");
@@ -461,4 +509,96 @@ test("actual API process crashes preserve attempt evidence and recover without p
       await rm(root, { recursive: true, force: true });
     }
   }
+});
+
+test("recovery quarantines a corrupted persisted intent without publishing or redispatching", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-api-corrupt-intent-recovery-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const databasePath = join(root, "versions.sqlite");
+  const objectRoot = join(root, "objects");
+  const callLog = join(root, "provider-calls.log");
+  const actionId = "corrupt-intent-recovery";
+  const seed = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  seed.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief: await fixture("brief") });
+  seed.close();
+  const child = spawnSync(process.execPath, [API_CRASH_WORKER.pathname], {
+    env: { ...process.env, CREATIVE_API_DATABASE: databasePath, CREATIVE_API_OBJECTS: objectRoot,
+      CREATIVE_API_ACTION: actionId, CREATIVE_API_CALL_LOG: callLog, CREATIVE_API_CRASH_AT: "after_commit_intent" },
+    encoding: "utf8", timeout: 20_000,
+  });
+  assert.equal(child.status, 86, child.stderr);
+  assert.equal((await readFile(callLog, "utf8")).trim().split("\n").length, 1);
+
+  const reopened = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  t.after(() => reopened.close());
+  const row = reopened.db.prepare("SELECT intent_json FROM creation_actions WHERE action_id=?").get(actionId);
+  reopened.db.prepare("UPDATE creation_actions SET intent_json=? WHERE action_id=?")
+    .run(substituteAttemptIdentity(row.intent_json), actionId);
+  const recovery = await reopened.recover();
+  assert.deepEqual(recovery, { examined: 1, committed: 0, conflicts: 0, unknown: 1 });
+  const action = reopened.db.prepare("SELECT state FROM creation_actions WHERE action_id=?").get(actionId);
+  const job = reopened.db.prepare("SELECT status,result_json,error_json FROM creative_jobs WHERE action_id=?").get(actionId);
+  assert.equal(action.state, "unknown");
+  assert.equal(job.status, "failed");
+  assert.equal(job.result_json, null);
+  assert.equal(JSON.parse(job.error_json).code, "integrity_error");
+  assert.equal(reopened.db.prepare("SELECT count(*) AS count FROM design_versions WHERE action_id=?").get(actionId).count, 0);
+  assert.equal(reopened.getSelection({ scope: SCOPE, brief_id: SCOPE.brief_id }), null);
+  assert.equal(reopened.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, 0);
+
+  const counters = { provider: 0, reserved: 0 };
+  const replayApi = createCreativeApi({ ports: portsFor(reopened, counters, () => "corrupt-replay-port"),
+    now: () => NOW, idFactory: () => "corrupt-replay-api" });
+  const replay = await replayApi.invoke(actor(), request(actionId, await fixture("generate-plan")));
+  assert.equal(replay.ok, false);
+  assert.equal(counters.provider, 0);
+  assert.equal(counters.reserved, 0);
+  assert.equal((await readFile(callLog, "utf8")).trim().split("\n").length, 1);
+});
+
+test("recovery rechecks the job lease after metadata work before committing publication", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-api-recovery-expired-lease-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const databasePath = join(root, "versions.sqlite");
+  const objectRoot = join(root, "objects");
+  const callLog = join(root, "provider-calls.log");
+  const actionId = "recovery-expired-during-publication";
+  const seed = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  seed.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief: await fixture("brief") });
+  seed.close();
+  const child = spawnSync(process.execPath, [API_CRASH_WORKER.pathname], {
+    env: { ...process.env, CREATIVE_API_DATABASE: databasePath, CREATIVE_API_OBJECTS: objectRoot,
+      CREATIVE_API_ACTION: actionId, CREATIVE_API_CALL_LOG: callLog, CREATIVE_API_CRASH_AT: "after_commit_intent" },
+    encoding: "utf8", timeout: 20_000,
+  });
+  assert.equal(child.status, 86, child.stderr);
+  assert.equal((await readFile(callLog, "utf8")).trim().split("\n").length, 1);
+
+  let now = NOW;
+  const reopened = new CreativeVersionStore({ databasePath, objectRoot, now: () => now });
+  t.after(() => reopened.close());
+  const originalTimestamp = reopened.timestamp.bind(reopened);
+  let advancedDuringMetadataTimestamp = false;
+  reopened.timestamp = () => {
+    const value = originalTimestamp();
+    if (!advancedDuringMetadataTimestamp) {
+      advancedDuringMetadataTimestamp = true;
+      now = NOW + 120_000;
+    }
+    return value;
+  };
+
+  const recovery = await reopened.recover();
+  assert.equal(advancedDuringMetadataTimestamp, true);
+  assert.deepEqual(recovery, { examined: 1, committed: 0, conflicts: 0, unknown: 1 });
+  const job = reopened.db.prepare("SELECT status,result_json FROM creative_jobs WHERE action_id=?").get(actionId);
+  const action = reopened.db.prepare("SELECT state FROM creation_actions WHERE action_id=?").get(actionId);
+  assert.equal(job.status, "failed");
+  assert.equal(job.result_json, null);
+  assert.equal(action.state, "unknown");
+  assert.equal(reopened.db.prepare("SELECT count(*) AS count FROM design_versions WHERE action_id=?").get(actionId).count, 0);
+  assert.equal(reopened.getSelection({ scope: SCOPE, brief_id: SCOPE.brief_id }), null);
+  assert.equal(reopened.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, 0);
+  assert.equal((await readFile(callLog, "utf8")).trim().split("\n").length, 1,
+    "recovery of an expired publication intent never redispatches the provider");
 });

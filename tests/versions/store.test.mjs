@@ -7,10 +7,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { computeDesignVersionHash } from "../../src/contracts/index.mjs";
+import { canonicalHash, canonicalSerialize, computeDesignVersionHash } from "../../src/contracts/index.mjs";
 import { hashArtifactBytes, readContentAddressedObject, writeContentAddressedObject } from "../../src/storage/content-addressed.mjs";
 import { CreativeVersionStore, VersionStoreError } from "../../src/versions/store.mjs";
-import { createStore, createWrite, DEFAULT_SCOPE } from "./helpers.mjs";
+import { createBrief, createStore, createWrite, DEFAULT_SCOPE } from "./helpers.mjs";
 import * as publicVersions from "creative-engine/versions";
 
 const CRASH_WORKER = new URL("../../fixtures/versions/crash-worker.mjs", import.meta.url);
@@ -105,6 +105,8 @@ test("durable root version preserves exact bytes, context, additive fields, and 
 
 test("explicit branches retain A/B/C and restore changes only the selected pointer with CAS", async (t) => {
   const { store } = await createStore(t);
+  store.putBrief({ scope: { tenant_id: DEFAULT_SCOPE.tenant_id, project_id: DEFAULT_SCOPE.project_id },
+    brief: createBrief() });
   const aInput = createWrite({ id: "A" });
   const a = await store.saveDesignVersion(aInput);
   const bInput = createWrite({ id: "B", parent: a.design_version,
@@ -162,8 +164,92 @@ test("explicit branches retain A/B/C and restore changes only the selected point
   assert.equal(current.revision, 4);
 });
 
+test("standalone restore rechecks the current brief inside selection CAS after artifact IO", async (t) => {
+  const { store } = await createStore(t);
+  const originalBrief = createBrief();
+  store.putBrief({ scope: { tenant_id: DEFAULT_SCOPE.tenant_id, project_id: DEFAULT_SCOPE.project_id }, brief: originalBrief });
+  const originalBriefHash = canonicalHash(originalBrief);
+  const a = await store.saveDesignVersion(createWrite({ id: "restore-fence-A" }));
+  const b = await store.saveDesignVersion(createWrite({ id: "restore-fence-B", parent: a.design_version,
+    selection: { mode: "branch" } }));
+  const selectedB = await store.selectDesignVersion({ scope: DEFAULT_SCOPE, brief_id: DEFAULT_SCOPE.brief_id,
+    design_version_id: b.design_version.design_version_id, expected_brief_hash: originalBriefHash,
+    expected_target_design_hash: b.design_version.design_hash,
+    expected_selected_design_version_id: a.design_version.design_version_id,
+    expected_selected_design_hash: a.design_version.design_hash, expected_selection_revision: 1 });
+  assert.equal(selectedB.status, "selected");
+
+  let entered;
+  const readStarted = new Promise((resolve) => { entered = resolve; });
+  let release;
+  const readGate = new Promise((resolve) => { release = resolve; });
+  const readBytes = store.getArtifactBytes.bind(store);
+  store.getArtifactBytes = async (input) => {
+    const bytes = await readBytes(input);
+    entered();
+    await readGate;
+    return bytes;
+  };
+  const restoring = store.selectDesignVersion({ scope: DEFAULT_SCOPE, brief_id: DEFAULT_SCOPE.brief_id,
+    design_version_id: a.design_version.design_version_id, expected_brief_hash: originalBriefHash,
+    expected_target_design_hash: a.design_version.design_hash,
+    expected_selected_design_version_id: b.design_version.design_version_id,
+    expected_selected_design_hash: b.design_version.design_hash, expected_selection_revision: 2 });
+  await readStarted;
+  const updatedBrief = structuredClone(originalBrief);
+  updatedBrief.facts.verified[0].value = "2027-05-19";
+  assert.equal(store.putBrief({ scope: { tenant_id: DEFAULT_SCOPE.tenant_id, project_id: DEFAULT_SCOPE.project_id },
+    brief: updatedBrief, expected_brief_hash: originalBriefHash }).status, "saved");
+  release();
+
+  assert.deepEqual(await restoring, { status: "stale" });
+  assert.deepEqual(store.getSelection({ scope: DEFAULT_SCOPE, brief_id: DEFAULT_SCOPE.brief_id }), {
+    tenant_id: DEFAULT_SCOPE.tenant_id, project_id: DEFAULT_SCOPE.project_id, brief_id: DEFAULT_SCOPE.brief_id,
+    design_version_id: b.design_version.design_version_id, design_hash: b.design_version.design_hash, revision: 2,
+  });
+  assert.equal(store.listDesignVersions({ scope: DEFAULT_SCOPE, brief_id: DEFAULT_SCOPE.brief_id, limit: 10 }).items.length, 2);
+});
+
+test("commit-intent integrity binds canonical payload and every row identity before finalize or recovery", async (t) => {
+  const { store } = await createStore(t);
+  const cases = ["nested_attempt_identity", "row_actor", "row_job", "row_request", "row_brief"];
+  for (const kind of cases) {
+    const actionId = `intent-integrity-${kind}`;
+    const input = createWrite({ id: actionId, action_id: actionId, job_id: `job-${actionId}` });
+    const prepared = await store.prepareDesignVersion(input);
+    assert.equal(prepared.status, "prepared");
+    const action = store.db.prepare(`SELECT * FROM creation_actions WHERE action_id=?`).get(actionId);
+    if (kind === "nested_attempt_identity") {
+      const intent = JSON.parse(action.intent_json);
+      intent.evidence.creation.billable_attempt_id = "billable-substituted";
+      intent.evidence.attempt_identities.billable_attempt_id = "billable-substituted";
+      store.db.prepare("UPDATE creation_actions SET intent_json=? WHERE action_id=?")
+        .run(canonicalSerialize(intent), actionId);
+    } else if (kind === "row_actor") {
+      store.db.prepare("UPDATE creation_actions SET actor_id=? WHERE action_id=?").run("actor-substituted", actionId);
+    } else if (kind === "row_job") {
+      store.db.prepare("UPDATE creation_actions SET job_id=? WHERE action_id=?").run("job-substituted", actionId);
+    } else if (kind === "row_request") {
+      store.db.prepare("UPDATE creation_actions SET request_hash=? WHERE action_id=?")
+        .run(canonicalHash({ substituted: kind }), actionId);
+    } else {
+      store.db.prepare("UPDATE creation_actions SET brief_id=? WHERE action_id=?").run("brief-substituted", actionId);
+    }
+
+    await expectStoreReject("integrity_error", () => store.finalizeAction(DEFAULT_SCOPE, actionId));
+    assert.equal(store.db.prepare("SELECT count(*) AS count FROM design_versions WHERE action_id=?").get(actionId).count, 0);
+    assert.equal(store.getSelection({ scope: DEFAULT_SCOPE, brief_id: DEFAULT_SCOPE.brief_id }), null);
+    const recovery = await store.recover();
+    assert.equal(recovery.unknown, 1, kind);
+    assert.equal(store.db.prepare("SELECT state FROM creation_actions WHERE action_id=?").get(actionId).state, "unknown");
+    assert.equal(store.db.prepare("SELECT count(*) AS count FROM design_versions WHERE action_id=?").get(actionId).count, 0);
+  }
+});
+
 test("separate processes race selection CAS and exactly one branch wins", async (t) => {
   const { root, store } = await createStore(t);
+  store.putBrief({ scope: { tenant_id: DEFAULT_SCOPE.tenant_id, project_id: DEFAULT_SCOPE.project_id },
+    brief: createBrief() });
   const a = await store.saveDesignVersion(createWrite({ id: "process-A" }));
   const b = await store.saveDesignVersion(createWrite({ id: "process-B", parent: a.design_version,
     selection: { mode: "branch" } }));

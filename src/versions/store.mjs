@@ -179,6 +179,80 @@ function validateContextRecord(value, scope, field = "version_context") {
   }
 }
 
+function validateCommitIntentRow(row, expectedScope) {
+  try {
+    if (!isRecord(row) || typeof row.intent_json !== "string" || typeof row.payload_hash !== "string" ||
+      !HASH_PATTERN.test(row.payload_hash)) reject("integrity_error", "creation.intent");
+    const intent = JSON.parse(row.intent_json);
+    if (!isRecord(intent) || canonicalSerialize(intent) !== row.intent_json ||
+      intent.storage_contract !== "CreativeVersionCommitIntent" || intent.schema_version !== "1.0") {
+      reject("integrity_error", "creation.intent");
+    }
+    const { created_at: createdAt, ...stableIntent } = intent;
+    if (typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt)) ||
+      new Date(createdAt).toISOString() !== createdAt || row.created_at !== createdAt ||
+      canonicalHash(stableIntent) !== row.payload_hash) reject("integrity_error", "creation.intent");
+
+    const scope = validScope({ tenant_id: row.tenant_id, project_id: row.project_id }, row.brief_id);
+    if (expectedScope && (scope.tenant_id !== expectedScope.tenant_id ||
+      scope.project_id !== expectedScope.project_id || scope.brief_id !== expectedScope.brief_id)) {
+      reject("integrity_error", "creation.intent.scope");
+    }
+    const exactScope = { tenant_id: scope.tenant_id, project_id: scope.project_id, brief_id: scope.brief_id };
+    if (!hasOnlyKeys(intent.scope, ["tenant_id", "project_id", "brief_id"]) ||
+      canonicalSerialize(intent.scope) !== canonicalSerialize(exactScope) || intent.brief_id !== row.brief_id ||
+      reference(row.action_id, "creation.action_id") !== intent.evidence?.creation?.action_id ||
+      reference(row.actor_id, "creation.actor_id") !== intent.actor_id ||
+      reference(row.job_id, "creation.job_id") !== intent.evidence?.creation?.job_id ||
+      hash(row.request_hash, "creation.request_hash") !== intent.evidence?.creation?.request_hash) {
+      reject("integrity_error", "creation.intent.identity");
+    }
+
+    const creation = attemptEvidence(intent.evidence?.creation);
+    if (creation.action_id !== row.action_id || creation.actor_id !== row.actor_id ||
+      creation.job_id !== row.job_id || creation.request_hash !== row.request_hash) {
+      reject("integrity_error", "creation.intent.identity");
+    }
+    const expectedEvidence = {
+      creation,
+      usage_refs: creation.usage_refs ?? [],
+      trace_refs: creation.trace_refs ?? [],
+      attempt_identities: {
+        ...(creation.logical_operation_id ? { logical_operation_id: creation.logical_operation_id } : {}),
+        ...(creation.billable_attempt_id ? { billable_attempt_id: creation.billable_attempt_id } : {}),
+        transport_attempt_ids: creation.transport_attempt_ids ?? [],
+        provider_request_ids: creation.provider_request_ids ?? [],
+      },
+    };
+    if (!isRecord(intent.evidence) || canonicalSerialize(intent.evidence) !== canonicalSerialize(expectedEvidence)) {
+      reject("integrity_error", "creation.intent.evidence");
+    }
+
+    const brief = validateContextRecord(intent.context, exactScope, "creation.intent.context");
+    if (!isRecord(intent.design_version)) reject("integrity_error", "creation.intent.design_version");
+    const design = validateDesignVersion(intent.design_version, {
+      trustedScope: { ...exactScope, design_version_id: intent.design_version.design_version_id },
+      brief_hash: intent.context.brief_hash,
+      known_source_refs: brief.source_identity.map((source) => source.source_id),
+    });
+    if (!hasOnlyKeys(intent.artifact, ["content_hash", "byte_length"]) ||
+      intent.artifact.content_hash !== design.artifact.content_hash || !Number.isSafeInteger(intent.artifact.byte_length) ||
+      intent.artifact.byte_length < 1 || intent.artifact.byte_length > MAX_ARTIFACT_BYTES) {
+      reject("integrity_error", "creation.intent.artifact");
+    }
+    const selection = selectionRequest(intent.selection, design);
+    if (canonicalSerialize(selection) !== canonicalSerialize(intent.selection)) reject("integrity_error", "creation.intent.selection");
+    if (intent.job_result !== null && (!isRecord(intent.job_result) ||
+      intent.job_result.design?.design_version_id !== design.design_version_id)) {
+      reject("integrity_error", "creation.intent.job_result");
+    }
+    return intent;
+  } catch (error) {
+    if (error instanceof VersionStoreError && error.code === "integrity_error") throw error;
+    reject("integrity_error", "creation.intent");
+  }
+}
+
 function configurationSnapshot(value) {
   if (value === undefined) return null;
   if (!isRecord(value)) reject("invalid_request", "configuration_snapshot");
@@ -710,7 +784,7 @@ export class CreativeVersionStore {
     if (!row || row.job_id !== jobId || row.payload_hash !== payloadHash || row.state !== "commit_intent") {
       reject("conflict", "creation.action_id");
     }
-    const intent = snapshotJson(JSON.parse(row.intent_json), "integrity_error", "creation.intent");
+    const intent = validateCommitIntentRow(row, scope);
     if (intent.actor_id !== publication.actor_id || intent.evidence.creation.request_hash !== publication.request_hash ||
       canonicalSerialize(intent.job_result) !== canonicalSerialize(publication.result)) {
       reject("conflict", "creation.job_result");
@@ -731,11 +805,10 @@ export class CreativeVersionStore {
         !isRecord(result.selection) && result.selection !== null || typeof result.created_at !== "string") {
         reject("integrity_error", "creation.result");
       }
-      const intent = snapshotJson(JSON.parse(row.intent_json), "integrity_error", "creation.intent");
-      const scope = validScope({ tenant_id: row.tenant_id, project_id: row.project_id }, intent.brief_id);
-      const { created_at: _createdAt, ...stableIntent } = intent;
-      if (canonicalHash(stableIntent) !== row.payload_hash || intent.scope.tenant_id !== scope.tenant_id ||
-        intent.scope.project_id !== scope.project_id || intent.actor_id !== row.actor_id ||
+      const scope = validScope({ tenant_id: row.tenant_id, project_id: row.project_id }, row.brief_id);
+      const intent = validateCommitIntentRow(row, scope);
+      if (intent.scope.tenant_id !== scope.tenant_id || intent.scope.project_id !== scope.project_id ||
+        intent.actor_id !== row.actor_id ||
         intent.evidence.creation.action_id !== row.action_id || intent.evidence.creation.job_id !== row.job_id ||
         intent.evidence.creation.request_hash !== row.request_hash ||
         result.design_version.design_version_id !== intent.design_version.design_version_id ||
@@ -775,6 +848,52 @@ export class CreativeVersionStore {
 
   rollback() {
     try { this.db.exec("ROLLBACK"); } catch { /* transaction may already be closed */ }
+  }
+
+  markRecoveryUnknown(row, code, field) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const action = this.db.prepare(`SELECT state FROM creation_actions
+        WHERE tenant_id=? AND project_id=? AND action_id=?`)
+        .get(row.tenant_id, row.project_id, row.action_id);
+      if (action?.state === "commit_intent") {
+        this.db.prepare(`UPDATE creation_actions SET state='unknown',updated_at=?
+          WHERE tenant_id=? AND project_id=? AND action_id=? AND state='commit_intent'`)
+          .run(this.timestamp(), row.tenant_id, row.project_id, row.action_id);
+      }
+      const job = this.db.prepare(`SELECT job_id,operation,status FROM creative_jobs
+        WHERE tenant_id=? AND project_id=? AND action_id=?`)
+        .get(row.tenant_id, row.project_id, row.action_id);
+      if (job?.status === "running") {
+        const safeCode = ["integrity_error", "stale_version"].includes(code) ? code : "unavailable";
+        const safeField = ["creation.intent", "creative_context", "job.lease_expired"].includes(field)
+          ? field : "creation.intent";
+        const operation = ["generate", "edit", "inspect", "list", "compare", "restore", "cancel", "handoff", "job.status"]
+          .includes(job.operation) ? job.operation : "unknown";
+        const error = {
+          code: safeCode,
+          module: "creative-engine.api",
+          operation,
+          field: safeField,
+          retryable: safeCode === "unavailable",
+          message: safeCode === "integrity_error"
+            ? "Stored version or artifact integrity could not be verified."
+            : safeCode === "stale_version"
+              ? "The requested design version is no longer current."
+              : "A required service is unavailable; no successful result was produced.",
+          diagnostic_ref: safeCode === "integrity_error" ? "creative-engine:creation-intent-integrity"
+            : safeCode === "stale_version" ? "creative-engine:stale-context" : "creative-engine:lease-expired",
+        };
+        this.db.prepare(`UPDATE creative_jobs SET status='failed',result_json=NULL,error_json=?,updated_at=?
+          WHERE tenant_id=? AND project_id=? AND action_id=? AND status='running'`)
+          .run(canonicalSerialize(error), this.timestamp(), row.tenant_id, row.project_id, row.action_id);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.rollback();
+      if (error instanceof VersionStoreError) throw error;
+      reject("unavailable", "recovery", true);
+    }
   }
 
   createPublicationTransaction(data) {
@@ -831,6 +950,7 @@ export class CreativeVersionStore {
         WHERE tenant_id=? AND project_id=? AND action_id=?`)
         .get(scope.tenant_id, scope.project_id, actionId);
       if (!row) reject("not_found", "creation.action_id");
+      const intent = validateCommitIntentRow(row, scope);
       if (row.state === "committed") {
         if (ownsTransaction) this.db.exec("COMMIT");
         return this.readActionResult(row, true);
@@ -840,7 +960,6 @@ export class CreativeVersionStore {
         return { status: "unknown", code: "unknown_completion" };
       }
       if (row.state !== "commit_intent") reject("conflict", "creation.action_id");
-      const intent = snapshotJson(JSON.parse(row.intent_json), "integrity_error", "creation.intent");
       const artifactBytes = readStoredObjectSync(this.objectRoot, intent.artifact.content_hash);
       if (!artifactBytes || artifactBytes.byteLength !== intent.artifact.byte_length) {
         this.db.prepare("UPDATE creation_actions SET state='unknown',updated_at=? WHERE tenant_id=? AND project_id=? AND action_id=?")
@@ -993,8 +1112,26 @@ export class CreativeVersionStore {
     const outcomes = [];
     for (const row of pending) {
       const scope = Object.freeze({ tenant_id: row.tenant_id, project_id: row.project_id, brief_id: row.brief_id });
+      const action = this.db.prepare(`SELECT * FROM creation_actions
+        WHERE tenant_id=? AND project_id=? AND action_id=?`)
+        .get(row.tenant_id, row.project_id, row.action_id);
+      let intent;
+      try {
+        intent = validateCommitIntentRow(action, scope);
+      } catch {
+        this.markRecoveryUnknown(row, "integrity_error", "creation.intent");
+        outcomes.push({ status: "unknown", code: "integrity_error" });
+        continue;
+      }
       const job = this.db.prepare(`SELECT * FROM creative_jobs WHERE tenant_id=? AND project_id=? AND job_id=?`)
         .get(row.tenant_id, row.project_id, row.job_id);
+      if (job && (job.actor_id !== intent.actor_id || job.action_id !== row.action_id ||
+        job.request_hash !== intent.evidence.creation.request_hash || job.brief_id !== scope.brief_id ||
+        !["generate", "edit"].includes(job.operation) || intent.job_result === null) || !job && intent.job_result !== null) {
+        this.markRecoveryUnknown(row, "integrity_error", "creation.intent");
+        outcomes.push({ status: "unknown", code: "integrity_error" });
+        continue;
+      }
       if (job) {
         if (job.status === "cancelled") {
           this.db.prepare(`UPDATE creation_actions SET state='cancelled',updated_at=?
@@ -1004,27 +1141,8 @@ export class CreativeVersionStore {
           continue;
         }
         if (job.status !== "running" || Date.parse(job.lease_expires_at) <= this.now()) {
-          this.db.exec("BEGIN IMMEDIATE");
-          try {
-            this.db.prepare(`UPDATE creation_actions SET state='unknown',updated_at=?
-              WHERE tenant_id=? AND project_id=? AND action_id=? AND state='commit_intent'`)
-              .run(this.timestamp(), row.tenant_id, row.project_id, row.action_id);
-            if (job.status === "running") {
-              const error = { code: "unavailable", module: "creative-engine.api", operation: job.operation,
-                field: "job.lease_expired", retryable: true,
-                message: "A required service is unavailable; no successful result was produced.",
-                diagnostic_ref: "creative-engine:lease-expired" };
-              this.db.prepare(`UPDATE creative_jobs SET status='failed',error_json=?,updated_at=?
-                WHERE tenant_id=? AND project_id=? AND job_id=? AND status='running'`)
-                .run(canonicalSerialize(error), this.timestamp(), row.tenant_id, row.project_id, row.job_id);
-            }
-            this.db.exec("COMMIT");
-            outcomes.push({ status: "unknown" });
-          } catch (error) {
-            this.rollback();
-            if (error instanceof VersionStoreError) throw error;
-            outcomes.push({ status: "unknown" });
-          }
+          this.markRecoveryUnknown(row, "unavailable", "job.lease_expired");
+          outcomes.push({ status: "unknown" });
           continue;
         }
         let transaction;
@@ -1032,33 +1150,73 @@ export class CreativeVersionStore {
         try {
           const freshJob = this.db.prepare(`SELECT * FROM creative_jobs WHERE tenant_id=? AND project_id=? AND job_id=?`)
             .get(row.tenant_id, row.project_id, row.job_id);
-          if (!freshJob || freshJob.status !== "running" || Date.parse(freshJob.lease_expires_at) <= this.now()) {
+          if (!freshJob || freshJob.status !== "running" || Date.parse(freshJob.lease_expires_at) <= this.now() ||
+            freshJob.actor_id !== intent.actor_id || freshJob.action_id !== row.action_id ||
+            freshJob.request_hash !== intent.evidence.creation.request_hash || freshJob.brief_id !== scope.brief_id) {
             this.db.exec("ROLLBACK");
+            this.markRecoveryUnknown(row, "unavailable", "job.lease_expired");
             outcomes.push({ status: "unknown" });
             continue;
           }
-          const action = this.db.prepare(`SELECT intent_json FROM creation_actions
+          const currentAction = this.db.prepare(`SELECT * FROM creation_actions
             WHERE tenant_id=? AND project_id=? AND action_id=?`)
             .get(row.tenant_id, row.project_id, row.action_id);
-          const intent = snapshotJson(JSON.parse(action.intent_json), "integrity_error", "creation.intent");
+          const currentIntent = validateCommitIntentRow(currentAction, scope);
           transaction = this.createPublicationTransaction({
             scope, actor_id: freshJob.actor_id, job_id: freshJob.job_id,
             lease_token: "recovery:" + freshJob.job_id, action_id: freshJob.action_id,
-            request_hash: freshJob.request_hash, result: intent.job_result,
-            publication_fence: { brief_id: scope.brief_id, brief_hash: intent.context.brief_hash },
+            request_hash: freshJob.request_hash, result: currentIntent.job_result,
+            publication_fence: { brief_id: scope.brief_id, brief_hash: currentIntent.context.brief_hash },
           });
           const completed = await this.finalizeAction(scope, row.action_id, undefined, transaction);
-          if (completed.status === "saved" && intent.job_result !== null) {
-            this.db.prepare(`UPDATE creative_jobs SET status='completed',result_json=?,error_json=NULL,updated_at=?
-              WHERE tenant_id=? AND project_id=? AND job_id=? AND status='running'`)
-              .run(canonicalSerialize(intent.job_result), this.timestamp(), row.tenant_id, row.project_id, row.job_id);
+          if (completed.status === "saved" && currentIntent.job_result !== null) {
+            const committedBriefIsCurrent = publicationFenceCurrent(this, scope, {
+              brief_id: scope.brief_id, brief_hash: currentIntent.context.brief_hash,
+            });
+            const finalJob = this.db.prepare(`SELECT * FROM creative_jobs
+              WHERE tenant_id=? AND project_id=? AND job_id=?`)
+              .get(row.tenant_id, row.project_id, row.job_id);
+            const updatedAt = this.timestamp();
+            const finalNow = this.now();
+            const activeLease = finalJob && finalJob.status === "running" &&
+              finalJob.actor_id === freshJob.actor_id && finalJob.action_id === freshJob.action_id &&
+              finalJob.request_hash === freshJob.request_hash && finalJob.lease_hash === freshJob.lease_hash &&
+              Date.parse(finalJob.lease_expires_at) > Math.max(finalNow, Date.parse(updatedAt));
+            let selectionIsCurrent = true;
+            if (currentIntent.selection.mode === "advance") {
+              const selection = this.db.prepare(`SELECT design_version_id,design_hash,revision FROM version_selections
+                WHERE tenant_id=? AND project_id=? AND brief_id=?`)
+                .get(scope.tenant_id, scope.project_id, scope.brief_id);
+              selectionIsCurrent = selection?.design_version_id === completed.selection?.design_version_id &&
+                selection?.design_hash === completed.selection?.design_hash &&
+                selection?.revision === completed.selection?.revision;
+            }
+            if (!activeLease || !committedBriefIsCurrent || !selectionIsCurrent) {
+              this.db.exec("ROLLBACK");
+              this.markRecoveryUnknown(row, activeLease ? "stale_version" : "unavailable",
+                activeLease ? "creative_context" : "job.lease_expired");
+              outcomes.push({ status: "unknown" });
+              continue;
+            }
+            const completedJob = this.db.prepare(`UPDATE creative_jobs SET status='completed',result_json=?,error_json=NULL,updated_at=?
+              WHERE tenant_id=? AND project_id=? AND job_id=? AND status='running' AND actor_id=? AND action_id=?
+                AND request_hash=? AND lease_hash=? AND lease_expires_at>?`)
+              .run(canonicalSerialize(currentIntent.job_result), updatedAt, row.tenant_id, row.project_id, row.job_id,
+                finalJob.actor_id, finalJob.action_id, finalJob.request_hash, finalJob.lease_hash,
+                new Date(finalNow).toISOString()).changes;
+            if (completedJob !== 1 || Date.parse(finalJob.lease_expires_at) <= this.now()) {
+              this.db.exec("ROLLBACK");
+              this.markRecoveryUnknown(row, "unavailable", "job.lease_expired");
+              outcomes.push({ status: "unknown" });
+              continue;
+            }
             this.db.exec("COMMIT");
             outcomes.push(completed);
           } else {
             this.db.prepare(`UPDATE creation_actions SET state='unknown',updated_at=?
               WHERE tenant_id=? AND project_id=? AND action_id=? AND state='commit_intent'`)
               .run(this.timestamp(), row.tenant_id, row.project_id, row.action_id);
-            this.db.prepare(`UPDATE creative_jobs SET status='failed',error_json=?,updated_at=?
+            this.db.prepare(`UPDATE creative_jobs SET status='failed',result_json=NULL,error_json=?,updated_at=?
               WHERE tenant_id=? AND project_id=? AND job_id=? AND status='running'`)
               .run(canonicalSerialize({ code: "stale_version", module: "creative-engine.api", operation: freshJob.operation,
                 field: "creative_context", retryable: false, message: "The requested design version is no longer current.",
@@ -1069,9 +1227,9 @@ export class CreativeVersionStore {
         } catch (error) {
           this.rollback();
           const code = error instanceof VersionStoreError ? error.code : "unavailable";
-          this.db.prepare(`UPDATE creation_actions SET state='unknown',updated_at=?
-            WHERE tenant_id=? AND project_id=? AND action_id=? AND state='commit_intent'`)
-            .run(this.timestamp(), row.tenant_id, row.project_id, row.action_id);
+          this.markRecoveryUnknown(row, code === "integrity_error" ? "integrity_error"
+            : code === "stale_version" ? "stale_version" : "unavailable",
+          code === "integrity_error" ? "creation.intent" : code === "stale_version" ? "creative_context" : "job.lease_expired");
           outcomes.push({ status: "unknown", code });
         } finally {
           this.closePublicationTransaction(transaction);
@@ -1082,9 +1240,9 @@ export class CreativeVersionStore {
         outcomes.push(await this.finalizeAction(scope, row.action_id));
       } catch (error) {
         const code = error instanceof VersionStoreError ? error.code : "unavailable";
-        this.db.prepare(`UPDATE creation_actions SET state='unknown',updated_at=?
-          WHERE tenant_id=? AND project_id=? AND action_id=? AND state='commit_intent'`)
-          .run(this.timestamp(), row.tenant_id, row.project_id, row.action_id);
+        this.markRecoveryUnknown(row, code === "integrity_error" ? "integrity_error"
+          : code === "stale_version" ? "stale_version" : "unavailable",
+        code === "integrity_error" ? "creation.intent" : code === "stale_version" ? "creative_context" : "job.lease_expired");
         outcomes.push({ status: "unknown", code });
       }
     }
@@ -1235,6 +1393,11 @@ export class CreativeVersionStore {
     if (!Number.isSafeInteger(input.expected_selection_revision) || input.expected_selection_revision < 0) reject("invalid_request", "expected_selection_revision");
     if (ownsTransaction) this.db.exec("BEGIN IMMEDIATE");
     try {
+      const currentBrief = this.getBrief({ scope, brief_id: scope.brief_id });
+      if (!currentBrief || canonicalHash(currentBrief) !== input.expected_brief_hash) {
+        if (ownsTransaction) this.db.exec("ROLLBACK");
+        return Object.freeze({ status: "stale" });
+      }
       const current = this.db.prepare(`SELECT design_version_id,design_hash,revision FROM version_selections
         WHERE tenant_id=? AND project_id=? AND brief_id=?`)
         .get(scope.tenant_id, scope.project_id, scope.brief_id);

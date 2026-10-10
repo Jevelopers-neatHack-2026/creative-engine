@@ -1390,7 +1390,7 @@ export function createCreativeApi(options = {}) {
       const selectedDesign = await loadDesign(scope, brief, boundedString(selection.design_version_id, "selection.design_version_id"), operation);
       const selected = await publish(principal, request, started, { selection: {
         tenant_id: scope.tenant_id, project_id: scope.project_id, brief_id: brief.brief_id,
-        design_version_id: target.design_version_id, revision: selection.revision + 1,
+        design_version_id: target.design_version_id, design_hash: target.design_hash, revision: selection.revision + 1,
       } }, async (transaction) => {
         const select = requiredPort(ports, "storage.selectDesignVersion", operation);
         const selectedResult = await select(Object.freeze({ scope, brief_id: brief.brief_id,
@@ -1402,6 +1402,7 @@ export function createCreativeApi(options = {}) {
         if (!isRecord(selectedResult) || selectedResult.status !== "selected") throw new CreativeApiError("stale_version", operation);
         assertScopedRecord(selectedResult.selection, scope, operation, brief.brief_id);
         if (selectedResult.selection.design_version_id !== target.design_version_id ||
+          selectedResult.selection.design_hash !== target.design_hash ||
           selectedResult.selection.revision !== selection.revision + 1) throw new CreativeApiError("failed", operation, "selection");
       }, Object.freeze({ ...creativeContextFence(brief, target),
         expected_current_design_version_id: selectedDesign.design_version_id,
@@ -1409,7 +1410,7 @@ export function createCreativeApi(options = {}) {
       return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse", schema_version: CREATIVE_API_VERSION,
         operation_id: selected.job_id, job: publicJob(selected, selected.job_id),
         result: Object.freeze({ selection: { tenant_id: scope.tenant_id, project_id: scope.project_id, brief_id: brief.brief_id,
-          design_version_id: target.design_version_id, revision: selection.revision + 1 } }) }), operation);
+          design_version_id: target.design_version_id, design_hash: target.design_hash, revision: selection.revision + 1 } }) }), operation);
     }
     if (operation === "handoff") {
       const briefId = boundedString(payload.brief_id, "brief_id");
@@ -1539,19 +1540,23 @@ export function createCreativeApi(options = {}) {
     if (request.operation === "restore") {
       assertStoredOnlyKeys(job.result, ["selection"], request.operation, "stored_result");
       const selection = job.result.selection;
-      assertStoredOnlyKeys(selection, ["tenant_id", "project_id", "brief_id", "design_version_id", "revision"],
+      assertStoredOnlyKeys(selection, ["tenant_id", "project_id", "brief_id", "design_version_id", "design_hash", "revision"],
         request.operation, "stored_selection");
       if (!isRecord(selection) || selection.tenant_id !== principal.tenant_id || selection.project_id !== principal.project_id ||
         selection.brief_id !== request.payload.brief_id || selection.design_version_id !== request.payload.target_design_version_id ||
+        selection.design_hash !== undefined && (typeof selection.design_hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(selection.design_hash)) ||
         !Number.isSafeInteger(selection.revision) ||
         selection.revision !== request.payload.expected_selection_revision + 1) {
         throw new CreativeApiError("unavailable", request.operation, "stored_selection");
       }
       const brief = await loadBrief(started.scope, request.payload.brief_id, request.operation);
-      await loadDesign(started.scope, brief, selection.design_version_id, request.operation);
+      const design = await loadDesign(started.scope, brief, selection.design_version_id, request.operation);
+      if (selection.design_hash !== undefined && selection.design_hash !== design.design_hash) {
+        throw new CreativeApiError("unavailable", request.operation, "stored_selection");
+      }
       return Object.freeze({ selection: Object.freeze({ tenant_id: selection.tenant_id,
         project_id: selection.project_id, brief_id: selection.brief_id,
-        design_version_id: selection.design_version_id, revision: selection.revision }) });
+        design_version_id: selection.design_version_id, design_hash: design.design_hash, revision: selection.revision }) });
     }
     if (request.operation === "inspect") {
       assertStoredOnlyKeys(job.result, ["inspection", "attempt_id"], request.operation, "stored_result");
