@@ -191,11 +191,26 @@ test("synthetic admission credential material is omitted from every planner outp
 });
 
 test("recursive privacy screening catches secret-like keys and signed or encoded URLs without flagging ordinary Basic prose", () => {
+  const tripleEncodedEmailUrl = (() => {
+    let value = "https://example.test/person@example.test";
+    for (let index = 0; index < 3; index += 1) value = encodeURIComponent(value);
+    return value;
+  })();
+  const deeplyEncodedEmailUrl = (() => {
+    let value = "https://example.test/person@example.test";
+    for (let index = 0; index < 10; index += 1) value = encodeURIComponent(value);
+    return value;
+  })();
+  const encodedSignedUrl = encodeURIComponent("https://example.test/image?X-Amz-Signature=synthetic-private-signature");
   const cases = [
     ["email key", "person@example.test", (research) => { research.preferences.items[0]["person@example.test"] = "safe"; }],
     ["provider key", "ghp_" + "A".repeat(30), (research) => { research.preferences.items[0]["ghp_" + "A".repeat(30)] = "safe"; }],
     ["signed source URL", "synthetic-private-signature", (research) => { research.source_identity[0].uri = "https://example.test/image?X-Amz-Signature=synthetic-private-signature"; }],
+    ["encoded whole signed URL", "synthetic-private-signature", (research) => { research.source_identity[0].uri = encodedSignedUrl; }],
     ["encoded email URL", "person%40example.test", (research) => { research.source_identity[0].uri = "https://example.test/person%40example.test"; }],
+    ["triple-encoded email URL", "person@example.test", (research) => { research.source_identity[0].uri = tripleEncodedEmailUrl; }],
+    ["deep encoding fails closed", "person@example.test", (research) => { research.source_identity[0].uri = deeplyEncodedEmailUrl; }],
+    ["URL userinfo", "user:password", (research) => { research.source_identity[0].uri = "https://user:password@example.test/path"; }],
     ["nested sensitive key", "person@example.test", (research) => { research.preferences.items[0]["person@example.test"] = { authorization: "synthetic-private-value" }; }],
   ];
   for (const [name, marker, mutate] of cases) {
@@ -206,6 +221,10 @@ test("recursive privacy screening catches secret-like keys and signed or encoded
     assert.equal(failure?.code, "sensitive_input", name);
     assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes(marker), false, name);
   }
+  const ordinaryEncodedUrl = completeResearchPackage();
+  ordinaryEncodedUrl.source_identity[0].uri = "https://example.test/illustrations%20for%20the%20event";
+  assert.equal(plan(ordinaryEncodedUrl).brief.source_identity[0].uri,
+    "https://example.test/illustrations%20for%20the%20event");
 });
 
 test("Basic prose remains usable while credential-looking values are rejected", () => {
@@ -213,6 +232,9 @@ test("Basic prose remains usable while credential-looking values are rejected", 
     customer_preferences: [{ preference_id: "illustration-style", value: "Basic illustrations with warm colors" }],
   });
   assert.equal(result.brief.preferences.items.some((item) => item.value === "Basic illustrations with warm colors"), true);
+  assert.equal(plan(completeResearchPackage(), baseTime, {
+    customer_preferences: [{ preference_id: "basic-shapes", value: "Basic shapes" }],
+  }).brief.preferences.items.some((item) => item.value === "Basic shapes"), true);
   let failure;
   try {
     plan(completeResearchPackage(), baseTime, {
@@ -221,6 +243,25 @@ test("Basic prose remains usable while credential-looking values are rejected", 
   } catch (error) { failure = error; }
   assert.equal(failure?.code, "sensitive_input");
   assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes("dTpw"), false);
+
+  const unicodeBasic = "Basic " + Buffer.from("üser:päss", "utf8").toString("base64");
+  failure = undefined;
+  try {
+    plan(completeResearchPackage(), baseTime, {
+      customer_preferences: [{ preference_id: "unicode-auth-style", value: unicodeBasic }],
+    });
+  } catch (error) { failure = error; }
+  assert.equal(failure?.code, "sensitive_input");
+  assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes(unicodeBasic), false);
+
+  failure = undefined;
+  try {
+    plan(completeResearchPackage(), baseTime, {
+      customer_preferences: [{ preference_id: "empty-basic-auth", value: "Basic Og==" }],
+    });
+  } catch (error) { failure = error; }
+  assert.equal(failure?.code, "sensitive_input");
+  assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes("Og=="), false);
 });
 
 test("prototype-named additional fact keys produce ordinary missing-fact clarifications", () => {

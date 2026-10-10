@@ -57,47 +57,75 @@ function hasBasicAuthMaterial(value) {
     const canonical = decoded.toString("base64");
     if (canonical !== token && canonical.replace(/=+$/, "") !== token) continue;
     const colon = decoded.indexOf(0x3a);
-    if (colon < 0 || [...decoded].some((byte) => byte < 0x20 || byte === 0x7f || byte > 0x7e)) continue;
+    if (colon < 0) continue;
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+    } catch {
+      // RFC 7617 also permits the default ISO-8859-1 repertoire. Decode that
+      // form only when every byte is printable Latin-1, excluding C1 controls.
+      if ([...decoded].some((byte) => byte < 0x20 || byte === 0x7f || (byte >= 0x80 && byte < 0xa0))) continue;
+      text = decoded.toString("latin1");
+    }
+    if ([...text].some((character) => /[\p{Cc}\p{Cf}]/u.test(character))) continue;
     return true;
   }
   return false;
 }
 
-function decodeForScreening(value) {
+function decodedVariants(value) {
+  const variants = [value];
   let decoded = value;
-  for (let index = 0; index < 2; index += 1) {
+  let exhausted = false;
+  for (let index = 0; index < 8; index += 1) {
     try {
       const next = decodeURIComponent(decoded.replace(/\+/g, "%20"));
       if (next === decoded) break;
       decoded = next;
+      variants.push(decoded);
+      if (index === 7 && /%[0-9a-f]{2}/i.test(decoded)) exhausted = true;
     } catch {
       break;
     }
   }
-  return decoded;
+  return { variants, exhausted };
 }
 
-function hasSignedUrl(value) {
-  const candidates = value.match(/https?:\/\/[^\s"'<>]+/gi) ?? [];
-  for (const candidate of candidates) {
-    const decoded = decodeForScreening(candidate);
-    try {
-      const parsed = new URL(decoded);
-      for (const [key] of parsed.searchParams) {
-        if (SIGNED_URL_PARAMETER.test(decodeForScreening(key))) return true;
+function hasSignedUrl(value, variants) {
+  for (const variant of variants) {
+    const candidates = variant.match(/https?:\/\/[^\s"'<>]+/gi) ?? [];
+    for (const candidate of candidates) {
+      const candidateVariants = decodedVariants(candidate);
+      if (candidateVariants.exhausted) return true;
+      for (const decoded of candidateVariants.variants) {
+        if (SENSITIVE_VALUE.test(decoded) || hasBasicAuthMaterial(decoded)) return true;
       }
-    } catch {
-      // Malformed URLs are handled by the normal input contract.
+      const decoded = candidateVariants.variants.at(-1);
+      try {
+        const parsed = new URL(decoded);
+        if (parsed.username || parsed.password) return true;
+        for (const [key, queryValue] of parsed.searchParams) {
+          const keyVariants = decodedVariants(key);
+          const valueVariants = decodedVariants(queryValue);
+          if (keyVariants.exhausted || valueVariants.exhausted) return true;
+          if (keyVariants.variants.some((item) => SIGNED_URL_PARAMETER.test(item))) return true;
+          if (valueVariants.variants.some((item) => SENSITIVE_VALUE.test(item) || hasBasicAuthMaterial(item))) return true;
+        }
+      } catch {
+        // Malformed URLs are handled by the normal input contract.
+      }
     }
-    if (SENSITIVE_VALUE.test(decoded) || hasBasicAuthMaterial(decoded)) return true;
   }
   return false;
 }
 
 function hasSensitivePublicText(value) {
-  if (SENSITIVE_VALUE.test(value) || hasBasicAuthMaterial(value) || hasSignedUrl(value)) return true;
-  const decoded = decodeForScreening(value);
-  return decoded !== value && (SENSITIVE_VALUE.test(decoded) || hasBasicAuthMaterial(decoded));
+  const screening = decodedVariants(value);
+  if (screening.exhausted) return true;
+  for (const variant of screening.variants) {
+    if (SENSITIVE_VALUE.test(variant) || hasBasicAuthMaterial(variant)) return true;
+  }
+  return hasSignedUrl(value, screening.variants);
 }
 
 function isRecord(value) {
