@@ -1,0 +1,23 @@
+{
+  "manifest_version": "contract-fixtures/1",
+  "schema_proposal": {
+    "path": "docs/contracts/schema-proposal.json",
+    "sha256": "sha256:3655d139d8e4e59bd8918d69e390f1a3a2a9738b3d2af8a13334d8233a06d751"
+  },
+  "fixtures": {
+    "fixtures/contracts/creative/controls-producer-valid.json": "sha256:c1915344cf2dc8743be05148f94da76cf0c84567d81430b94fda42416ebefcee",
+    "fixtures/contracts/creative/creative-brief.json": "sha256:e947bf3b207a35476e7b7a1f50b54aa522211cfeb7e56219ebc8e15d1d6acf70",
+    "fixtures/contracts/creative/current.json": "sha256:7fcafcdc22c57857e4f3b91930c6c93ac19d2e4c73642452f05b927be4292034",
+    "fixtures/contracts/creative/design-control-schema.json": "sha256:748d3addb577593905847e72555f4299463f50393b97e5b09631df631495eee6",
+    "fixtures/contracts/creative/design-version-base.json": "sha256:9f25229d42933ac2789b064c885d3c88fca85a080cc2ad2eb915db4e905b873e",
+    "fixtures/contracts/creative/edit-plan.json": "sha256:ea5450c5f2c464d491f8f78575f922853e76bd69c57112987d42286cac7e8bf6",
+    "fixtures/contracts/creative/older.json": "sha256:19bef55384ba76ab8883f49549925d2850f5a6d66be98bbb0fa25aff7d383b86",
+    "fixtures/contracts/creative/privacy-sensitive.json": "sha256:2d7a5998ef29660e3f887576e8dfad64819a47293f424979fa94022eab3387b3",
+    "fixtures/contracts/creative/scenarios.json": "sha256:d4f12096f0a1e6be8fb2e124023e5cbf8740f1ad59c4414b9694116c11a9ef71",
+    "fixtures/contracts/creative/scope-attacks.json": "sha256:e076a2d7d4992f5ff7e098ce3678c643fded648298cbf85ad0b0193b89177672",
+    "fixtures/contracts/creative/unknown-additive.json": "sha256:5103910212f8f15030546d43e71ca1a49853090542f6b6112a4f3f121f74a508",
+    "fixtures/contracts/decision-port/request.json": "sha256:20dc3499b58cb11c71c14ff941c957483f2d51a4e1d6e2437276ea81a9a1291e",
+    "fixtures/contracts/decision-port/result.json": "sha256:74640505fe7c6c09dd11793fea7027bcd7533688b0b00a3d9f1763906490c859",
+    "fixtures/contracts/decision-port/scenarios.json": "sha256:d2dac4c7647415dd68dfc53bf0b33e6ab0edaec4f4d52ce978af023c266e9b8e"
+  }
+}
