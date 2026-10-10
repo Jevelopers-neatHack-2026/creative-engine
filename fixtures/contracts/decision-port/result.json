@@ -1,0 +1,57 @@
+{
+  "contract": "DecisionPortResult",
+  "schema_version": "1.0",
+  "event_id": "event-decision-result-1",
+  "tenant_id": "tenant-1",
+  "project_id": "project-1",
+  "correlation_id": "journey-1",
+  "producer": "agent-harness@fixture",
+  "occurred_at": "2026-10-10T12:05:10Z",
+  "ingested_at": "2026-10-10T12:05:11Z",
+  "environment": "test",
+  "billing_mode": "simulated",
+  "source_refs": ["source:page-1"],
+  "request_id": "decision-req-1",
+  "logical_operation_id": "operation-1",
+  "billable_attempt_id": "billable-attempt-1",
+  "model_id": "jev-1.13.0",
+  "model_policy_version": "model-policy-1",
+  "status": "complete",
+  "answers": {
+    "layout_choice": {
+      "status": "answered",
+      "question_schema_version": "1.0",
+      "policy_version": "creative-choice-policy-1",
+      "answer": {
+        "type": "choice",
+        "choice": "centered",
+        "probabilities": {"centered": 0.8, "top_band": 0.2},
+        "confidence": 0.92
+      }
+    },
+    "palette_score": {
+      "status": "answered",
+      "question_schema_version": "1.0",
+      "policy_version": "creative-score-policy-1",
+      "answer": {
+        "type": "score",
+        "score": 1.6,
+        "legend": {"0": "poor", "1": "acceptable", "2": "strong"},
+        "probabilities": {"0": 0.1, "1": 0.2, "2": 0.7},
+        "confidence": 0.81
+      }
+    },
+    "binary_match": {
+      "status": "answered",
+      "question_schema_version": "1.0",
+      "policy_version": "creative-noul-policy-1",
+      "answer": {"type": "noul", "noul": 0.83}
+    }
+  },
+  "usage": {
+    "completeness": "complete",
+    "input_tokens": 412,
+    "output_tokens": 103,
+    "provider_request_id": "synthetic-request-ref-1"
+  }
+}
