@@ -27,6 +27,7 @@ import {
   METERING_PROPOSAL_VERSION,
   executeMeteredAttempt,
 } from "../contracts/metering.mjs";
+import { hashArtifactBytes } from "../storage/content-addressed.mjs";
 
 export const CREATIVE_API_VERSION = "1.0";
 export const CREATIVE_API_OPERATIONS = Object.freeze([
@@ -330,7 +331,7 @@ function validateRequest(request) {
   if (!isRecord(request.payload)) throw new CreativeApiError("invalid_request", request.operation, "payload");
   const allowedPayloadKeys = {
     generate: ["brief_id", "plan", "decision_request"],
-    edit: ["brief_id", "design_version_id", "plan", "decision_request"],
+    edit: ["brief_id", "design_version_id", "plan", "selection_mode", "decision_request"],
     inspect: ["brief_id", "design_version_id"],
     list: ["brief_id", "limit", "cursor"],
     compare: ["brief_id", "left_design_version_id", "right_design_version_id"],
@@ -374,6 +375,10 @@ function validateRequest(request) {
   }
   if (request.payload.decision_request !== undefined && !isRecord(request.payload.decision_request)) {
     throw new CreativeApiError("invalid_request", request.operation, "decision_request");
+  }
+  if (request.operation === "edit" && request.payload.selection_mode !== undefined &&
+    !["advance", "branch"].includes(request.payload.selection_mode)) {
+    throw new CreativeApiError("invalid_request", request.operation, "selection_mode");
   }
   if (request.payload.limit !== undefined && (!Number.isSafeInteger(request.payload.limit) || request.payload.limit < 1 || request.payload.limit > 100)) {
     throw new CreativeApiError("invalid_request", request.operation, "limit");
@@ -602,6 +607,22 @@ function safeError(error, operation) {
     return new CreativeApiError(code, operation, safeFieldPath(error.field));
   }
   if (error instanceof MeteringContractError) return new CreativeApiError("unavailable", operation, "metering", { retryable: true });
+  if (error?.module === "creative-engine.versions") {
+    const versionCodeMap = Object.freeze({
+      invalid_request: "invalid_request",
+      unsupported_version: "unsupported_version",
+      scope_denied: "scope_denied",
+      not_found: "not_found",
+      conflict: "conflict",
+      stale_version: "stale_version",
+      unavailable: "unavailable",
+      cancelled: "cancelled",
+      integrity_error: "failed",
+      unknown_completion: "unavailable",
+    });
+    const code = versionCodeMap[error.code] ?? "failed";
+    return new CreativeApiError(code, operation, safeFieldPath(error.field), { retryable: error.retryable === true });
+  }
   if (error instanceof ContractError) {
     const code = error.code === "unsupported_version" || error.code === "unsupported_major"
       ? "unsupported_version"
@@ -793,10 +814,12 @@ export function createCreativeApi(options = {}) {
       actor_id: principal.actor_id,
       job_id: started.job_id,
       lease_token: started.lease_token,
+      action_id: request.action_id,
+      operation: request.operation,
       result,
       publication_fence: publicationFence,
-    }), async () => {
-      const persisted = await persist();
+    }), async (transaction) => {
+      const persisted = await persist(transaction);
       assertPublicIdentifiers(result, request.operation, "result");
       return persisted;
     });
@@ -956,7 +979,9 @@ export function createCreativeApi(options = {}) {
       if (preDispatchError) throw preDispatchError;
       throw meteringFailure(outcome, request.operation);
     }
-    return { value: providerValue, attempt_id: attemptId, decision_request: validatedDecisionRequest, metering: outcome };
+    return { value: providerValue, attempt_id: attemptId, decision_request: validatedDecisionRequest,
+      metering: outcome, transport_attempt_ids: Object.freeze([...dispatchIntentRefs.keys()]),
+      usage_ref: outcome.observation_ack?.source_observation_id };
   }
 
   function decisionInput(decisionRequest, principal, request, brief, started) {
@@ -975,7 +1000,8 @@ export function createCreativeApi(options = {}) {
 
   async function decision(principal, request, started, brief, decisionRequest, baseDesign = null) {
     if (decisionRequest === undefined) return undefined;
-    const expectedCurrentDesignVersionId = baseDesign?.design_version_id ?? null;
+    const branchMode = request.operation === "edit" && request.payload.selection_mode === "branch";
+    const expectedCurrentDesignVersionId = branchMode ? undefined : (baseDesign?.design_version_id ?? null);
     await assertCurrentCreativeContext(started.scope, brief, baseDesign, request.operation,
       expectedCurrentDesignVersionId);
     const input = decisionInput(decisionRequest, principal, request, brief, started);
@@ -1101,7 +1127,8 @@ export function createCreativeApi(options = {}) {
     if (operation === "edit" && plan.operation === "correction.apply") {
       throw new CreativeApiError("unavailable", operation, "correction_handoff");
     }
-    const expectedCurrentDesignVersionId = baseDesign?.design_version_id ?? null;
+    const branchMode = operation === "edit" && request.payload.selection_mode === "branch";
+    const expectedCurrentDesignVersionId = branchMode ? undefined : (baseDesign?.design_version_id ?? null);
     await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
       expectedCurrentDesignVersionId);
     const decisionResult = await decision(principal, request, started, brief,
@@ -1129,6 +1156,16 @@ export function createCreativeApi(options = {}) {
       typeof generated.artifact.artifact_id !== "string" || typeof generated.artifact.content_hash !== "string" ||
       typeof generated.artifact.media_type !== "string") {
       throw new CreativeApiError("failed", operation, "provider_result");
+    }
+    if (!(generated.artifact_bytes instanceof Uint8Array) || generated.artifact_bytes.byteLength === 0) {
+      throw new CreativeApiError("failed", operation, "artifact_bytes");
+    }
+    // Copy bytes before any later storage await. Provider-owned buffers can be
+    // reused or mutated after the call returns; the published hash must bind
+    // the exact immutable snapshot below.
+    const artifactBytes = Uint8Array.from(generated.artifact_bytes);
+    if (hashArtifactBytes(artifactBytes) !== generated.artifact.content_hash) {
+      throw new CreativeApiError("failed", operation, "artifact_content_hash");
     }
     const design_version_id = boundedString(generated.design_version_id ?? idFactory(), "design_version_id");
     boundedString(generated.provider, "provider_result.provider", 100);
@@ -1168,7 +1205,16 @@ export function createCreativeApi(options = {}) {
       design_version_ids: baseDesign ? [baseDesign.design_version_id] : [],
       known_source_refs: allowedSourceRefs,
     });
-    return { design, usage: { completeness: usage.completeness ?? "unknown" }, attempt_id: metered.attempt_id };
+    const providerRequestIds = [];
+    if (generated.usage?.provider_request_id !== undefined) {
+      providerRequestIds.push(publicIdentifier(generated.usage.provider_request_id, "provider_request_id", operation, 256));
+    }
+    const usageRefs = typeof metered.usage_ref === "string"
+      ? [publicIdentifier(metered.usage_ref, "usage_ref", operation, 256)] : [];
+    return { design, artifact_bytes: artifactBytes,
+      creation_evidence: { transport_attempt_ids: [...metered.transport_attempt_ids], provider_request_ids: providerRequestIds,
+        usage_refs: usageRefs },
+      usage: { completeness: usage.completeness ?? "unknown" }, attempt_id: metered.attempt_id };
   }
 
   async function executeNew(principal, request, started) {
@@ -1251,31 +1297,84 @@ export function createCreativeApi(options = {}) {
       const baseDesign = operation === "edit"
         ? await loadDesign(scope, brief, payload.design_version_id, operation)
         : null;
+      const branchMode = operation === "edit" && payload.selection_mode === "branch";
       if (operation === "edit") {
         const getCurrent = requiredPort(ports, "storage.getCurrentDesignVersion", operation);
         const current = await getCurrent(Object.freeze({ scope, brief_id: brief.brief_id }));
-        if (!current || current.design_version_id !== baseDesign.design_version_id) {
+        if (!branchMode && (!current || current.design_version_id !== baseDesign.design_version_id)) {
           throw new CreativeApiError("stale_version", operation, "design_version_id");
         }
-        assertScopedRecord(current, scope, operation, brief.brief_id);
-        validateDesignVersion(current, { trustedScope: { ...scope, design_version_id: current.design_version_id }, brief_hash: canonicalHash(brief),
-          known_source_refs: brief.source_identity.map((source) => source.source_id) });
-        if (current.design_hash !== baseDesign.design_hash) throw new CreativeApiError("stale_version", operation, "design_hash");
+        if (current) {
+          assertScopedRecord(current, scope, operation, brief.brief_id);
+          validateDesignVersion(current, { trustedScope: { ...scope, design_version_id: current.design_version_id }, brief_hash: canonicalHash(brief),
+            known_source_refs: brief.source_identity.map((source) => source.source_id) });
+          if (!branchMode && current.design_hash !== baseDesign.design_hash) throw new CreativeApiError("stale_version", operation, "design_hash");
+        }
       } else {
         const getCurrent = requiredPort(ports, "storage.getCurrentDesignVersion", operation);
         const current = await getCurrent(Object.freeze({ scope, brief_id: brief.brief_id }));
         if (current !== null) throw new CreativeApiError("stale_version", operation, "brief_id");
       }
       const output = await runImageOperation(principal, request, started, brief, baseDesign);
-      const job = await publish(principal, request, started, output, async () => {
-        const save = requiredPort(ports, "storage.saveDesignVersion", operation);
-        const saved = await save(Object.freeze({ scope, brief_id: brief.brief_id,
-          design_version: output.design,
-          expected_brief_hash: canonicalHash(brief),
-          expected_current_design_version_id: baseDesign?.design_version_id ?? null,
-          expected_current_design_hash: baseDesign?.design_hash ?? null }));
+      const { artifact_bytes: _artifactBytes, creation_evidence: creationEvidence, ...publishedOutput } = output;
+      const selectionMode = operation === "edit" && payload.selection_mode === "branch" ? "branch" : "advance";
+      const creation = Object.freeze({
+        job_id: started.job_id,
+        action_id: request.action_id,
+        actor_id: principal.actor_id,
+        request_hash: started.request_hash,
+        logical_operation_id: request.action_id,
+        billable_attempt_id: output.design.billable_attempt_id,
+        ...(baseDesign ? { parent_design_hash: baseDesign.design_hash } : {}),
+        transport_attempt_ids: Object.freeze([...(creationEvidence?.transport_attempt_ids ?? [])]),
+        provider_request_ids: Object.freeze([...(creationEvidence?.provider_request_ids ?? [])]),
+        usage_refs: Object.freeze([...(creationEvidence?.usage_refs ?? [])]),
+        trace_refs: Object.freeze([]),
+      });
+      const saveInput = Object.freeze({ scope, brief_id: brief.brief_id,
+        design_version: output.design,
+        artifact_bytes: Uint8Array.from(output.artifact_bytes),
+        selection_mode: selectionMode,
+        creation,
+        lease_token: started.lease_token,
+        job_result: publishedOutput,
+        expected_brief_hash: canonicalHash(brief),
+        expected_current_design_version_id: selectionMode === "advance" ? (baseDesign?.design_version_id ?? null) : null,
+        expected_current_design_hash: selectionMode === "advance" ? (baseDesign?.design_hash ?? null) : null,
+        expected_parent_design_version_id: baseDesign?.design_version_id ?? null,
+        expected_parent_design_hash: baseDesign?.design_hash ?? null });
+      const prepare = ports.storage?.prepareDesignVersion;
+      const commitPrepared = ports.storage?.commitPreparedDesignVersion;
+      if ((typeof prepare === "function") !== (typeof commitPrepared === "function")) {
+        throw new CreativeApiError("unavailable", operation, "storage.version_transaction");
+      }
+      if (typeof prepare === "function") {
+        const recordAttemptEvidence = requiredPort(ports, "jobs.recordAttemptEvidence", operation);
+        const evidenceRecord = await recordAttemptEvidence(Object.freeze({
+          scope,
+          actor_id: principal.actor_id,
+          job_id: started.job_id,
+          lease_token: started.lease_token,
+          action_id: request.action_id,
+          request_hash: started.request_hash,
+          creation,
+        }));
+        if (!isRecord(evidenceRecord) || !["recorded", "replayed"].includes(evidenceRecord.status)) {
+          throw new CreativeApiError("unavailable", operation, "attempt_evidence");
+        }
+      }
+      const prepared = typeof prepare === "function" ? await prepare(saveInput) : null;
+      if (prepared !== null && (!isRecord(prepared) || prepared.status !== "prepared" ||
+        prepared.action_id !== request.action_id || prepared.job_id !== started.job_id || typeof prepared.payload_hash !== "string")) {
+        throw new CreativeApiError("unavailable", operation, "storage.version_intent");
+      }
+      const job = await publish(principal, request, started, publishedOutput, async (transaction) => {
+        const saved = prepared
+          ? await commitPrepared(Object.freeze({ scope, brief_id: brief.brief_id, action_id: prepared.action_id,
+            job_id: prepared.job_id, payload_hash: prepared.payload_hash }), transaction)
+          : await requiredPort(ports, "storage.saveDesignVersion", operation)(saveInput, transaction);
         if (!isRecord(saved) || saved.status !== "saved") throw new CreativeApiError("stale_version", operation);
-      }, creativeContextFence(brief, baseDesign));
+      }, creativeContextFence(brief, baseDesign, branchMode ? undefined : (baseDesign?.design_version_id ?? null)));
       return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse", schema_version: CREATIVE_API_VERSION,
         operation_id: job.job_id, job: publicJob(job, job.job_id), result: Object.freeze({ design_version: output.design, usage: output.usage }) }), operation);
     }
@@ -1292,19 +1391,21 @@ export function createCreativeApi(options = {}) {
       const selected = await publish(principal, request, started, { selection: {
         tenant_id: scope.tenant_id, project_id: scope.project_id, brief_id: brief.brief_id,
         design_version_id: target.design_version_id, revision: selection.revision + 1,
-      } }, async () => {
+      } }, async (transaction) => {
         const select = requiredPort(ports, "storage.selectDesignVersion", operation);
         const selectedResult = await select(Object.freeze({ scope, brief_id: brief.brief_id,
           design_version_id: target.design_version_id, expected_brief_hash: canonicalHash(brief),
           expected_target_design_hash: target.design_hash,
           expected_selected_design_version_id: selectedDesign.design_version_id,
           expected_selected_design_hash: selectedDesign.design_hash,
-          expected_selection_revision: selection.revision }));
+          expected_selection_revision: selection.revision }), transaction);
         if (!isRecord(selectedResult) || selectedResult.status !== "selected") throw new CreativeApiError("stale_version", operation);
         assertScopedRecord(selectedResult.selection, scope, operation, brief.brief_id);
         if (selectedResult.selection.design_version_id !== target.design_version_id ||
           selectedResult.selection.revision !== selection.revision + 1) throw new CreativeApiError("failed", operation, "selection");
-      }, creativeContextFence(brief, target));
+      }, Object.freeze({ ...creativeContextFence(brief, target),
+        expected_current_design_version_id: selectedDesign.design_version_id,
+        expected_current_design_hash: selectedDesign.design_hash }));
       return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse", schema_version: CREATIVE_API_VERSION,
         operation_id: selected.job_id, job: publicJob(selected, selected.job_id),
         result: Object.freeze({ selection: { tenant_id: scope.tenant_id, project_id: scope.project_id, brief_id: brief.brief_id,
@@ -1545,6 +1646,13 @@ export function createCreativeApi(options = {}) {
       operation = request.operation;
       principal = validatePrincipal(principalInput, now());
       assertRequestScope(principal, request);
+      const assertOperationAvailable = ports.jobs?.assertOperationAvailable;
+      if (typeof assertOperationAvailable === "function") {
+        const availability = await assertOperationAvailable(Object.freeze({ operation }));
+        if (!isRecord(availability) || availability.status !== "available") {
+          throw new CreativeApiError("unavailable", operation, "operation_capability", { retryable: true });
+        }
+      }
       await emitTrace({ event: "creative_api.request", operation, request_id: request.request_id,
         tenant_id: principal.tenant_id, project_id: principal.project_id, actor_id: principal.actor_id });
       if (operation === "list") {

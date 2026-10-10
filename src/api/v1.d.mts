@@ -56,6 +56,34 @@ export interface CreativeContextFence {
   expected_current_design_hash?: string | null;
 }
 
+/** A transaction capability owned by a durable jobs/storage adapter. Runtime
+ * callers may forward it only to the matching version adapter port. */
+export interface CreativePublicationTransaction {
+  readonly job_id: string;
+  readonly lease_token: string;
+}
+
+export interface CreativeVersionCreationEvidence {
+  job_id: string;
+  action_id: string;
+  actor_id: string;
+  request_hash: string;
+  logical_operation_id?: string;
+  billable_attempt_id: string;
+  parent_design_hash?: string;
+  transport_attempt_ids?: string[];
+  provider_request_ids?: string[];
+  usage_refs?: string[];
+  trace_refs?: string[];
+}
+
+export interface PreparedDesignVersion {
+  status: "prepared";
+  action_id: string;
+  job_id: string;
+  payload_hash: string;
+}
+
 export interface CreativeApiRequestEnvelope {
   contract: "CreativeApiRequest";
   schema_version: "1.0";
@@ -77,7 +105,8 @@ export type CreativeApiRequest =
   | (CreativeApiRequestEnvelope & { operation: "generate"; action_id: string;
       payload: { brief_id: string; plan: EditPlan; decision_request?: CreativeDecisionInput } })
   | (CreativeApiRequestEnvelope & { operation: "edit"; action_id: string;
-      payload: { brief_id: string; design_version_id: string; plan: EditPlan; decision_request?: CreativeDecisionInput } })
+      payload: { brief_id: string; design_version_id: string; plan: EditPlan;
+        selection_mode?: "advance" | "branch"; decision_request?: CreativeDecisionInput } })
   | (CreativeApiRequestEnvelope & { operation: "inspect"; action_id: string;
       payload: { brief_id: string; design_version_id: string } })
   | (CreativeApiRequestEnvelope & { operation: "list"; action_id?: string;
@@ -168,13 +197,26 @@ export interface CreativeRuntimePorts {
       after?: { occurred_at: string; design_version_id: string } }): Promise<{ items: DesignVersion[]; has_more: boolean }>;
     /** Atomically compare brief hash and current design ID/hash before storing a new immutable version. */
     saveDesignVersion(input: { scope: TrustedScope; brief_id: string; design_version: DesignVersion;
+      artifact_bytes: Uint8Array; selection_mode: "advance" | "branch";
+      creation: CreativeVersionCreationEvidence; lease_token: string; job_result: unknown;
       expected_brief_hash: string; expected_current_design_version_id: string | null;
-      expected_current_design_hash: string | null }): Promise<{ status: "saved" | "stale" }> | { status: "saved" | "stale" };
+      expected_current_design_hash: string | null; expected_parent_design_version_id: string | null;
+      expected_parent_design_hash: string | null }, transaction?: CreativePublicationTransaction):
+      Promise<{ status: "saved" | "stale" }> | { status: "saved" | "stale" };
+    prepareDesignVersion?(input: { scope: TrustedScope; brief_id: string; design_version: DesignVersion;
+      artifact_bytes: Uint8Array; selection_mode: "advance" | "branch";
+      creation: CreativeVersionCreationEvidence; lease_token: string; job_result: unknown;
+      expected_brief_hash: string; expected_current_design_version_id: string | null;
+      expected_current_design_hash: string | null; expected_parent_design_version_id: string | null;
+      expected_parent_design_hash: string | null }): Promise<PreparedDesignVersion> | PreparedDesignVersion;
+    commitPreparedDesignVersion?(input: { scope: TrustedScope; brief_id: string; action_id: string;
+      job_id: string; payload_hash: string }, transaction: CreativePublicationTransaction):
+      Promise<{ status: "saved" | "stale" }> | { status: "saved" | "stale" };
     /** Atomically compare brief, target, current selection identity/hash, and selection revision. */
     selectDesignVersion(input: { scope: TrustedScope; brief_id: string; design_version_id: string;
       expected_brief_hash: string; expected_target_design_hash: string;
       expected_selected_design_version_id: string; expected_selected_design_hash: string;
-      expected_selection_revision: number }): Promise<{ status: "selected"; selection: DesignSelection } | { status: "stale" }> |
+      expected_selection_revision: number }, transaction?: CreativePublicationTransaction): Promise<{ status: "selected"; selection: DesignSelection } | { status: "stale" }> |
       { status: "selected"; selection: DesignSelection } | { status: "stale" };
     getHandoffContext(input: { scope: TrustedScope; brief_id: string; design_version_id: string }): Promise<{
       binding: ApprovalBinding;
@@ -183,11 +225,15 @@ export interface CreativeRuntimePorts {
     } | null> | { binding: ApprovalBinding; artifact: HandoffArtifact; layer_manifest: HandoffLayer[] } | null;
   };
   jobs?: {
+    /** Fail closed before job creation or any operation-specific external port calls. */
+    assertOperationAvailable?(input: { operation: CreativeOperation }):
+      Promise<{ status: "available" }> | { status: "available" };
     begin(input: { scope: TrustedScope; actor_id: string; action_id: string; request_hash: string; operation: CreativeOperation }):
       Promise<StartedJob | ExistingJob | ConflictingJob> | StartedJob | ExistingJob | ConflictingJob;
     /** The adapter must compare this fence in the same transaction that publishes the completed result. */
     completeIfActive(input: { scope: TrustedScope; actor_id: string; job_id: string; lease_token: string;
-      result: unknown; publication_fence: CreativeContextFence }, publish: () => Promise<unknown>):
+      action_id: string; operation: CreativeOperation; result: unknown; publication_fence: CreativeContextFence },
+      publish: (transaction?: CreativePublicationTransaction) => Promise<unknown> | unknown):
       Promise<CompletedJob | CancelledJob | StaleContextJob> | CompletedJob | CancelledJob | StaleContextJob;
     failIfActive(input: { scope: TrustedScope; actor_id: string; job_id: string; lease_token: string;
       error: CreativeApiErrorShape }): Promise<FailedJobResult> | FailedJobResult;
@@ -196,6 +242,10 @@ export interface CreativeRuntimePorts {
       Promise<CancelJobResult> | CancelJobResult;
     /** Atomically compare context_fence and linearize each dispatch intent with cancellation and lease ownership. */
     authorizeDispatch(input: DispatchAuthorizationInput): Promise<DispatchAuthorizationResult> | DispatchAuthorizationResult;
+    /** Persist transport, provider, and usage identity references before artifact bytes are staged. */
+    recordAttemptEvidence?(input: { scope: TrustedScope; actor_id: string; job_id: string; lease_token: string;
+      action_id: string; request_hash: string; creation: CreativeVersionCreationEvidence }):
+      Promise<{ status: "recorded" | "replayed" }> | { status: "recorded" | "replayed" };
   };
   provider?: {
     resolveRoute(input: { scope: TrustedScope; actor_id: string; operation: "generate" | "edit"; plan: EditPlan }):
@@ -231,6 +281,7 @@ export interface DesignSelection {
   project_id: string;
   brief_id: string;
   design_version_id: string;
+  design_hash: string;
   revision: number;
 }
 
@@ -268,6 +319,8 @@ export interface DecisionDispatchInput extends Omit<MeteredDispatchContext, "rec
 export interface ProviderOutput {
   design_version_id?: string;
   artifact: { artifact_id: string; content_hash: string; media_type: string };
+  /** Exact bytes for the declared artifact hash; runtime snapshots and verifies them before publication. */
+  artifact_bytes: Uint8Array;
   provider: string;
   model: string;
   usage?: UsageRecord;
