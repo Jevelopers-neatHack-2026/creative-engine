@@ -12,12 +12,13 @@ make build
 make check TARGET=controls MODE=mock
 make check TARGET=contracts MODE=mock
 make check TARGET=decision-contract MODE=mock
+make check TARGET=eval-policy MODE=mock
 make check TARGET=metering-contract MODE=mock
 make check TARGET=handoff-contract MODE=mock
 make check TARGET=all MODE=mock
 ```
 
-The contracts and control checks use synthetic fixtures and make no provider calls. `make acceptance TARGET=contracts`, `make acceptance TARGET=decision-contract`, `make acceptance TARGET=metering-contract`, and `make acceptance TARGET=handoff-contract` intentionally fail while external owner agreements remain pending. `MODE=live` fails closed because there is no live dispatch implementation.
+The contracts, control, and evaluation-policy checks use synthetic fixtures and make no provider calls. `make check TARGET=eval-policy MODE=mock` runs the policy, corpus, register, report, and acceptance-gate fixtures; it passes when those local checks pass even though actual owner evidence is pending. `make acceptance TARGET=eval-policy` separately emits machine-readable evidence and exits 2 until accountable owners publish and independently verify the required corpus, question inventory, rubric, telemetry, budget, and policy approvals. `make acceptance TARGET=contracts`, `make acceptance TARGET=decision-contract`, `make acceptance TARGET=metering-contract`, and `make acceptance TARGET=handoff-contract` also intentionally fail while external owner agreements remain pending. `make acceptance TARGET=all` includes those agreements and the CE-Q01 policy/corpus evidence. `MODE=live` fails closed because there is no live dispatch implementation.
 
 The standalone contracts workflow also checks the public package imports with TypeScript 5.9.3 in strict NodeNext mode, including the metering and approval-handoff subpaths. Reproduce that typecheck locally after installing the browser fixture's locked development tools:
 

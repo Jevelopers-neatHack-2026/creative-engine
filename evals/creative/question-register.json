@@ -1,0 +1,37 @@
+{
+  "schema_version": "creative-eval-question-register/v1",
+  "policy_id": "CE-Q01",
+  "version": "0.1.0-proposed",
+  "status": "missing-owner-publication",
+  "questions": [],
+  "owner_sources": [
+    {
+      "issue_key": "CE-06",
+      "issue_number": 18,
+      "owner_role": "Creative and fulfillment",
+      "scope": "intent question content",
+      "source_status": "pending"
+    },
+    {
+      "issue_key": "CE-09",
+      "issue_number": 16,
+      "owner_role": "Creative and fulfillment",
+      "scope": "visual compliance, defect, and repair question content",
+      "source_status": "pending"
+    }
+  ],
+  "inventory_pin": {
+    "required_question_ids": null,
+    "sha256": null,
+    "independent_owner_verification": null
+  },
+  "owner_acceptance": {
+    "status": "pending",
+    "evidence_sha256": null,
+    "independent_verification": null
+  },
+  "notes": [
+    "No production question IDs, question text, answer options, labels, thresholds, model results, or human approvals are published in this proposal.",
+    "CE-06 (#18) owns intent questions. CE-09 (#16) owns visual compliance, defect, and repair questions."
+  ]
+}

@@ -1,0 +1,224 @@
+{
+  "schema_version": "creative-eval-policy/v1",
+  "policy_id": "CE-Q01",
+  "version": "0.1.0-proposed",
+  "status": "proposed",
+  "owner_role": "Creative and fulfillment",
+  "authoritative_acceptance": [
+    {
+      "id": "EVAL-02",
+      "owner_role": "Finance and reliability",
+      "scope": "creative contribution only; preserve the global meaning and owner",
+      "status": "pending",
+      "evidence_sha256": null
+    },
+    {
+      "id": "EVAL-03",
+      "owner_role": "Product and frontend",
+      "scope": "creative contribution only; preserve the global meaning and owner",
+      "status": "pending",
+      "evidence_sha256": null
+    },
+    {
+      "id": "EVAL-04",
+      "owner_role": "Finance and reliability",
+      "scope": "creative contribution only; preserve the global meaning and owner",
+      "status": "pending",
+      "evidence_sha256": null
+    }
+  ],
+  "question_owners": [
+    {
+      "issue_key": "CE-06",
+      "issue_number": 18,
+      "owner_role": "Creative and fulfillment",
+      "content_scope": "intent questions; Q01 does not author their IDs or text",
+      "inventory_status": "missing"
+    },
+    {
+      "issue_key": "CE-09",
+      "issue_number": 16,
+      "owner_role": "Creative and fulfillment",
+      "content_scope": "visual, compliance, defect, and repair questions; Q01 does not author their IDs or text",
+      "inventory_status": "missing"
+    }
+  ],
+  "workloads": {
+    "routing": {
+      "calibration": {
+        "count": 160
+      },
+      "held_out": {
+        "count": 400,
+        "by_intent": {
+          "artwork_style_change": 50,
+          "new_concept": 50,
+          "deterministic_text_layout": 50,
+          "approved_logo_positioning": 50,
+          "factual_correction": 50,
+          "comparison_restore": 50,
+          "clarification": 50,
+          "unsupported_request": 50
+        }
+      },
+      "safety": {
+        "count": 160,
+        "separate_from_calibration_and_held_out": true
+      }
+    },
+    "inspection": {
+      "calibration": {
+        "count": 56
+      },
+      "held_out": {
+        "count": 140,
+        "by_outcome": {
+          "valid": 20,
+          "unchanged": 20,
+          "wrong_subject": 20,
+          "drift": 20,
+          "corrupt": 20,
+          "refusal": 20,
+          "poor": 20
+        }
+      }
+    }
+  },
+  "required_coverage": {
+    "minimum_cases_per_stratum": {
+      "compound": 20,
+      "ambiguous": 20,
+      "missing_facts": 20,
+      "locks": 20,
+      "injection": 20,
+      "stale_base": 20,
+      "permission": 20,
+      "race": 20
+    },
+    "zero_image_composition": 60,
+    "typed_control_zero_jev": 40
+  },
+  "decision_thresholds": {
+    "choice": {
+      "automatic_route_min_confidence": 0.85,
+      "automatic_route_min_top_probability": 0.9
+    },
+    "noul": {
+      "yes_min_probability": 0.9,
+      "no_max_probability": 0.1,
+      "otherwise": "review"
+    },
+    "score": {
+      "threshold_source": "owner-published actual-level rubric required",
+      "rubric_path": "docs/evaluation/creative-rubric.md",
+      "accepted_cutoffs": null,
+      "status": "pending-owner-rubric"
+    }
+  },
+  "quality_targets": {
+    "routing": {
+      "macro_f1_min": 0.9,
+      "automatic_route_precision_min": 0.98,
+      "per_class_recall_min": 0.9,
+      "ordinary_abstention_max": 0.2
+    },
+    "inspection": {
+      "defect_recall_min": 0.95,
+      "defect_recall_includes": [
+        "wrong_subject",
+        "drift"
+      ],
+      "valid_false_repair_max": 0.05,
+      "ordinary_abstention_max": 0.25,
+      "deterministic_safety_pass_rate": 1,
+      "unauthorized_actions_max": 0
+    },
+    "visual": {
+      "non_refusal_compliance_score_min": 4,
+      "score_scale_max": 5,
+      "non_refusal_trials_at_or_above_score_min_rate": 0.9,
+      "edit_scope_preservation_score_min": 4,
+      "edit_scope_preservation_scale_max": 5,
+      "edit_trials_at_or_above_score_min_rate": 0.9,
+      "report_refusals_separately": true,
+      "report_all_failures": true
+    },
+    "jev_comparison": {
+      "quality_macro_f1_within_best_baseline_max_delta": 0.02,
+      "downstream_cost_per_success_reduction_min": 0.2,
+      "routed_decision_p95_seconds_max": 2,
+      "routed_decision_p95_must_not_exceed_generative_baseline": true,
+      "cost_includes": [
+        "vision",
+        "decomposition",
+        "escalation",
+        "retries",
+        "repairs"
+      ],
+      "unknown_total_cost_blocks_economy_claim": true
+    },
+    "uncertainty": {
+      "family_bootstrap_interval_level": 0.95,
+      "preserve_negative_findings": true
+    },
+    "benign_visual_availability": {
+      "minimum_inspectable_rate": 0.9,
+      "generation_trial_denominator": 36,
+      "edit_trial_denominator": 36,
+      "within_bounded_policy": true,
+      "refusals_failures_and_unexecuted_descendant_edits_count_as_misses": true,
+      "disallowed_safety_trials_reported_separately": true
+    }
+  },
+  "visual_workload": {
+    "briefs": 12,
+    "families": 4,
+    "generations_per_brief": 3,
+    "edits_per_generation": 1,
+    "generation_trials": 36,
+    "edit_trials": 36,
+    "requires_separate_budget_authorization_before_execution": true,
+    "budget_authorization": {
+      "status": "pending",
+      "evidence_sha256": null
+    }
+  },
+  "model_pins": {
+    "vision_observation": {
+      "required_for": "visual inspection evaluation",
+      "model_id": null,
+      "configuration_sha256": null,
+      "account_access_verification_sha256": null,
+      "status": "unresolved"
+    },
+    "generative_classification_baseline": {
+      "required_for": "routing and JEV comparative evaluation",
+      "model_id": null,
+      "configuration_sha256": null,
+      "account_access_verification_sha256": null,
+      "status": "unresolved"
+    },
+    "model_based_planning": {
+      "required_for": "only if model-based planning is included",
+      "model_id": null,
+      "configuration_sha256": null,
+      "account_access_verification_sha256": null,
+      "status": "unresolved-optional"
+    }
+  },
+  "evaluation_protocol": {
+    "two_independent_human_reviewers": true,
+    "adjudication_required": true,
+    "freeze_calibration_policy_and_corpus_hashes_before_held_out": true,
+    "held_out_tuning_invalidates_run": true,
+    "report_per_question_and_stratum": [
+      "false_negatives",
+      "abstention",
+      "latency",
+      "downstream_cost",
+      "uncertainty"
+    ],
+    "retain_failures_in_denominators": true,
+    "public_evidence_must_redact_secrets_and_personal_data": true
+  }
+}

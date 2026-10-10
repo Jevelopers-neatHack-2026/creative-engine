@@ -29,6 +29,25 @@ jobs:
       - run: npm ci --prefix examples/frontend-action-roundtrip
       - run: node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --version
       - run: make typecheck-contracts
+      - run: make check TARGET=eval-policy MODE=mock
+      - name: Capture pending creative evaluation acceptance
+        run: |
+          mkdir -p test-results/eval-policy
+          set +e
+          make --silent acceptance TARGET=eval-policy > test-results/eval-policy/acceptance.json
+          status=$?
+          set -e
+          if [ "$status" -ne 2 ]; then
+            echo "Expected pending CE-Q01 acceptance to exit 2, received $status" >&2
+            exit 1
+          fi
+          node -e 'const fs=require("node:fs");const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(r.schema_version!=="creative-eval-acceptance-result/v1"||r.accepted!==false||r.finding_count<1)process.exit(1)' test-results/eval-policy/acceptance.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 tag verified 2026-10-10
+        if: always()
+        with:
+          name: eval-policy-evidence-node-${{ matrix.node-version }}
+          path: test-results/eval-policy/acceptance.json
+          if-no-files-found: error
       - run: make check TARGET=metering-contract MODE=mock
       - run: make check TARGET=handoff-contract MODE=mock
       - run: make check TARGET=all MODE=mock

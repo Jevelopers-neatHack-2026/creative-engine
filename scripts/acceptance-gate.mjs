@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalHash } from "../src/contracts/validation.mjs";
+import { evaluatePolicyAcceptance } from "../evals/creative/validator.mjs";
 
 const requirements = {
   contracts: [
@@ -127,10 +129,43 @@ export async function evaluateAcceptanceRecord(record, target, repoRoot) {
   return { selected, unmet, proposalState: record?.proposal_state ?? "missing" };
 }
 
+function evaluateCreativePolicy(repoRoot) {
+  try {
+    const readJson = (relativePath) => JSON.parse(readFileSync(path.join(repoRoot, relativePath), "utf8"));
+    return evaluatePolicyAcceptance({
+      policy: readJson("evals/creative/policy.json"),
+      corpusManifest: readJson("evals/creative/corpus-manifest.json"),
+      questionRegister: readJson("evals/creative/question-register.json"),
+      telemetrySchema: readJson("evals/creative/telemetry-schema.json"),
+    });
+  } catch {
+    return {
+      accepted: false,
+      findings: [{ key: "acceptance.inputs", reason: "policy_or_evidence_input_unreadable" }],
+    };
+  }
+}
+
+function writeCreativePolicyResult(gate) {
+  process.stdout.write(JSON.stringify({
+    schema_version: "creative-eval-acceptance-result/v1",
+    target: "CE-Q01",
+    accepted: gate.accepted,
+    finding_count: gate.findings.length,
+    findings: gate.findings,
+  }) + "\n");
+  if (!gate.accepted) process.exitCode = 2;
+}
+
 async function main() {
   const target = process.argv[2] ?? "all";
+  if (target === "eval-policy") {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    writeCreativePolicyResult(evaluateCreativePolicy(repoRoot));
+    return;
+  }
   if (!Object.hasOwn(requirements, target) && target !== "all") {
-    process.stderr.write("Unknown acceptance target " + target + ". Use contracts, decision-contract, metering-contract, handoff-contract, or all.\n");
+    process.stderr.write("Unknown acceptance target " + target + ". Use contracts, decision-contract, metering-contract, handoff-contract, eval-policy, or all.\n");
     process.exitCode = 2;
     return;
   }
@@ -139,11 +174,18 @@ async function main() {
   const recordPath = path.join(repoRoot, "docs/contracts/canonical-owner-agreements.json");
   const record = JSON.parse(await readFile(recordPath, "utf8"));
   const { unmet, proposalState } = await evaluateAcceptanceRecord(record, target, repoRoot);
-  if (unmet.length > 0) {
+  const creativePolicy = target === "all" ? evaluateCreativePolicy(repoRoot) : null;
+  if (unmet.length > 0 || creativePolicy && !creativePolicy.accepted) {
     process.stderr.write("Acceptance blocked: missing or unverified canonical owner agreement evidence for " + target + " (proposal_state=" + proposalState + ").\n");
     for (const id of unmet) {
       const agreement = record.agreements?.[id];
       process.stderr.write("- " + id + " (" + (agreement?.owner_role ?? "owner unknown") + "; status=" + (agreement?.status ?? "missing") + ")\n");
+    }
+    if (creativePolicy && !creativePolicy.accepted) {
+      process.stderr.write("Acceptance blocked: CE-Q01 policy and corpus evidence remain pending.\n");
+      for (const finding of creativePolicy.findings) {
+        process.stderr.write("- CE-Q01 " + finding.key + " (" + finding.reason + ")\n");
+      }
     }
     process.exitCode = 2;
     return;

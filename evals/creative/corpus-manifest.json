@@ -1,0 +1,152 @@
+{
+  "schema_version": "creative-eval-corpus-manifest/v1",
+  "policy_id": "CE-Q01",
+  "version": "0.1.0-proposed",
+  "status": "pending-owner-corpus",
+  "source_kind": "no-real-or-approved-corpus-present",
+  "immutable": false,
+  "freeze": {
+    "policy_sha256": null,
+    "calibration_sha256": null,
+    "corpus_sha256": null,
+    "frozen_before_held_out": false
+  },
+  "review_requirements": {
+    "independent_human_reviewers": 2,
+    "adjudication_required": true,
+    "owner_acceptance_required": true
+  },
+  "splits": [
+    {
+      "id": "routing_calibration",
+      "planned_count": 160,
+      "status": "missing",
+      "samples": [],
+      "content_sha256": null,
+      "license": {
+        "status": "pending",
+        "provenance_sha256": null
+      },
+      "labeling": {
+        "status": "pending",
+        "reviewers": [],
+        "adjudication_sha256": null
+      },
+      "owner_acceptance": {
+        "status": "pending",
+        "evidence_sha256": null
+      }
+    },
+    {
+      "id": "routing_held_out",
+      "planned_count": 400,
+      "status": "missing",
+      "required_strata": {
+        "artwork_style_change": 50,
+        "new_concept": 50,
+        "deterministic_text_layout": 50,
+        "approved_logo_positioning": 50,
+        "factual_correction": 50,
+        "comparison_restore": 50,
+        "clarification": 50,
+        "unsupported_request": 50
+      },
+      "samples": [],
+      "content_sha256": null,
+      "license": {
+        "status": "pending",
+        "provenance_sha256": null
+      },
+      "labeling": {
+        "status": "pending",
+        "reviewers": [],
+        "adjudication_sha256": null
+      },
+      "owner_acceptance": {
+        "status": "pending",
+        "evidence_sha256": null
+      }
+    },
+    {
+      "id": "routing_safety",
+      "planned_count": 160,
+      "status": "missing",
+      "samples": [],
+      "content_sha256": null,
+      "license": {
+        "status": "pending",
+        "provenance_sha256": null
+      },
+      "labeling": {
+        "status": "pending",
+        "reviewers": [],
+        "adjudication_sha256": null
+      },
+      "owner_acceptance": {
+        "status": "pending",
+        "evidence_sha256": null
+      }
+    },
+    {
+      "id": "inspection_calibration",
+      "planned_count": 56,
+      "status": "missing",
+      "samples": [],
+      "content_sha256": null,
+      "license": {
+        "status": "pending",
+        "provenance_sha256": null
+      },
+      "labeling": {
+        "status": "pending",
+        "reviewers": [],
+        "adjudication_sha256": null
+      },
+      "owner_acceptance": {
+        "status": "pending",
+        "evidence_sha256": null
+      }
+    },
+    {
+      "id": "inspection_held_out",
+      "planned_count": 140,
+      "status": "missing",
+      "required_strata": {
+        "valid": 20,
+        "unchanged": 20,
+        "wrong_subject": 20,
+        "drift": 20,
+        "corrupt": 20,
+        "refusal": 20,
+        "poor": 20
+      },
+      "samples": [],
+      "content_sha256": null,
+      "license": {
+        "status": "pending",
+        "provenance_sha256": null
+      },
+      "labeling": {
+        "status": "pending",
+        "reviewers": [],
+        "adjudication_sha256": null
+      },
+      "owner_acceptance": {
+        "status": "pending",
+        "evidence_sha256": null
+      }
+    }
+  ],
+  "required_cross_split_coverage": {
+    "compound": 20,
+    "ambiguous": 20,
+    "missing_facts": 20,
+    "locks": 20,
+    "injection": 20,
+    "stale_base": 20,
+    "permission": 20,
+    "race": 20,
+    "zero_image_composition": 60,
+    "typed_control_zero_jev": 40
+  }
+}

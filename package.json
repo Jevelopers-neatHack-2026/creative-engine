@@ -32,9 +32,10 @@
   },
   "scripts": {
     "bootstrap": "npm ci --ignore-scripts --offline",
-    "build": "node scripts/runtime-check.mjs && node --check src/contracts/validation.mjs && node --check src/contracts/scope.mjs && node --check src/contracts/creative/v1.mjs && node --check src/contracts/decision-port/v1.mjs && node --check src/contracts/metering.mjs && node --check src/contracts/approval-handoff.mjs && node --check src/contracts/index.mjs",
+    "build": "node scripts/runtime-check.mjs && node --check evals/creative/validator.mjs && node --check scripts/acceptance-gate.mjs && node --check src/contracts/validation.mjs && node --check src/contracts/scope.mjs && node --check src/contracts/creative/v1.mjs && node --check src/contracts/decision-port/v1.mjs && node --check src/contracts/metering.mjs && node --check src/contracts/approval-handoff.mjs && node --check src/contracts/index.mjs",
     "check:contracts": "node --test tests/contracts/creative-contract.test.mjs tests/contracts/fixture-manifest.test.mjs tests/contracts/dependency-boundary.test.mjs tests/contracts/acceptance-gate.test.mjs",
     "check:decision-contract": "node --test tests/contracts/decision-port.test.mjs tests/contracts/fixture-manifest.test.mjs tests/contracts/dependency-boundary.test.mjs tests/contracts/acceptance-gate.test.mjs",
+    "check:eval-policy": "node --test tests/evaluation/*.test.mjs",
     "check:metering-contract": "node --test tests/contracts/metering/*.test.mjs",
     "check:handoff-contract": "node --test tests/contracts/approval/*.test.mjs",
     "test": "node --test tests/contracts/*.test.mjs"

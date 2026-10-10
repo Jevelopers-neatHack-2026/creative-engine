@@ -29,12 +29,13 @@ check:
 	@case "$(TARGET)" in \
 		contracts) npm run check:contracts ;; \
 		decision-contract) npm run check:decision-contract ;; \
+		eval-policy) npm run check:eval-policy ;; \
 		metering-contract) npm run check:metering-contract && $(MAKE) typecheck-boundary-contracts ;; \
 		handoff-contract) npm run check:handoff-contract && $(MAKE) typecheck-boundary-contracts ;; \
 		controls) node fixtures/controls/check.mjs ;; \
-		all) npm test && npm run check:metering-contract && npm run check:handoff-contract && $(MAKE) typecheck-contracts && node fixtures/controls/check.mjs ;; \
-		*) echo "Unknown TARGET=$(TARGET). Use controls, contracts, decision-contract, metering-contract, handoff-contract, or all." >&2; exit 2 ;; \
+		all) npm test && npm run check:eval-policy && npm run check:metering-contract && npm run check:handoff-contract && $(MAKE) typecheck-contracts && node fixtures/controls/check.mjs ;; \
+		*) echo "Unknown TARGET=$(TARGET). Use controls, contracts, decision-contract, eval-policy, metering-contract, handoff-contract, or all." >&2; exit 2 ;; \
 	esac
 
 acceptance:
-	node scripts/acceptance-gate.mjs "$(TARGET)"
+	@node scripts/acceptance-gate.mjs "$(TARGET)"

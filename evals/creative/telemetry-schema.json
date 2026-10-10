@@ -1,0 +1,30 @@
+{
+  "schema_version": "creative-eval-telemetry-proposal/v1",
+  "policy_id": "CE-Q01",
+  "version": "0.1.0-proposed",
+  "status": "pending-producer-agreement",
+  "events": [],
+  "required_fields": [
+    "question_id",
+    "question_version",
+    "stratum_id",
+    "gold_label_ref",
+    "prediction",
+    "false_negative",
+    "abstained",
+    "latency_ms",
+    "downstream_cost_status",
+    "downstream_cost_amount",
+    "uncertainty",
+    "failure_status",
+    "dependency_mode",
+    "policy_sha256",
+    "corpus_sha256"
+  ],
+  "provenance": {
+    "producer_owner": "Agent and research",
+    "evaluation_owner": "Finance and reliability",
+    "agreement_status": "pending",
+    "agreement_sha256": null
+  }
+}
