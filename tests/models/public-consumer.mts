@@ -38,8 +38,8 @@ export function consumeAuthorizationBinding(input: OpenAIImageAuthorizationReque
   return { prompt, operationInput, parent };
 }
 
-export function consumeImageBytes(bytes: Uint8Array) {
-  const info = inspectOpenAIImageBytes(bytes);
+export async function consumeImageBytes(bytes: Uint8Array) {
+  const info = await inspectOpenAIImageBytes(bytes);
   const usage = normalizeOpenAIImageUsage({ input_tokens: 12, output_tokens: 8 }, { transport_attempt_id: "transport-01" });
   const retry = evaluateOpenAIImageRetry({ attempt_number: 1, started_at: new Date(0).toISOString(),
     now_at: new Date(1000).toISOString(), deadline_at: new Date(100_000).toISOString(), retry_after: "1" });

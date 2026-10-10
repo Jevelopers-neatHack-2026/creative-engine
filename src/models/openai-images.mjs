@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { inflateSync } from "node:zlib";
+import { decodeOpenAIImageRgba, ImageCodecUnavailableError } from "./codec-runtime/index.mjs";
 
 const GENERATION_ENDPOINT = "https://api.openai.com/v1/images/generations";
 const EDIT_ENDPOINT = "https://api.openai.com/v1/images/edits";
@@ -11,6 +12,8 @@ const MAX_PROVIDER_CONTEXT_BYTES = 1024 * 1024;
 const MAX_PIXELS = 16_777_216;
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const OPAQUE_REF = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
+const PROVIDER_REQUEST_REF = /^provider-request-[a-f0-9]{64}$/;
+const SENSITIVE_ID_VALUE = /(?:\bbearer\s+\S+|\bbasic\s+\S+|\bsk-(?:proj-)?[A-Za-z0-9_-]{4,}|\bgh[pousr]_[A-Za-z0-9]{8,}\b|\b(?:rk|pk)-[A-Za-z0-9_-]{8,}|\b(?:xox[baprs]-|github_pat_|glpat-)[A-Za-z0-9_-]{8,}|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|https?:\/\/)/i;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
@@ -18,6 +21,7 @@ const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
   for (let bit = 0; bit < 8; bit += 1) crc = (crc & 1) ? (0xedb88320 ^ (crc >>> 1)) : (crc >>> 1);
   return crc >>> 0;
 });
+const PRIVATE_PROVIDER_REQUEST_IDS = new WeakMap();
 
 /** The documented candidate pin is explicit and never auto-selected. Owner capability evidence is still required. */
 export const OPENAI_IMAGE_CANDIDATE_PROFILES = Object.freeze({
@@ -62,8 +66,24 @@ export class OpenAIImagesProviderError extends Error {
   }
 }
 
+function attachUsageObservation(error, usage, privateProviderRequestId) {
+  if (usage !== undefined && !Object.hasOwn(error, "usage")) {
+    Object.defineProperty(error, "usage", { value: usage, enumerable: true, configurable: false, writable: false });
+  }
+  const rawId = privateProviderRequestId ?? (usage && PRIVATE_PROVIDER_REQUEST_IDS.get(usage));
+  if (typeof rawId === "string") PRIVATE_PROVIDER_REQUEST_IDS.set(error, rawId);
+}
+
 function fail(code, message, options) {
-  throw new OpenAIImagesProviderError(code, message, options);
+  const { private_provider_request_id: privateProviderRequestId, usage, ...publicOptions } = options ?? {};
+  const error = new OpenAIImagesProviderError(code, message, publicOptions);
+  attachUsageObservation(error, usage, privateProviderRequestId);
+  throw error;
+}
+
+/** Internal runtime accessor; deliberately not re-exported from the public model barrel. */
+export function readPrivateOpenAIImageRequestId(value) {
+  return value !== null && typeof value === "object" ? PRIVATE_PROVIDER_REQUEST_IDS.get(value) : undefined;
 }
 
 function isRecord(value) {
@@ -133,7 +153,7 @@ function isDate(value) {
 }
 
 function checkRef(value, field) {
-  if (typeof value !== "string" || !OPAQUE_REF.test(value)) {
+  if (typeof value !== "string" || !OPAQUE_REF.test(value) || SENSITIVE_ID_VALUE.test(value)) {
     fail("invalid_configuration", "A bounded opaque reference is required.", { outcome: "failed", field });
   }
   return value;
@@ -528,7 +548,7 @@ function inspectJpeg(bytes) {
   return { format: "jpeg", width, height, has_alpha: false, has_transparency: false };
 }
 
-function inspectWebp(bytes) {
+function inspectWebpStructure(bytes) {
   const reject = () => fail("image_bytes_invalid", "WebP bytes are not a bounded, structurally decodable image.", { outcome: "unknown" });
   if (bytes.length < 25 || bytes.length > MAX_IMAGE_BYTES || bytes.toString("ascii", 0, 4) !== "RIFF" ||
       bytes.toString("ascii", 8, 12) !== "WEBP" || bytes.readUInt32LE(4) !== bytes.length - 8) reject();
@@ -584,14 +604,31 @@ function inspectWebp(bytes) {
   return { format: "webp", width, height, has_alpha: hasAlpha, has_transparency: hasAlpha };
 }
 
-/** Bounded structural decoders used for provider outputs and edit inputs. */
-export function inspectOpenAIImageBytes(value) {
+async function decodeAndVerifyPixels(bytes, structure) {
+  let decoded;
+  try { decoded = await decodeOpenAIImageRgba(bytes); } catch (error) {
+    if (error instanceof ImageCodecUnavailableError) {
+      fail("image_decoder_unavailable", "The pinned bounded image decoder is unavailable.", { outcome: "unknown" });
+    }
+    fail("image_bytes_invalid", "Image pixel content did not pass bounded decoding.", { outcome: "unknown" });
+  }
+  if (structure.format !== decoded.format || structure.width !== decoded.width || structure.height !== decoded.height ||
+      structure.has_alpha !== decoded.has_alpha || (structure.format !== "webp" && structure.has_transparency !== decoded.has_transparency)) {
+    fail("image_bytes_invalid", "Decoded pixels do not match the checked image container.", { outcome: "unknown" });
+  }
+  return Object.freeze({ ...structure, has_alpha: decoded.has_alpha, has_transparency: decoded.has_transparency });
+}
+
+/** Bounded image decoders used for provider outputs and edit inputs. */
+export async function inspectOpenAIImageBytes(value) {
   if (!(value instanceof Uint8Array)) fail("image_bytes_invalid", "Image input must be a byte array.", { outcome: "unknown" });
   const bytes = Buffer.from(value);
   if (bytes.length > MAX_IMAGE_BYTES) fail("image_bytes_invalid", "Image bytes exceed the provider boundary limit.", { outcome: "unknown" });
-  if (bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return Object.freeze(inspectPng(bytes));
-  if (bytes[0] === 0xff && bytes[1] === 0xd8) return Object.freeze(inspectJpeg(bytes));
-  if (bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") return Object.freeze(inspectWebp(bytes));
+  if (bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return decodeAndVerifyPixels(bytes, inspectPng(bytes));
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return decodeAndVerifyPixels(bytes, inspectJpeg(bytes));
+  if (bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") {
+    return decodeAndVerifyPixels(bytes, inspectWebpStructure(bytes));
+  }
   fail("image_bytes_invalid", "Image bytes are not PNG, JPEG, or WebP.", { outcome: "unknown" });
 }
 
@@ -640,7 +677,8 @@ async function readJsonBounded(response) {
 }
 
 function safeProviderRequestRef(value) {
-  if (typeof value !== "string" || value.length === 0) return undefined;
+  if (typeof value !== "string" || value.length === 0 || value.length > 16_384) return undefined;
+  if (PROVIDER_REQUEST_REF.test(value)) return value;
   return `provider-request-${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
@@ -658,8 +696,10 @@ function exactUsage(value) {
 /** Preserve allowlisted provider counters; only a reviewed owner profile may map them for settlement. */
 export function normalizeOpenAIImageUsage(raw, { transport_attempt_id, provider_request_id } = {}) {
   const result = { completeness: "unknown", missing_fields: ["usage.profile_mapping_pending"] };
-  if (typeof transport_attempt_id === "string" && OPAQUE_REF.test(transport_attempt_id)) result.transport_attempt_id = transport_attempt_id;
-  if (typeof provider_request_id === "string" && OPAQUE_REF.test(provider_request_id)) result.provider_request_id = provider_request_id;
+  if (transport_attempt_id !== undefined) result.transport_attempt_id = checkRef(transport_attempt_id, "transport_attempt_id");
+  const safeRequestRef = safeProviderRequestRef(provider_request_id);
+  if (safeRequestRef) result.provider_request_id = safeRequestRef;
+  if (typeof provider_request_id === "string") PRIVATE_PROVIDER_REQUEST_IDS.set(result, provider_request_id);
   if (!isRecord(raw)) return Object.freeze({ ...result, missing_fields: Object.freeze(["usage"]) });
 
   const missing = new Set(result.missing_fields);
@@ -691,6 +731,14 @@ export function normalizeOpenAIImageUsage(raw, { transport_attempt_id, provider_
   ].includes(key))) missing.add("usage.unmapped_fields");
   result.missing_fields = Object.freeze([...missing]);
   return Object.freeze(result);
+}
+
+function usageFromPayload(payload, transportAttemptId, rawProviderRequestId) {
+  if (!isRecord(payload) || !Object.hasOwn(payload, "usage")) return undefined;
+  return normalizeOpenAIImageUsage(payload.usage, {
+    transport_attempt_id: transportAttemptId,
+    provider_request_id: rawProviderRequestId,
+  });
 }
 
 function parseRetryAfter(value, nowMs) {
@@ -788,7 +836,8 @@ function validateAttempt(input, operation, profile) {
   if (input.signal.aborted) fail("cancelled_before_dispatch", "Image request was cancelled before provider dispatch.", { outcome: "failed" });
   const identities = [input.attempt.logical_operation_id, input.attempt.billable_attempt_id,
     input.transport_attempt_id, input.dispatch_intent_ref, input.reservation_ref];
-  if (identities.some((id) => typeof id !== "string" || !OPAQUE_REF.test(id)) || new Set(identities).size !== identities.length) {
+  if (identities.some((id) => typeof id !== "string" || !OPAQUE_REF.test(id) || SENSITIVE_ID_VALUE.test(id)) ||
+      new Set(identities).size !== identities.length) {
     fail("provider_attempt_mismatch", "Operation, billing, transport, reservation, and dispatch identities must be distinct.", { outcome: "failed" });
   }
   return input;
@@ -902,12 +951,12 @@ function maskAndReferenceBytes(input, assetPort, parentImage) {
   return callTrustedPort("asset_unavailable", "The immutable parent artwork could not be read.", () =>
     assetPort.readArtifact({ scope: input.scope, artifact_id: input.base_design.artifact.artifact_id,
       content_hash: input.base_design.artifact.content_hash, media_type: input.base_design.artifact.media_type }))
-    .then((raw) => {
+    .then(async (raw) => {
       if (!(raw instanceof Uint8Array) || raw.byteLength === 0 || raw.byteLength > MAX_IMAGE_BYTES || sha256(raw) !== input.base_design.artifact.content_hash) {
         fail("asset_integrity_error", "Parent artwork bytes do not match the immutable design version.", { outcome: "failed", field: "base_design.artifact" });
       }
       const bytes = Buffer.from(raw);
-      const info = inspectOpenAIImageBytes(bytes);
+      const info = await inspectOpenAIImageBytes(bytes);
       if (`image/${info.format}` !== input.base_design.artifact.media_type || !parentImage) {
         fail("asset_integrity_error", "Parent artwork format does not match its immutable media type.", { outcome: "failed" });
       }
@@ -1009,10 +1058,11 @@ function knownProviderError(payload, status) {
   return { code: "provider_request_failed", outcome: status >= 500 ? "unknown" : "failed" };
 }
 
-async function providerError(response, retryContext, providerRequestRef, now) {
+async function providerError(response, retryContext, providerRequestRef, rawProviderRequestId, transportAttemptId, now) {
   let payload;
   try { payload = await readJsonBounded(response); } catch { payload = {}; }
   const mapped = knownProviderError(payload, response.status);
+  const usage = usageFromPayload(payload, transportAttemptId, rawProviderRequestId);
   let retry;
   if ((response.status === 429 && mapped.code === "provider_rate_limited") || response.status === 503) {
     const errorNow = now();
@@ -1029,7 +1079,8 @@ async function providerError(response, retryContext, providerRequestRef, now) {
     });
   }
   fail(mapped.code, "Provider returned a bounded failure response.", {
-    outcome: mapped.outcome, http_status: response.status, retry, provider_request_ref: providerRequestRef,
+    outcome: mapped.outcome, http_status: response.status, retry, provider_request_ref: providerRequestRef, usage,
+    private_provider_request_id: rawProviderRequestId,
   });
 }
 
@@ -1213,33 +1264,78 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
     if (!response || typeof response.ok !== "boolean" || !Number.isInteger(response.status) || !response.body) {
       fail("provider_response_invalid", "Provider transport returned an invalid response envelope.", { outcome: "unknown" });
     }
-    const providerRequestRef = safeProviderRequestRef(responseHeader(response, "x-request-id"));
+    const rawProviderRequestId = responseHeader(response, "x-request-id");
+    const providerRequestRef = safeProviderRequestRef(rawProviderRequestId);
     if (!response.ok) {
       await providerError(response, { attempt_number: input.attempt_number ?? 1,
         started_at: input.started_at ?? new Date(initialNow).toISOString(), deadline_at: input.deadline_at,
         max_attempts: retryPolicy.max_attempts ?? 3, max_elapsed_ms: retryPolicy.max_elapsed_ms ?? 60_000,
-        max_delay_ms: retryPolicy.max_delay_ms ?? 10_000 }, providerRequestRef, now);
+        max_delay_ms: retryPolicy.max_delay_ms ?? 10_000 }, providerRequestRef, rawProviderRequestId, transportId, now);
     }
-    const payload = await readJsonBounded(response);
+    let payload;
+    try { payload = await readJsonBounded(response); } catch (error) {
+      if (error instanceof OpenAIImagesProviderError) {
+        if (providerRequestRef) error.provider_request_ref = providerRequestRef;
+        if (typeof rawProviderRequestId === "string") PRIVATE_PROVIDER_REQUEST_IDS.set(error, rawProviderRequestId);
+      }
+      throw error;
+    }
+    const usage = normalizeOpenAIImageUsage(payload.usage, {
+      transport_attempt_id: transportId,
+      provider_request_id: rawProviderRequestId,
+    });
+    const observedUsage = Object.hasOwn(payload, "usage") ? usage : undefined;
     if (input.signal.aborted || now() >= deadlineMs) {
-      fail("provider_outcome_unknown", "Cancellation or deadline occurred after transport; output remains unpublished.", { outcome: "unknown", provider_request_ref: providerRequestRef });
+      fail("provider_outcome_unknown", "Cancellation or deadline occurred after transport; output remains unpublished.", {
+        outcome: "unknown", provider_request_ref: providerRequestRef, usage: observedUsage,
+        private_provider_request_id: rawProviderRequestId,
+      });
     }
     if (payload.error) {
       const mapped = knownProviderError(payload, response.status);
-      fail(mapped.code, "Provider refused the image request.", { outcome: mapped.outcome, http_status: response.status, provider_request_ref: providerRequestRef });
+      fail(mapped.code, "Provider refused the image request.", {
+        outcome: mapped.outcome, http_status: response.status, provider_request_ref: providerRequestRef, usage: observedUsage,
+        private_provider_request_id: rawProviderRequestId,
+      });
     }
     if (!Array.isArray(payload.data) || payload.data.length !== 1 || !isRecord(payload.data[0]) ||
         typeof payload.data[0].b64_json !== "string") {
-      fail("provider_response_invalid", "Provider response did not contain one base64 image result.", { outcome: "unknown", provider_request_ref: providerRequestRef });
+      fail("provider_response_invalid", "Provider response did not contain one base64 image result.", {
+        outcome: "unknown", provider_request_ref: providerRequestRef, usage: observedUsage,
+        private_provider_request_id: rawProviderRequestId,
+      });
     }
-    const bytes = decodeBase64(payload.data[0].b64_json);
-    const imageInfo = inspectOpenAIImageBytes(bytes);
+    let bytes;
+    try { bytes = decodeBase64(payload.data[0].b64_json); } catch (error) {
+      if (error instanceof OpenAIImagesProviderError) {
+        attachUsageObservation(error, observedUsage, rawProviderRequestId);
+        if (providerRequestRef) error.provider_request_ref = providerRequestRef;
+      }
+      throw error;
+    }
+    let imageInfo;
+    try { imageInfo = await inspectOpenAIImageBytes(bytes); } catch (error) {
+      if (error instanceof OpenAIImagesProviderError) {
+        attachUsageObservation(error, observedUsage, rawProviderRequestId);
+        if (providerRequestRef) error.provider_request_ref = providerRequestRef;
+      }
+      throw error;
+    }
     if (!profileDimensionsMatch(imageInfo, profile) || imageInfo.format !== config.output_format ||
         (config.background === "transparent" && !imageInfo.has_alpha) || (config.dimensions &&
         (imageInfo.width !== config.dimensions.width || imageInfo.height !== config.dimensions.height))) {
-      fail("provider_output_mismatch", "Provider image format or dimensions do not match the authorized request.", { outcome: "unknown", provider_request_ref: providerRequestRef });
+      fail("provider_output_mismatch", "Provider image format or dimensions do not match the authorized request.", {
+        outcome: "unknown", provider_request_ref: providerRequestRef, usage: observedUsage,
+        private_provider_request_id: rawProviderRequestId,
+      });
     }
-    const usage = normalizeOpenAIImageUsage(payload.usage, { transport_attempt_id: transportId, provider_request_id: providerRequestRef });
+    const decodeFinishedAt = now();
+    if (input.signal.aborted || !Number.isFinite(decodeFinishedAt) || decodeFinishedAt >= deadlineMs) {
+      fail("provider_outcome_unknown", "Cancellation or deadline occurred during image decoding; output remains unpublished.", {
+        outcome: "unknown", provider_request_ref: providerRequestRef, usage: observedUsage,
+        private_provider_request_id: rawProviderRequestId,
+      });
+    }
     return Object.freeze({
       artifact: Object.freeze({ artifact_id: checkRef(`artifact-${idFactory()}`, "artifact_id"), content_hash: sha256(bytes), media_type: `image/${imageInfo.format}` }),
       artifact_bytes: Uint8Array.from(bytes),

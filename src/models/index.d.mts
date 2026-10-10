@@ -155,7 +155,8 @@ export type OpenAIImagesErrorCode =
   | "deadline_or_cancelled" | "cancelled_before_dispatch" | "dispatch_fence_closed" | "transport_ack_unknown"
   | "transport_ack_mismatch" | "provider_transport_unknown" | "provider_response_invalid" | "provider_request_failed"
   | "provider_rate_limited" | "provider_quota_exhausted" | "authentication_denied" | "operation_permission_denied"
-  | "moderation_blocked" | "provider_output_mismatch" | "provider_outcome_unknown" | "image_bytes_invalid";
+  | "moderation_blocked" | "provider_output_mismatch" | "provider_outcome_unknown" | "image_bytes_invalid"
+  | "image_decoder_unavailable";
 
 export interface OpenAIImageRetryDecision {
   readonly decision: "stop" | "eligible_for_separately_authorized_attempt";
@@ -198,6 +199,8 @@ export declare class OpenAIImagesProviderError extends Error {
   readonly retry?: OpenAIImageRetryDecision;
   readonly provider_request_ref?: string;
   readonly field?: string;
+  /** Raw allowlisted counters observed before a failed outcome; never implies settlement. */
+  readonly usage?: OpenAIImageUsage;
 }
 
 export declare function createOpenAIImagesProvider(options: OpenAIImageProviderOptions): Readonly<{
@@ -206,13 +209,13 @@ export declare function createOpenAIImagesProvider(options: OpenAIImageProviderO
   edit(input: OpenAIImagesInput): Promise<OpenAIImagesOutput>;
 }>;
 
-export declare function inspectOpenAIImageBytes(value: Uint8Array): Readonly<{
+export declare function inspectOpenAIImageBytes(value: Uint8Array): Promise<Readonly<{
   format: OpenAIImageOutputFormat;
   width: number;
   height: number;
   has_alpha: boolean;
   has_transparency: boolean;
-}>;
+}>>;
 
 export declare function normalizeOpenAIImageUsage(raw: unknown, identities?: {
   transport_attempt_id?: string;

@@ -10,6 +10,7 @@ import {
   inspectOpenAIImageBytes,
   normalizeOpenAIImageUsage,
 } from "../../src/models/openai-images.mjs";
+import { readPrivateOpenAIImageRequestId } from "../../src/models/openai-images.mjs";
 import { corruptPngCrc, makeInvalidIndexedPng, makePng } from "../../fixtures/models/png.mjs";
 
 const MODEL = "gpt-image-2.5-sunburst-2026-09-08";
@@ -173,6 +174,25 @@ function corruptJpegEntropy(bytes) {
   return copy;
 }
 
+function shortStructurallyValidWebp() {
+  const bytes = Buffer.alloc(26);
+  bytes.write("RIFF", 0);
+  bytes.writeUInt32LE(bytes.length - 8, 4);
+  bytes.write("WEBPVP8L", 8);
+  bytes.writeUInt32LE(6, 16);
+  bytes[20] = 0x2f;
+  bytes.writeUInt32LE(15 | (15 << 14), 21);
+  bytes[25] = 0;
+  return bytes;
+}
+
+function truncatedButConsistentWebp(bytes) {
+  const copy = Buffer.from(bytes.subarray(0, bytes.length - 2));
+  copy.writeUInt32LE(copy.length - 8, 4);
+  copy.writeUInt32LE(bytes.readUInt32LE(16) - 1, 16);
+  return copy;
+}
+
 function providerHarness({ operation = "generate", outputBytes = makePng(), usage, configOverride = {}, configuration, fetchImpl, ports = {}, now = () => NOW, inputOverride = {}, assetPort, promptPort } = {}) {
   const events = ports.events ?? [];
   const authority = makeAuthorityPorts({ now, events, ...ports });
@@ -235,6 +255,7 @@ test("generation posts the documented direct JSON request once after C03 acknowl
   assert.equal(output.usage.total_tokens, 100);
   assert.equal(output.usage.transport_attempt_id, "transport-image-001");
   assert.match(output.usage.provider_request_id, /^provider-request-[a-f0-9]{64}$/);
+  assert.equal(readPrivateOpenAIImageRequestId(output.usage), "req-private-fixture-id");
   assert.doesNotMatch(JSON.stringify(output), /req-private-fixture-id|synthetic-offline-token/);
 });
 
@@ -379,21 +400,74 @@ test("denied, cross-scope, substituted, or malformed edit assets never reach pro
   });
 });
 
-test("decoded image fixtures validate dimensions and reject CRC, truncated, indexed, or corrupt payloads", () => {
+test("decoded image fixtures validate dimensions and reject CRC, truncated, indexed, or corrupt payloads", async () => {
   const png = makePng();
-  assert.deepEqual(inspectOpenAIImageBytes(png), {
+  assert.deepEqual(await inspectOpenAIImageBytes(png), {
     format: "png", width: 16, height: 16, has_alpha: true, has_transparency: false,
   });
-  assert.equal(inspectOpenAIImageBytes(makePng({ transparent: true })).has_transparency, true);
-  assert.deepEqual(inspectOpenAIImageBytes(JPEG), {
+  assert.equal((await inspectOpenAIImageBytes(makePng({ transparent: true }))).has_transparency, true);
+  assert.deepEqual(await inspectOpenAIImageBytes(JPEG), {
     format: "jpeg", width: 16, height: 16, has_alpha: false, has_transparency: false,
   });
-  assert.deepEqual(inspectOpenAIImageBytes(WEBP), {
+  assert.deepEqual(await inspectOpenAIImageBytes(WEBP), {
     format: "webp", width: 16, height: 16, has_alpha: false, has_transparency: false,
   });
   for (const bytes of [corruptPngCrc(png), makeInvalidIndexedPng(), png.subarray(0, png.length - 4),
     corruptJpegEntropy(JPEG), Buffer.from("hello")]) {
-    assert.throws(() => inspectOpenAIImageBytes(bytes), (error) => error.code === "image_bytes_invalid");
+    await assert.rejects(inspectOpenAIImageBytes(bytes), (error) => error.code === "image_bytes_invalid");
+  }
+});
+
+test("WebP artifacts require bounded pixel decoding, not a RIFF/frame header", async (t) => {
+  const corruptPayload = Buffer.from(WEBP);
+  corruptPayload[25] = 0;
+  const malformedCases = [
+    ["header-only VP8L frame", shortStructurallyValidWebp()],
+    ["truncated coded payload with consistent chunk lengths", truncatedButConsistentWebp(WEBP)],
+    ["corrupt coded payload with intact container", corruptPayload],
+  ];
+  for (const [name, bytes] of malformedCases) await t.test(name, async () => {
+    await assert.rejects(inspectOpenAIImageBytes(bytes), (error) => error.code === "image_bytes_invalid");
+  });
+  await t.test("valid WebP output passes the real decoder before publication", async () => {
+    const harness = providerHarness({ configOverride: { output_format: "webp" }, outputBytes: WEBP });
+    const output = await harness.provider.generate(harness.ctx);
+    assert.equal(harness.fetchCount, 1);
+    assert.equal(output.artifact.media_type, "image/webp");
+    assert.deepEqual(Buffer.from(output.artifact_bytes), WEBP);
+  });
+  await t.test("invalid WebP output preserves known usage but publishes no artifact", async () => {
+    const harness = providerHarness({ configOverride: { output_format: "webp" }, outputBytes: shortStructurallyValidWebp() });
+    await assert.rejects(harness.provider.generate(harness.ctx), (error) => {
+      assert.equal(error.code, "image_bytes_invalid");
+      assert.equal(error.usage.input_tokens, 50);
+      assert.equal(error.usage.completeness, "unknown");
+      assert.equal(error.provider_outcome, "unknown");
+      return true;
+    });
+    assert.equal(harness.fetchCount, 1);
+  });
+  await t.test("invalid WebP edit parent is rejected before provider dispatch", async () => {
+    const bytes = shortStructurallyValidWebp();
+    const ctx = input("edit");
+    ctx.base_design.artifact.content_hash = HASH(bytes);
+    ctx.base_design.artifact.media_type = "image/webp";
+    const harness = providerHarness({ operation: "edit", inputOverride: ctx,
+      assetPort: { async readArtifact() { return bytes; } } });
+    await assert.rejects(harness.provider.edit(harness.ctx), (error) => error.code === "image_bytes_invalid");
+    assert.equal(harness.fetchCount, 0);
+  });
+});
+
+test("all advertised output formats pass the full bounded decoder before publication", async (t) => {
+  for (const [format, bytes] of [["png", makePng()], ["jpeg", JPEG], ["webp", WEBP]]) {
+    await t.test(format, async () => {
+      const harness = providerHarness({ configOverride: { output_format: format }, outputBytes: bytes });
+      const result = await harness.provider.generate(harness.ctx);
+      assert.equal(result.artifact.media_type, `image/${format}`);
+      assert.deepEqual(Buffer.from(result.artifact_bytes), bytes);
+      assert.equal(harness.fetchCount, 1);
+    });
   }
 });
 
@@ -607,6 +681,92 @@ test("partial and missing provider usage remains raw, identity-bound, and unknow
     "usage.output_tokens_details", "usage.unmapped_fields"]);
   assert.equal(raw.usage_units, undefined);
   assert.deepEqual(normalizeOpenAIImageUsage(null).missing_fields, ["usage"]);
+});
+
+test("public usage references preserve safe transport identity and screen sensitive identity values", async (t) => {
+  const safeProviderRef = normalizeOpenAIImageUsage({}, {
+    transport_attempt_id: "transport-image-001", provider_request_id: "provider-request-safe-hash",
+  });
+  assert.equal(safeProviderRef.transport_attempt_id, "transport-image-001");
+  assert.match(safeProviderRef.provider_request_id, /^provider-request-[a-f0-9]{64}$/);
+  for (const value of ["person@example.invalid", "ghp_SyntheticCredentialValueSyntheticCredentialValue", "https://example.invalid/private"]) {
+    await t.test(`normalizer rejects sensitive transport identity: ${value.startsWith("https:") ? "url" : value.includes("@") ? "email" : "credential"}`, () => {
+      assert.throws(() => normalizeOpenAIImageUsage({}, { transport_attempt_id: value }), (error) => {
+        assert.ok(error instanceof OpenAIImagesProviderError);
+        assert.equal(error.code, "invalid_configuration");
+        assert.doesNotMatch(JSON.stringify(error), /person@example|ghp_Synthetic|example\.invalid/);
+        return true;
+      });
+      const sanitizedProviderRef = normalizeOpenAIImageUsage({}, { provider_request_id: value });
+      assert.doesNotMatch(JSON.stringify(sanitizedProviderRef), /person@example|ghp_Synthetic|example\.invalid/);
+      assert.match(sanitizedProviderRef.provider_request_id, /^provider-request-[a-f0-9]{64}$/);
+    });
+    const ctx = input();
+    ctx.transport_attempt_id = value;
+    const harness = providerHarness({ inputOverride: ctx });
+    await assert.rejects(harness.provider.generate(harness.ctx), (error) => {
+      assert.equal(error.code, "provider_attempt_mismatch");
+      assert.doesNotMatch(JSON.stringify(error), /person@example|ghp_Synthetic|example\.invalid/);
+      return true;
+    });
+    assert.equal(harness.fetchCount, 0);
+  }
+  const sensitiveRequestId = "person@example.invalid";
+  const responseHarness = providerHarness({ fetchImpl: async () => new Response(JSON.stringify({
+    data: [{ b64_json: makePng().toString("base64") }],
+    usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+  }), { status: 200, headers: { "content-type": "application/json", "x-request-id": sensitiveRequestId } }) });
+  const response = await responseHarness.provider.generate(responseHarness.ctx);
+  assert.doesNotMatch(JSON.stringify(response), /person@example\.invalid/);
+  assert.match(response.usage.provider_request_id, /^provider-request-[a-f0-9]{64}$/);
+  assert.equal(readPrivateOpenAIImageRequestId(response.usage), sensitiveRequestId);
+});
+
+test("observed raw usage accompanies failed outcomes without publishing artifacts or implying settlement", async (t) => {
+  const usage = {
+    input_tokens: 50,
+    input_tokens_details: { text_tokens: 10, image_tokens: 40 },
+    output_tokens: 50,
+    output_tokens_details: { text_tokens: 10, image_tokens: 40 },
+    total_tokens: 100,
+  };
+  const cases = [
+    ["cancellation after response", async (harness) => {
+      harness.ctx.controller.abort();
+      return responseImage(makePng(), usage);
+    }, "provider_outcome_unknown"],
+    ["refusal response", async () => new Response(JSON.stringify({ error: { code: "content_policy_violation" }, usage }), { status: 200 }), "moderation_blocked"],
+    ["malformed image bytes", async () => responseImage(Buffer.from("not an image"), usage), "image_bytes_invalid"],
+    ["HTTP refusal", async () => new Response(JSON.stringify({ error: { code: "invalid_api_key" }, usage }), { status: 401 }), "authentication_denied"],
+  ];
+  for (const [name, makeResponse, code] of cases) await t.test(name, async () => {
+    const harness = providerHarness({ fetchImpl: async () => makeResponse(harness) });
+    let failure;
+    try { await harness.provider.generate(harness.ctx); } catch (error) { failure = error; }
+    assert.ok(failure instanceof OpenAIImagesProviderError);
+    assert.equal(failure.code, code);
+    assert.equal(harness.fetchCount, 1);
+    assert.equal(Object.hasOwn(failure, "artifact"), false);
+    assert.equal(failure.usage.completeness, "unknown");
+    assert.equal(failure.usage.input_tokens, 50);
+    assert.deepEqual(failure.usage.input_tokens_details, { text_tokens: 10, image_tokens: 40 });
+    assert.equal(failure.usage.total_tokens, 100);
+    assert.equal(failure.usage.transport_attempt_id, "transport-image-001");
+    if (["cancellation after response", "malformed image bytes"].includes(name)) {
+      assert.equal(readPrivateOpenAIImageRequestId(failure.usage), "req-private-fixture-id");
+    }
+    if (["refusal response", "HTTP refusal"].includes(name)) assert.equal(failure.usage.provider_request_id, undefined);
+    else assert.match(failure.usage.provider_request_id, /^provider-request-[a-f0-9]{64}$/);
+    assert.doesNotMatch(JSON.stringify(failure), /req-private-fixture-id|synthetic-offline-token/);
+  });
+  const absent = providerHarness({ fetchImpl: async () => new Response(JSON.stringify({
+    data: [{ b64_json: Buffer.from("not an image").toString("base64") }],
+  }), { status: 200, headers: { "content-type": "application/json" } }) });
+  await assert.rejects(absent.provider.generate(absent.ctx), (error) => {
+    assert.equal(error.code, "image_bytes_invalid");
+    assert.equal(Object.hasOwn(error, "usage"), false);
+    return true;
+  });
 });
 
 test("provider output refusal, malformed base64, timeout, and post-response deadline never publish an artifact", async (t) => {

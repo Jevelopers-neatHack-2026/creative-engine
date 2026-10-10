@@ -1,0 +1,11 @@
+{
+  "name": "@creative-engine/model-codec-runtime",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.23.3"
+  },
+  "dependencies": {
+    "sharp": "0.35.5"
+  }
+}
