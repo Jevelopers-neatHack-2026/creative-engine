@@ -1,0 +1,35 @@
+name: Controls offline roundtrip
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  controls:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.23.3', '24.15.0']
+    name: Controls (Node ${{ matrix.node }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 tag verified 2026-10-10
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 tag verified 2026-10-10
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: examples/frontend-action-roundtrip/package-lock.json
+      - name: Locked fixture dependencies
+        run: npm ci --prefix examples/frontend-action-roundtrip
+      - name: Browser runtime
+        working-directory: examples/frontend-action-roundtrip
+        run: npx playwright install --with-deps chromium
+      - name: Validate server, public types and browser roundtrip (mock boundaries)
+        run: node fixtures/controls/check.mjs --browser --out examples/frontend-action-roundtrip/test-results/controls-evidence.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 tag verified 2026-10-10
+        if: always()
+        with:
+          name: controls-mock-evidence-node-${{ matrix.node }}
+          path: examples/frontend-action-roundtrip/test-results/
+          if-no-files-found: error
