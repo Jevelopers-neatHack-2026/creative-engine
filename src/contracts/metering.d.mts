@@ -149,6 +149,7 @@ export type MeteredAttemptOutcome =
   | { status: 'settled'; published: false; provider_outcome: ProviderOutcome; observation_ack: ObservationAcknowledgement; settlement: ReservationSettlement };
 
 export declare class MeteringContractError extends Error {
+  constructor(code: string, message: string, field?: string);
   readonly code: string;
   readonly field?: string;
 }

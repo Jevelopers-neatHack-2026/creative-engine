@@ -50,6 +50,7 @@ function observation(attemptRequest, overrides = {}) {
     schema_version: METERING_PROPOSAL_VERSION,
     tenant_id: attemptRequest.tenant_id,
     project_id: attemptRequest.project_id,
+    budget_scope_id: attemptRequest.budget_scope_id,
     logical_operation_id: attemptRequest.logical_operation_id,
     billable_attempt_id: attemptRequest.billable_attempt_id,
     source_observation_id: 'test:observation-direct-1',
@@ -103,6 +104,10 @@ test('trusted scope is server-bound, and unknown usage cannot be encoded as zero
     () => validateUsageObservation({ ...unknown, source_observation_id: request.billable_attempt_id }, request),
     (error) => error instanceof MeteringContractError && error.code === 'identity_collision',
   );
+  assert.throws(
+    () => validateUsageObservation({ ...unknown, budget_scope_id: 'test:wrong-budget' }, request),
+    (error) => error instanceof MeteringContractError && error.code === 'attempt_identity_mismatch',
+  );
   assert.equal(sameMeteringIdentity(request, { ...request, transport_attempt_id: 'test:transport-2' }), true);
   assert.equal(sameMeteringIdentity(request, { ...request, billable_attempt_id: 'test:billable-2' }), false);
 });
@@ -155,6 +160,49 @@ test('direct and trace observations keep separate observation IDs but one effect
   assert.notEqual(first.source_observation_id, second.source_observation_id);
   assert.equal(first.effective_billable_attempt_id, second.effective_billable_attempt_id);
   assert.equal(authority.effectiveChargeCount, 1);
+});
+
+test('foreign usage acknowledgement identities keep the hold and never settle', async () => {
+  const authority = new FakeMeteringAuthority();
+  const request = attempt();
+  let settlementCalls = 0;
+  authority.recordUsageObservation = async () => ({
+    status: 'accepted',
+    source_observation_id: 'test:foreign-observation',
+    effective_billable_attempt_id: 'test:foreign-billable',
+  });
+  authority.settleReservation = async () => { settlementCalls += 1; throw new Error('must not settle foreign acknowledgement'); };
+  const outcome = await executeMeteredAttempt({
+    port: authority,
+    request,
+    trustedScope,
+    dispatch: async ({ recordTransportAttempt }) => {
+      await recordTransportAttempt('test:transport-foreign-ack');
+      return { usage_observation: observation(request, {
+        source_observation_id: 'test:observation-foreign-ack',
+        transport_attempt_id: 'test:transport-foreign-ack',
+      }) };
+    },
+  });
+  assert.equal(outcome.status, 'usage_observation_unconfirmed');
+  assert.equal(outcome.hold, 'retained_for_reconciliation');
+  assert.equal(settlementCalls, 0);
+  assert.equal(authority.reservationFor(request.billable_attempt_id).state, 'held_for_reconciliation');
+});
+
+test('standalone observation forwarding rejects mismatched acknowledgement identities', async () => {
+  const request = attempt();
+  for (const acknowledgement of [
+    { status: 'accepted', source_observation_id: 'test:foreign-observation', effective_billable_attempt_id: request.billable_attempt_id },
+    { status: 'duplicate', source_observation_id: 'test:observation-direct-1', effective_billable_attempt_id: 'test:foreign-billable' },
+  ]) {
+    await assert.rejects(recordUsageObservation({
+      port: { recordUsageObservation: async () => acknowledgement },
+      attempt: request,
+      trustedScope,
+      observation: observation(request),
+    }), (error) => error instanceof MeteringContractError && error.code === 'usage_ack_identity_mismatch');
+  }
 });
 
 test('a genuinely billed retry uses a new billable attempt and retains both charges', async () => {

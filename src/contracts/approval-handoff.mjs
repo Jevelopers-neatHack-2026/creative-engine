@@ -219,6 +219,7 @@ function validateArtifact(value, field, expectedHash = undefined) {
 function validateLayers(value, binding, artworkArtifact, { requireArtwork = true } = {}) {
   if (!Array.isArray(value) || value.length === 0) fail('missing_layers', 'layer_manifest must contain the exact handoff layers', 'layer_manifest');
   const ids = new Set();
+  const binaryArtifactIds = new Set([artworkArtifact.artifact_id]);
   let artworkCount = 0;
   const usedAssetIds = new Set();
   const assets = new Map(binding.assets.map((asset) => [asset.asset_id, asset]));
@@ -253,13 +254,18 @@ function validateLayers(value, binding, artworkArtifact, { requireArtwork = true
       if (!bound || bound.sha256 !== layer.asset_sha256 || bound.permission_ref !== layer.permission_ref) {
         fail('unapproved_layer_asset', 'Layer asset must match an approved asset in the binding', `layer_manifest[${index}].asset_id`);
       }
+      const assetArtifact = validateArtifact(layer.artifact, `layer_manifest[${index}].artifact`, bound.sha256);
+      if (binaryArtifactIds.has(assetArtifact.artifact_id)) {
+        fail('duplicate_artifact_id', 'Each binary handoff artifact must have a distinct artifact ID', `layer_manifest[${index}].artifact.artifact_id`);
+      }
+      binaryArtifactIds.add(assetArtifact.artifact_id);
       return {
         layer_id: layerId,
         kind: 'approved_asset',
         asset_id: assetId,
         asset_sha256: hash(layer.asset_sha256, `layer_manifest[${index}].asset_sha256`),
         permission_ref: id(layer.permission_ref, `layer_manifest[${index}].permission_ref`),
-        artifact: validateArtifact(layer.artifact, `layer_manifest[${index}].artifact`, bound.sha256),
+        artifact: assetArtifact,
       };
     }
     fail('unsupported_layer_kind', 'Unsupported handoff layer kind', `layer_manifest[${index}].kind`);
@@ -281,6 +287,10 @@ function stableJson(value) {
 
 function hashLayers(layers) {
   return createHash('sha256').update(stableJson(layers)).digest('hex');
+}
+
+function hashCanonical(value) {
+  return createHash('sha256').update(stableJson(value)).digest('hex');
 }
 
 /** Compute the proposed composition digest over the normalized ordered manifest. */
@@ -509,6 +519,10 @@ export function createConsumptionReceipt({
     handoff_id: checked.handoff_id,
     approval_id: checked.approval.approval_id,
     design_version_id: checked.binding.design_version.design_version_id,
+    binding_sha256: hashCanonical(checked.binding),
+    composition_sha256: checked.binding.composition.sha256,
+    layer_manifest_sha256: hashLayers(checked.layer_manifest),
+    approval_proof_sha256: hashCanonical(checked.approval),
     consumed_artifacts: verified.artifacts,
     verified_layer_ids: verified.verified_layer_ids,
     access_grants: grants,
@@ -532,6 +546,17 @@ export function validateConsumptionReceipt(value, handoff, { trustedScope, now =
     design_version_id: checkedHandoff.binding.design_version.design_version_id,
   })) {
     if (receipt[field] !== expected) fail('receipt_binding_mismatch', `${field} does not match the handoff`, field);
+  }
+  const contextHashes = {
+    binding_sha256: hashCanonical(checkedHandoff.binding),
+    composition_sha256: checkedHandoff.binding.composition.sha256,
+    layer_manifest_sha256: hashLayers(checkedHandoff.layer_manifest),
+    approval_proof_sha256: hashCanonical(checkedHandoff.approval),
+  };
+  for (const [field, expected] of Object.entries(contextHashes)) {
+    if (hash(receipt[field], `receipt.${field}`) !== expected) {
+      fail('receipt_context_mismatch', `${field} does not match the exact approved handoff context`, `receipt.${field}`);
+    }
   }
   id(receipt.receipt_id, 'receipt_id');
   id(receipt.consumer_id, 'consumer_id');
@@ -588,6 +613,7 @@ export function validateConsumptionReceipt(value, handoff, { trustedScope, now =
     handoff_id: checkedHandoff.handoff_id,
     approval_id: checkedHandoff.approval.approval_id,
     design_version_id: checkedHandoff.binding.design_version.design_version_id,
+    ...contextHashes,
     consumed_artifacts: [...receivedArtifacts].map(([artifact_id, artifact]) => ({ artifact_id, ...artifact })).sort((a, b) => a.artifact_id.localeCompare(b.artifact_id)),
     verified_layer_ids: [...receivedLayers].sort(),
     access_grants: grants,

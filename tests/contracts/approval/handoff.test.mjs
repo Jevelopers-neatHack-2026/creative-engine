@@ -173,8 +173,21 @@ test('consumer receipt proves hashes of the exact bytes for every required binar
   assert.equal(receipt.consumed_artifacts.length, 2);
   assert.deepEqual(receipt.verified_layer_ids, ['test:art-layer', 'test:logo-layer', 'test:name-layer']);
   assert.equal(receipt.access_grants.length, 2);
+  for (const field of ['binding_sha256', 'composition_sha256', 'layer_manifest_sha256', 'approval_proof_sha256']) {
+    assert.match(receipt[field], /^[a-f0-9]{64}$/);
+  }
   assert.equal(receipt.consumed_artifacts.find((item) => item.artifact_id === 'test:artwork-1').sha256, setup.handoff.artifact.sha256);
   assert.deepEqual(validateConsumptionReceipt(receipt, setup.handoff, { trustedScope, now }), receipt);
+
+  for (const field of ['binding_sha256', 'composition_sha256', 'layer_manifest_sha256', 'approval_proof_sha256']) {
+    const tamperedContext = structuredClone(receipt);
+    tamperedContext[field] = '0'.repeat(64);
+    assert.throws(
+      () => validateConsumptionReceipt(tamperedContext, setup.handoff, { trustedScope, now }),
+      codeIs('receipt_context_mismatch'),
+      `${field} must bind the receipt to the approved handoff context`,
+    );
+  }
 
   const wrongBytes = accessFor(setup);
   wrongBytes.artifacts.set('test:artwork-1', Buffer.from('different artwork bytes'));
@@ -201,6 +214,46 @@ test('consumer receipt proves hashes of the exact bytes for every required binar
   assert.throws(
     () => validateConsumptionReceipt(tamperedReceipt, setup.handoff, { trustedScope, now }),
     codeIs('receipt_artifact_mismatch'),
+  );
+});
+
+test('binary artifact IDs are unique across artwork and approved asset layers', async () => {
+  const setup = await createHandoff();
+  const collision = structuredClone(setup.handoff);
+  const logoLayer = collision.layer_manifest.find((layer) => layer.kind === 'approved_asset');
+  logoLayer.artifact.artifact_id = collision.artifact.artifact_id;
+
+  assert.throws(() => validateArtworkHandoff(collision, trustedScope, { now }), codeIs('duplicate_artifact_id'));
+  await assert.rejects(consumeHandoffTestDouble({
+    approvalVerifier: setup.verifier,
+    handoff: collision,
+    trustedScope,
+    accessPort: accessFor(setup),
+    now,
+  }), codeIs('duplicate_artifact_id'));
+});
+
+test('receipt from an earlier manifest is stale after text changes and composition is rehashed', async () => {
+  const setup = await createHandoff();
+  const receipt = await consumeHandoffTestDouble({
+    approvalVerifier: setup.verifier,
+    handoff: setup.handoff,
+    trustedScope,
+    accessPort: accessFor(setup),
+    now,
+  });
+  const changed = structuredClone(setup.handoff);
+  changed.layer_manifest.find((layer) => layer.kind === 'text').value = 'Taylor Avery';
+  changed.binding.composition.sha256 = hashCompositionLayerManifest({
+    binding: changed.binding,
+    artifact: changed.artifact,
+    layer_manifest: changed.layer_manifest,
+    trustedScope,
+  });
+
+  assert.throws(
+    () => validateConsumptionReceipt(receipt, changed, { trustedScope, now }),
+    codeIs('receipt_context_mismatch'),
   );
 });
 

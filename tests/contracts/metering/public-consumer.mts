@@ -1,10 +1,13 @@
 import {
+  MeteringContractError,
   executeMeteredAttempt,
   type MeteredAttemptRequest,
   type MeteringPort,
   type TrustedMeteringScope,
+  type UsageObservation,
 } from '../../../src/contracts/metering.mjs';
 import {
+  ApprovalHandoffContractError,
   createArtworkHandoff,
   createCompositionEditPlan,
   hashCompositionLayerManifest,
@@ -23,6 +26,28 @@ declare const binding: ApprovalBinding;
 declare const handoff: ArtworkHandoff;
 declare const verifier: Parameters<typeof createArtworkHandoff>[0]['approvalVerifier'];
 declare const receipt: ConsumptionReceipt;
+
+const usageObservation: UsageObservation = {
+  schema_version: 'creative.metering.proposal/v1',
+  tenant_id: 'example:tenant',
+  project_id: 'example:project',
+  budget_scope_id: 'example:budget',
+  logical_operation_id: 'example:operation',
+  billable_attempt_id: 'example:billable-attempt',
+  source_observation_id: 'example:observation',
+  source: 'provider_response',
+  provider_name: 'example:provider',
+  model: 'example:model',
+  environment: 'test',
+  billing_mode: 'simulated',
+  completeness: 'unknown',
+  missing_fields: ['provider_usage'],
+};
+const meteringError = new MeteringContractError('invalid_input', 'Invalid input', 'attempt.provider');
+const approvalError = new ApprovalHandoffContractError('approval_stale', 'Approval is stale', {
+  field: 'approval',
+  retryable: true,
+});
 
 export async function consumeContractDeclarations(): Promise<void> {
   const outcome = await executeMeteredAttempt({
@@ -67,4 +92,7 @@ export async function consumeContractDeclarations(): Promise<void> {
   void plan.approval_required_after_application;
   void checkedReceipt.status;
   void verifier;
+  void usageObservation;
+  void meteringError;
+  void approvalError;
 }

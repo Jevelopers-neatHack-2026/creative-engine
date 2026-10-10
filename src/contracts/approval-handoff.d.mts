@@ -98,6 +98,10 @@ export interface ConsumptionReceipt {
   handoff_id: string;
   approval_id: string;
   design_version_id: string;
+  binding_sha256: string;
+  composition_sha256: string;
+  layer_manifest_sha256: string;
+  approval_proof_sha256: string;
   consumed_artifacts: Array<{
     artifact_id: string;
     sha256: string;
@@ -144,6 +148,7 @@ export interface CompositionEditPlan {
 }
 
 export declare class ApprovalHandoffContractError extends Error {
+  constructor(code: string, message: string, options?: { field?: string; retryable?: boolean });
   readonly code: string;
   readonly field?: string;
   readonly retryable: boolean;

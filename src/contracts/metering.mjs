@@ -147,7 +147,7 @@ export function validateMeteredAttempt(value, trustedScope) {
 export function validateUsageObservation(value, attempt) {
   const observation = record(value, 'usage_observation');
   assertAllowedKeys(observation, new Set([
-    'schema_version', 'tenant_id', 'project_id', 'logical_operation_id', 'billable_attempt_id',
+    'schema_version', 'tenant_id', 'project_id', 'budget_scope_id', 'logical_operation_id', 'billable_attempt_id',
     'source_observation_id', 'source', 'provider_name', 'model', 'provider_request_id',
     'transport_attempt_id', 'environment', 'billing_mode', 'completeness', 'usage_units',
     'missing_fields', 'rate_card_ref', 'valuation',
@@ -156,7 +156,7 @@ export function validateUsageObservation(value, attempt) {
   if (observation.schema_version !== METERING_PROPOSAL_VERSION) {
     fail('unsupported_version', 'Unsupported metering observation version', 'schema_version');
   }
-  for (const field of ['tenant_id', 'project_id', 'logical_operation_id', 'billable_attempt_id']) {
+  for (const field of ['tenant_id', 'project_id', 'budget_scope_id', 'logical_operation_id', 'billable_attempt_id']) {
     id(observation[field], field);
     if (observation[field] !== validatedAttempt[field]) {
       fail('attempt_identity_mismatch', `${field} does not match the authorized attempt`, field);
@@ -438,8 +438,16 @@ export async function executeMeteredAttempt({ port, request, trustedScope, dispa
     await ignoreFailure(() => port.markOutcomeUnknown({ ...reservationRef, reason: 'usage_observation_unconfirmed' }));
     return { status: 'usage_observation_unconfirmed', published: false, ...safeOutcome, hold: 'retained_for_reconciliation' };
   }
-  record(rawObservationAck, 'usage_observation_ack');
-  if (rawObservationAck.status !== 'accepted' && rawObservationAck.status !== 'duplicate') {
+  let acknowledgementValid = false;
+  try {
+    record(rawObservationAck, 'usage_observation_ack');
+    acknowledgementValid = (rawObservationAck.status === 'accepted' || rawObservationAck.status === 'duplicate')
+      && rawObservationAck.source_observation_id === observation.source_observation_id
+      && rawObservationAck.effective_billable_attempt_id === attempt.billable_attempt_id;
+  } catch {
+    acknowledgementValid = false;
+  }
+  if (!acknowledgementValid) {
     await ignoreFailure(() => port.markOutcomeUnknown({ ...reservationRef, reason: 'usage_observation_unconfirmed' }));
     return { status: 'usage_observation_unconfirmed', published: false, ...safeOutcome, hold: 'retained_for_reconciliation' };
   }
@@ -510,9 +518,15 @@ export async function recordUsageObservation({ port, attempt, trustedScope, obse
   } catch {
     fail('usage_observation_unavailable', 'Metering authority did not confirm the usage observation', 'port.recordUsageObservation');
   }
-  record(acknowledgement, 'usage_observation_ack');
-  if (acknowledgement.status !== 'accepted' && acknowledgement.status !== 'duplicate') {
-    fail('invalid_usage_ack', 'Metering authority did not acknowledge the observation', 'acknowledgement.status');
+  try {
+    record(acknowledgement, 'usage_observation_ack');
+  } catch {
+    fail('invalid_usage_ack', 'Metering authority did not acknowledge the observation', 'acknowledgement');
+  }
+  if ((acknowledgement.status !== 'accepted' && acknowledgement.status !== 'duplicate')
+    || acknowledgement.source_observation_id !== validatedObservation.source_observation_id
+    || acknowledgement.effective_billable_attempt_id !== validatedAttempt.billable_attempt_id) {
+    fail('usage_ack_identity_mismatch', 'Metering authority acknowledged a different observation or billable attempt', 'acknowledgement');
   }
   return {
     status: acknowledgement.status,
