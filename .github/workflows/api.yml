@@ -35,11 +35,65 @@ jobs:
         run: make build
       - name: API tests and sanitized machine-readable evidence
         run: make check TARGET=api MODE=mock
+      - name: Access preflight mock matrix and runtime evidence
+        run: make check TARGET=access-preflight MODE=mock
+      - name: Verify live access gate fails before dispatch
+        shell: bash
+        run: |
+          set +e
+          make check TARGET=access-preflight MODE=live > build/access-preflight-live-gate.stdout.json
+          gate_status=$?
+          set -e
+          if [ "$gate_status" -ne 2 ]; then
+            echo "Expected the pending live access gate to exit 2; got $gate_status." >&2
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const stdout = readFileSync('build/access-preflight-live-gate.stdout.json', 'utf8');
+          const gate = JSON.parse(stdout);
+          assert.equal(gate.target, 'CE-A01');
+          assert.equal(gate.status, 'blocked');
+          assert.equal(gate.acceptance_allowed, false);
+          assert.equal(gate.provider_dispatches, 0);
+          assert.equal(gate.paid_provider_calls, 0);
+          assert.equal(gate.provider_credentials_read, false);
+          assert.equal(gate.required_cell_count, 8);
+          assert.equal(gate.cells.length, 8);
+          assert.ok(gate.cells.every((cell) => cell.status === 'blocked'));
+          NODE
+      - name: Verify CE-A01 acceptance remains pending
+        shell: bash
+        run: |
+          set +e
+          make acceptance TARGET=access-preflight > build/access-preflight-acceptance-gate.stdout.json
+          gate_status=$?
+          set -e
+          if [ "$gate_status" -ne 2 ]; then
+            echo "Expected CE-A01 acceptance to remain pending with exit 2; got $gate_status." >&2
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const gate = JSON.parse(readFileSync('build/access-preflight-acceptance-gate.stdout.json', 'utf8'));
+          assert.equal(gate.target, 'CE-A01');
+          assert.equal(gate.acceptance_allowed, false);
+          assert.equal(gate.provider_dispatches, 0);
+          assert.equal(gate.cells.length, 8);
+          assert.ok(gate.missing_owner_evidence.includes('external_grant_and_finance_reservation'));
+          NODE
       - name: Aggregate offline checks
         run: make check TARGET=all MODE=mock
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 verified 2026-10-10
         if: always()
         with:
           name: creative-api-evidence-node-${{ matrix.node-version }}
-          path: build/api-check-evidence.json
+          path: |
+            build/api-check-evidence.json
+            build/access-preflight-evidence.json
+            build/access-preflight-live-gate.json
+            build/access-preflight-live-gate.stdout.json
+            build/access-preflight-acceptance-gate.stdout.json
           if-no-files-found: warn

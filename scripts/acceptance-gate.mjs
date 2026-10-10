@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalHash } from "../src/contracts/validation.mjs";
 import { evaluatePolicyAcceptance } from "../evals/creative/validator.mjs";
+import { createAccessPreflightGateReport } from "./access-preflight-check.mjs";
 
 const requirements = {
   api: [
@@ -163,15 +164,24 @@ function writeCreativePolicyResult(gate) {
   if (!gate.accepted) process.exitCode = 2;
 }
 
+function writeAccessPreflightResult(gate) {
+  process.stdout.write(JSON.stringify(gate) + "\n");
+  process.exitCode = 2;
+}
+
 async function main() {
   const target = process.argv[2] ?? "all";
+  if (target === "access-preflight") {
+    writeAccessPreflightResult(createAccessPreflightGateReport());
+    return;
+  }
   if (target === "eval-policy") {
     const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
     writeCreativePolicyResult(evaluateCreativePolicy(repoRoot));
     return;
   }
   if (!Object.hasOwn(requirements, target) && target !== "all") {
-    process.stderr.write("Unknown acceptance target " + target + ". Use api, contracts, decision-contract, metering-contract, handoff-contract, eval-policy, or all.\n");
+    process.stderr.write("Unknown acceptance target " + target + ". Use api, controls, contracts, decision-contract, eval-policy, metering-contract, handoff-contract, access-preflight, or all.\n");
     process.exitCode = 2;
     return;
   }
@@ -181,7 +191,8 @@ async function main() {
   const record = JSON.parse(await readFile(recordPath, "utf8"));
   const { unmet, proposalState } = await evaluateAcceptanceRecord(record, target, repoRoot);
   const creativePolicy = target === "all" ? evaluateCreativePolicy(repoRoot) : null;
-  if (unmet.length > 0 || creativePolicy && !creativePolicy.accepted) {
+  const accessPreflight = target === "all" ? createAccessPreflightGateReport() : null;
+  if (unmet.length > 0 || creativePolicy && !creativePolicy.accepted || accessPreflight) {
     process.stderr.write("Acceptance blocked: missing or unverified canonical owner agreement evidence for " + target + " (proposal_state=" + proposalState + ").\n");
     for (const id of unmet) {
       const agreement = record.agreements?.[id];
@@ -191,6 +202,12 @@ async function main() {
       process.stderr.write("Acceptance blocked: CE-Q01 policy and corpus evidence remain pending.\n");
       for (const finding of creativePolicy.findings) {
         process.stderr.write("- CE-Q01 " + finding.key + " (" + finding.reason + ")\n");
+      }
+    }
+    if (accessPreflight) {
+      process.stderr.write("Acceptance blocked: CE-A01 live access remains pending external owner, capability, Finance, harness, and trace evidence.\n");
+      for (const cell of accessPreflight.cells) {
+        process.stderr.write("- CE-A01 " + cell.cell_id + " (" + cell.reason_code + "; owner=" + cell.owner_role + ")\n");
       }
     }
     process.exitCode = 2;

@@ -63,6 +63,20 @@ test("canonical owner acceptance gate reports missing C01 and C02 agreements as 
   assert.equal(all.status, 2, "all acceptance must stay blocked while any external agreement is pending");
   assert.match(all.stderr, /finance_metering_budget_protocol/);
   assert.match(all.stderr, /product_approval_protocol_and_consumer/);
+  assert.match(all.stderr, /CE-A01 live access remains pending/);
+
+  const access = spawnSync("make", ["acceptance", "TARGET=access-preflight"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  assert.equal(access.status, 2, "CE-A01 acceptance must wait for actual owner and access evidence");
+  const accessGate = JSON.parse(access.stdout);
+  assert.equal(accessGate.target, "CE-A01");
+  assert.equal(accessGate.acceptance_allowed, false);
+  assert.equal(accessGate.provider_dispatches, 0);
+  assert.equal(accessGate.cells.length, 8);
+  assert.ok(accessGate.missing_owner_evidence.includes("openai_edit_account_permission_and_quota"));
+  assert.ok(accessGate.missing_owner_evidence.includes("external_grant_and_finance_reservation"));
 });
 
 test("acceptance requires an accepted proposal, pinned input bytes, canonical schema hashes, and matching review evidence", async () => {
