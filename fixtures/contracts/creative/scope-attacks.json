@@ -1,0 +1,11 @@
+{
+  "api_request": {"tenant_id": "tenant-forged", "project_id": "project-1"},
+  "queued_job": {"tenant_id": "tenant-1", "project_id": "project-1", "job_id": "job-forged"},
+  "artifact_reference": {"tenant_id": "tenant-1", "project_id": "project-1", "artifact_id": "artifact-forged"},
+  "signed_access_claims": {
+    "tenant_id": "tenant-1",
+    "project_id": "project-forged",
+    "artifact_id": "artifact-1",
+    "signature": "SYNTHETIC-UNVERIFIED-CLAIMS-NOT-A-REAL-SIGNATURE"
+  }
+}
