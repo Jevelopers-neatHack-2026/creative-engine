@@ -20,6 +20,14 @@ const requirements = {
     "trusted_project_membership",
     "creative_controls_consumer",
   ],
+  brief: [
+    "shared_contracts_creative_schemas",
+    "event_intelligence_producer",
+    "trusted_project_membership",
+    "event_intelligence_asset_permission_protocol",
+    "event_intelligence_invalidation_delivery",
+    "application_approval_staleness_consumer",
+  ],
   "decision-contract": [
     "shared_contracts_decision_port",
     "harness_decision_port_consumer",
@@ -186,6 +194,18 @@ function writeAccessPreflightResult(gate) {
   process.exitCode = 2;
 }
 
+function writeBriefAcceptanceResult({ unmet, proposalState }) {
+  process.stdout.write(JSON.stringify({
+    schema_version: "creative-brief-acceptance-result/v1",
+    target: "CE-02",
+    proposal_state: proposalState,
+    acceptance_allowed: unmet.length === 0,
+    provider_dispatches: 0,
+    missing_owner_evidence: unmet,
+  }) + "\n");
+  if (unmet.length > 0) process.exitCode = 2;
+}
+
 async function main() {
   const target = process.argv[2] ?? "all";
   if (target === "access-preflight") {
@@ -198,7 +218,7 @@ async function main() {
     return;
   }
   if (!Object.hasOwn(requirements, target) && target !== "all") {
-    process.stderr.write("Unknown acceptance target " + target + ". Use api, controls, contracts, decision-contract, eval-policy, metering-contract, handoff-contract, versions, creative-metering, access-preflight, or all.\n");
+    process.stderr.write("Unknown acceptance target " + target + ". Use api, controls, contracts, brief, decision-contract, eval-policy, metering-contract, handoff-contract, versions, creative-metering, access-preflight, or all.\n");
     process.exitCode = 2;
     return;
   }
@@ -207,6 +227,10 @@ async function main() {
   const recordPath = path.join(repoRoot, "docs/contracts/canonical-owner-agreements.json");
   const record = JSON.parse(await readFile(recordPath, "utf8"));
   const { unmet, unresolved, proposalState } = await evaluateAcceptanceRecord(record, target, repoRoot);
+  if (target === "brief") {
+    writeBriefAcceptanceResult({ unmet, proposalState });
+    return;
+  }
   const creativePolicy = target === "all" ? evaluateCreativePolicy(repoRoot) : null;
   const accessPreflight = target === "all" ? createAccessPreflightGateReport() : null;
   if (unmet.length > 0 || unresolved.length > 0 || creativePolicy && !creativePolicy.accepted || accessPreflight) {

@@ -37,6 +37,32 @@ jobs:
         run: make check TARGET=api MODE=mock
       - name: Access preflight mock matrix and runtime evidence
         run: make check TARGET=access-preflight MODE=mock
+      - name: CE-02 public brief and invalidation API checks
+        run: make check TARGET=brief MODE=mock
+      - name: Verify CE-02 external acceptance remains pending
+        shell: bash
+        run: |
+          mkdir -p build
+          set +e
+          make --no-print-directory --silent acceptance TARGET=brief > build/brief-acceptance-gate.stdout.json
+          gate_status=$?
+          set -e
+          if [ "$gate_status" -ne 2 ]; then
+            echo "Expected CE-02 owner acceptance to remain pending with exit 2; got $gate_status." >&2
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const gate = JSON.parse(readFileSync('build/brief-acceptance-gate.stdout.json', 'utf8'));
+          assert.equal(gate.schema_version, 'creative-brief-acceptance-result/v1');
+          assert.equal(gate.target, 'CE-02');
+          assert.equal(gate.acceptance_allowed, false);
+          assert.equal(gate.provider_dispatches, 0);
+          assert.ok(gate.missing_owner_evidence.includes('event_intelligence_asset_permission_protocol'));
+          assert.ok(gate.missing_owner_evidence.includes('event_intelligence_invalidation_delivery'));
+          assert.ok(gate.missing_owner_evidence.includes('application_approval_staleness_consumer'));
+          NODE
       - name: Verify live access gate fails before dispatch
         shell: bash
         run: |
@@ -92,6 +118,7 @@ jobs:
           name: creative-api-evidence-node-${{ matrix.node-version }}
           path: |
             build/api-check-evidence.json
+            build/brief-acceptance-gate.stdout.json
             build/access-preflight-evidence.json
             build/access-preflight-live-gate.json
             build/access-preflight-live-gate.stdout.json

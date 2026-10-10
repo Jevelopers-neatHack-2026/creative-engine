@@ -9,8 +9,8 @@ import {
   buildCreativeBrief,
   persistCreativeBrief,
   resolveAssetUse,
-} from "../../src/planning/index.mjs";
-import { createCreativeBriefStore, openCreativeBriefStore } from "../../src/planning/store.mjs";
+} from "creative-engine/planning";
+import { createCreativeBriefStore, openCreativeBriefStore } from "creative-engine/planning";
 import {
   completeResearchPackage,
   conflictingDateResearchPackage,

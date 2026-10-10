@@ -31,13 +31,16 @@ import {
   USAGE_PROFILE,
 } from "../telemetry/index.mjs";
 import { hashArtifactBytes } from "../storage/content-addressed.mjs";
+import { buildCreativeBrief, CreativePlanningError } from "../planning/index.mjs";
+import { normalizeResearchPackage } from "../contracts/creative/v1.mjs";
 
 export const CREATIVE_API_VERSION = "1.0";
 export const CREATIVE_API_OPERATIONS = Object.freeze([
   "generate", "edit", "inspect", "list", "compare", "restore", "cancel", "handoff", "job.status",
+  "brief.create", "brief.invalidate",
 ]);
 
-const MUTATIONS = new Set(["generate", "edit", "inspect", "restore", "cancel", "handoff"]);
+const MUTATIONS = new Set(["generate", "edit", "inspect", "restore", "cancel", "handoff", "brief.create", "brief.invalidate"]);
 const READ_OPERATIONS = new Set(["list", "compare", "job.status"]);
 const OPERATION_PERMISSION = Object.freeze({
   generate: "creative.generate",
@@ -49,6 +52,8 @@ const OPERATION_PERMISSION = Object.freeze({
   cancel: "creative.cancel",
   handoff: "creative.handoff",
   "job.status": "creative.read",
+  "brief.create": "creative.brief.create",
+  "brief.invalidate": "creative.brief.invalidate",
 });
 const REQUEST_KEYS = [
   "contract", "schema_version", "event_id", "request_id", "tenant_id", "project_id",
@@ -342,6 +347,9 @@ function validateRequest(request) {
     cancel: ["job_id"],
     handoff: ["brief_id", "design_version_id", "approval_ref", "destination_ref"],
     "job.status": ["job_id"],
+    "brief.create": ["customer_preferences", "artistic_intent", "additional_required_fact_keys", "fact_corrections",
+      "locked_fields", "expected_brief_hash"],
+    "brief.invalidate": ["event_id"],
   }[request.operation];
   assertOnlyKeys(request.payload, allowedPayloadKeys, "payload");
   if (READ_OPERATIONS.has(request.operation) || request.operation === "cancel" || request.operation === "handoff") {
@@ -357,6 +365,8 @@ function validateRequest(request) {
     cancel: ["job_id"],
     handoff: ["brief_id", "design_version_id", "approval_ref", "destination_ref"],
     "job.status": ["job_id"],
+    "brief.create": [],
+    "brief.invalidate": ["event_id"],
   }[request.operation];
   for (const key of requiredPayload) {
     if (!Object.prototype.hasOwnProperty.call(request.payload, key)) throw new CreativeApiError("invalid_request", request.operation, key);
@@ -369,6 +379,11 @@ function validateRequest(request) {
     (typeof request.payload.cursor !== "string" || request.payload.cursor.length > 1024)) {
     throw new CreativeApiError("invalid_request", request.operation, "cursor");
   }
+  if (request.operation === "brief.create" && request.payload.expected_brief_hash !== undefined &&
+    (typeof request.payload.expected_brief_hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(request.payload.expected_brief_hash))) {
+    throw new CreativeApiError("invalid_request", request.operation, "payload.expected_brief_hash");
+  }
+  if (request.operation === "brief.invalidate") boundedString(request.payload.event_id, "payload.event_id");
   for (const key of ["brief_id", "design_version_id", "left_design_version_id", "right_design_version_id",
     "target_design_version_id", "job_id", "approval_ref", "destination_ref"]) {
     if (Object.prototype.hasOwnProperty.call(request.payload, key)) boundedString(request.payload[key], "payload." + key);
@@ -518,14 +533,15 @@ function safeFieldPath(value) {
   return value;
 }
 
-function creativeContextFence(brief, design = null, expectedCurrentDesignVersionId = undefined) {
+function creativeContextFence(brief, design = null, expectedCurrentDesignVersionId = undefined,
+  expectedCurrentDesignHash = design?.design_hash ?? null) {
   return Object.freeze({
     brief_id: brief.brief_id,
     brief_hash: canonicalHash(brief),
     ...(design ? { design_version_id: design.design_version_id, design_hash: design.design_hash } : {}),
     ...(expectedCurrentDesignVersionId !== undefined ? {
       expected_current_design_version_id: expectedCurrentDesignVersionId,
-      expected_current_design_hash: design?.design_hash ?? null,
+      expected_current_design_hash: expectedCurrentDesignHash,
     } : {}),
   });
 }
@@ -809,6 +825,12 @@ function safeError(error, operation) {
   }
   if (error instanceof MeteringContractError) return new CreativeApiError("unavailable", operation, "metering", { retryable: true });
   if (error instanceof TelemetryBoundaryError) return new CreativeApiError("unavailable", operation, "telemetry", { retryable: true });
+  if (error instanceof CreativePlanningError) {
+    const code = error.code === "scope_mismatch" ? "scope_denied"
+      : error.code === "research_package_invalid" || error.code === "brief_store_unavailable" ? "unavailable"
+        : error.code === "permission_proof_invalid" ? "permission_denied" : "invalid_request";
+    return new CreativeApiError(code, operation, safeFieldPath(error.field));
+  }
   if (error?.module === "creative-engine.versions") {
     const versionCodeMap = Object.freeze({
       invalid_request: "invalid_request",
@@ -931,24 +953,97 @@ export function createCreativeApi(options = {}) {
     return validateCreativeBrief(brief, { trustedScope: scope });
   }
 
-  async function loadDesign(scope, brief, designVersionId, operation) {
+  async function createBrief(principal, request) {
+    const scope = scopeFor(principal);
+    const getPackage = requiredPort(ports, "planning.getCurrentResearchPackage", request.operation);
+    const saveAction = requiredPort(ports, "planning.saveBriefAction", request.operation);
+    const rawPackage = await getPackage(Object.freeze({ scope }));
+    let researchPackage;
+    try { researchPackage = immutableRequestSnapshot(rawPackage); }
+    catch { throw new CreativeApiError("unavailable", request.operation, "research_package"); }
+    const { expected_brief_hash: requestedExpectedHash, ...planningInput } = request.payload;
+    const plan = buildCreativeBrief({
+      trusted_scope: scope,
+      research_package: researchPackage,
+      context: { created_at: request.occurred_at, environment: request.environment,
+        billing_mode: request.billing_mode, correlation_id: request.correlation_id },
+      ...planningInput,
+    });
+    const getBrief = requiredPort(ports, "storage.getBrief", request.operation);
+    const existing = await getBrief(Object.freeze({ scope, brief_id: plan.brief.brief_id }));
+    let currentHash = null;
+    if (existing) {
+      assertScopedRecord(existing, scope, request.operation, plan.brief.brief_id);
+      const current = validateCreativeBrief(existing, { trustedScope: { ...scope, brief_id: plan.brief.brief_id } });
+      currentHash = canonicalHash(current);
+    }
+    const expectedBriefHash = requestedExpectedHash ?? currentHash;
+    const saved = await saveAction(Object.freeze({ scope, actor_id: principal.actor_id,
+      action_id: request.action_id, request_hash: actionRequestHash(request), plan,
+      expected_brief_hash: expectedBriefHash }));
+    if (!isRecord(saved)) throw new CreativeApiError("unavailable", request.operation, "brief_persistence");
+    if (saved.status === "conflict") throw new CreativeApiError("conflict", request.operation, "action_id");
+    if (saved.status === "stale") throw new CreativeApiError("stale_version", request.operation, "expected_brief_hash");
+    if (!["saved", "replayed"].includes(saved.status) || !isRecord(saved.plan) ||
+      saved.brief_hash !== saved.plan.brief_hash || saved.plan.brief?.brief_id !== plan.brief.brief_id) {
+      throw new CreativeApiError("unavailable", request.operation, "brief_persistence");
+    }
+    const result = saved.plan;
+    assertPublicIdentifiers(result, request.operation, "brief_plan");
+    return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse",
+      schema_version: CREATIVE_API_VERSION, operation_id: result.brief.brief_id,
+      replayed: saved.status === "replayed", result }), request.operation);
+  }
+
+  async function invalidateBrief(principal, request) {
+    const apply = requiredPort(ports, "planning.applyInvalidation", request.operation);
+    const result = await apply(Object.freeze({
+      trusted_scope: scopeFor(principal),
+      event_id: request.payload.event_id,
+    }));
+    if (!isRecord(result) || result.event_id !== request.payload.event_id || !isRecord(result.durable_receipt)) {
+      throw new CreativeApiError("unavailable", request.operation, "invalidation_receipt");
+    }
+    assertPublicIdentifiers(result, request.operation, "invalidation");
+    return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse",
+      schema_version: CREATIVE_API_VERSION, operation_id: result.event_id,
+      result: Object.freeze({ invalidation: result,
+        local_status: result.producer_acknowledgment ? "acknowledged" : "pending" }) }), request.operation);
+  }
+
+  async function loadDesign(scope, brief, designVersionId, operation, { allowHistorical = false } = {}) {
     boundedString(designVersionId, "design_version_id");
     const getDesignVersion = requiredPort(ports, "storage.getDesignVersion", operation);
     const design = await getDesignVersion(Object.freeze({ scope, brief_id: brief.brief_id, design_version_id: designVersionId }));
     if (!design) throw new CreativeApiError("not_found", operation, "design_version_id");
     assertScopedRecord(design, scope, operation, brief.brief_id);
     if (design.design_version_id !== designVersionId) throw new CreativeApiError("scope_denied", operation, "design_version_id");
+    let sourceBrief = brief;
+    if (design.brief_hash !== canonicalHash(brief)) {
+      if (!allowHistorical) throw new CreativeApiError("stale_version", operation, "brief_hash");
+      const getBriefVersion = requiredPort(ports, "storage.getBriefVersionByHash", operation);
+      const historical = await getBriefVersion(Object.freeze({ scope, brief_id: brief.brief_id, brief_hash: design.brief_hash }));
+      if (!historical) throw new CreativeApiError("unavailable", operation, "brief_history");
+      assertScopedRecord(historical, scope, operation, brief.brief_id);
+      sourceBrief = validateCreativeBrief(historical, { trustedScope: { ...scope, brief_id: brief.brief_id } });
+      if (canonicalHash(sourceBrief) !== design.brief_hash) throw new CreativeApiError("failed", operation, "brief_history.hash");
+    }
     return validateDesignVersion(design, {
       trustedScope: { ...scope, design_version_id: designVersionId },
-      brief_hash: canonicalHash(brief),
-      known_source_refs: brief.source_identity.map((source) => source.source_id),
+      brief_hash: canonicalHash(sourceBrief),
+      known_source_refs: sourceBrief.source_identity.map((source) => source.source_id),
     });
   }
 
-  async function assertCurrentCreativeContext(scope, brief, design, operation, expectedCurrentDesignVersionId = undefined) {
+  async function assertCurrentCreativeContext(scope, brief, design, operation,
+    expectedCurrentDesignVersionId = undefined, expectedCurrentDesignHash = undefined) {
     const currentBrief = await loadBrief(scope, brief.brief_id, operation);
     if (canonicalHash(currentBrief) !== canonicalHash(brief)) {
       throw new CreativeApiError("stale_version", operation, "brief_hash");
+    }
+    if (typeof ports.storage?.isBriefUsable === "function" &&
+      !(await ports.storage.isBriefUsable(Object.freeze({ scope, brief_id: brief.brief_id, brief_hash: canonicalHash(brief) })))) {
+      throw new CreativeApiError("stale_version", operation, "brief_invalidation");
     }
     if (design) {
       const currentDesign = await loadDesign(scope, currentBrief, design.design_version_id, operation);
@@ -966,17 +1061,106 @@ export function createCreativeApi(options = {}) {
       }
       if (selected) {
         assertScopedRecord(selected, scope, operation, brief.brief_id);
-        const validated = validateDesignVersion(selected, {
-          trustedScope: { ...scope, design_version_id: selected.design_version_id },
-          brief_hash: canonicalHash(currentBrief),
-          known_source_refs: currentBrief.source_identity.map((source) => source.source_id),
-        });
+        const validated = await loadDesign(scope, currentBrief, selected.design_version_id, operation, { allowHistorical: true });
+        const expectedHash = expectedCurrentDesignHash === undefined ? (design?.design_hash ?? null) : expectedCurrentDesignHash;
+        if (validated.design_hash !== expectedHash) throw new CreativeApiError("stale_version", operation, "design_hash");
         if (design && validated.design_hash !== design.design_hash) {
           throw new CreativeApiError("stale_version", operation, "design_hash");
         }
       }
     }
     return currentBrief;
+  }
+
+  async function verifyRequestedAssetPermissions(scope, brief, plan, operation) {
+    const explicit = new Map();
+    const sourceRefs = new Set(Array.isArray(plan.source_refs) ? plan.source_refs : []);
+    for (const step of plan.steps ?? []) {
+      for (const sourceRef of step.source_refs ?? []) sourceRefs.add(sourceRef);
+      const action = step.action === "concept.generate" ? "reproduce" : "modify";
+      const ids = [step.parameters?.asset_id,
+        ...(Array.isArray(step.parameters?.changes) ? step.parameters.changes.map((change) => change?.asset_id) : [])]
+        .filter((value) => value !== undefined);
+      for (const assetId of ids) explicit.set(assetId, action);
+    }
+    const getPackage = ports.planning?.getCurrentResearchPackage;
+    if (typeof getPackage !== "function") {
+      if (explicit.size > 0) throw new CreativeApiError("unavailable", operation, "asset_permission_verifier");
+      return;
+    }
+    let research;
+    try {
+      const raw = await getPackage(Object.freeze({ scope }));
+      research = normalizeResearchPackage(immutableRequestSnapshot(raw), scope);
+    } catch {
+      throw new CreativeApiError("unavailable", operation, "research_package");
+    }
+    const packageHash = canonicalHash(research);
+    if (research.package_id !== brief.research_package_ref.package_id ||
+      packageHash !== brief.research_package_ref.content_hash) {
+      throw new CreativeApiError("stale_version", operation, "research_package_hash");
+    }
+    for (const asset of research.assets.items) {
+      if (sourceRefs.has(asset.source_id) || sourceRefs.has(asset.asset_id) || sourceRefs.has(`asset:${asset.asset_id}`)) {
+        explicit.set(asset.asset_id, explicit.get(asset.asset_id) ?? (operation === "generate" ? "reproduce" : "modify"));
+      }
+    }
+    if (explicit.size === 0) return;
+    const requestedAssets = [];
+    for (const [assetId, action] of explicit) {
+      const asset = research.assets.items.find((item) => item.asset_id === assetId);
+      const packagePermission = research.permissions.items.find((item) => item.asset_id === assetId && item.action === action);
+      const briefPermission = brief.permissions.items.find((item) => item.asset_id === assetId && item.action === action);
+      if (!asset || !packagePermission || packagePermission.status !== "granted" ||
+        !briefPermission || briefPermission.status !== "granted") {
+        throw new CreativeApiError("permission_denied", operation, "asset_permission");
+      }
+      requestedAssets.push({ asset, action });
+    }
+    const verifier = ports.planning?.assetPermissionVerifier;
+    if (!isRecord(verifier) || typeof verifier.verifyAssetUse !== "function" ||
+      typeof ports.storage?.isAssetFenced !== "function") {
+      throw new CreativeApiError("unavailable", operation, "asset_permission_verifier");
+    }
+    for (const { asset, action } of requestedAssets) {
+      const requestedAt = new Date(now()).toISOString();
+      let proof;
+      try {
+        proof = await verifier.verifyAssetUse({ tenant_id: scope.tenant_id, project_id: scope.project_id,
+          asset_id: asset.asset_id, content_hash: asset.content_hash, action,
+          package_id: research.package_id, package_hash: packageHash, now: requestedAt });
+      } catch {
+        throw new CreativeApiError("unavailable", operation, "asset_permission_verifier", { retryable: true });
+      }
+      const verifiedAt = new Date(now()).getTime();
+      const checkedAt = typeof proof?.checked_at === "string" ? Date.parse(proof.checked_at) : NaN;
+      const expiresAt = typeof proof?.expires_at === "string" ? Date.parse(proof.expires_at) : NaN;
+      if (!isRecord(proof) || proof.status !== "granted" || proof.owner_evidence_status !== "verified" ||
+        proof.tenant_id !== scope.tenant_id || proof.project_id !== scope.project_id || proof.asset_id !== asset.asset_id ||
+        proof.content_hash !== asset.content_hash || proof.action !== action || proof.package_id !== research.package_id ||
+        proof.package_hash !== packageHash || typeof proof.evidence_ref !== "string" || proof.evidence_ref.length < 1 ||
+        !Number.isFinite(checkedAt) || checkedAt > verifiedAt || !Number.isFinite(expiresAt) || expiresAt <= verifiedAt) {
+        throw new CreativeApiError("permission_denied", operation, "asset_permission_evidence");
+      }
+    }
+    // Bind the permission result to the still-current package after all owner
+    // verifier awaits. The caller then performs its final same-DB fence/CAS.
+    const currentRaw = await getPackage(Object.freeze({ scope }));
+    let current;
+    try { current = normalizeResearchPackage(immutableRequestSnapshot(currentRaw), scope); }
+    catch { throw new CreativeApiError("unavailable", operation, "research_package"); }
+    if (current.package_id !== research.package_id || canonicalHash(current) !== packageHash) {
+      throw new CreativeApiError("stale_version", operation, "research_package_hash");
+    }
+    // The package read above can itself await. Check the durable asset fence
+    // last so an invalidation committed during permission verification or the
+    // current-package lookup cannot pass through to a transport call.
+    for (const { asset } of requestedAssets) {
+      if (await ports.storage.isAssetFenced(Object.freeze({ scope, asset_id: asset.asset_id,
+        content_hash: asset.content_hash }))) {
+        throw new CreativeApiError("permission_denied", operation, "asset_invalidation");
+      }
+    }
   }
 
   async function beginMutation(principal, request) {
@@ -1211,6 +1395,10 @@ export function createCreativeApi(options = {}) {
             // The telemetry executor owns idempotent transport identity reuse
             // and must revalidate the active job/context fence on every call.
             await dispatchContext.recordTransportAttempt(transportId);
+            // C03 transport acknowledgment is an async boundary. Recheck
+            // owner rights, current package, and same-database fences after it
+            // and before returning control to a provider adapter that sends.
+            await checkDispatchFence();
             const intentRef = dispatchIntentRefs.get(transportId);
             if (!intentRef) throw new CreativeApiError("unavailable", request.operation, "dispatch_authorization");
             if (dispatchContext.signal?.aborted) throw new CreativeApiError("cancelled", request.operation, "deadline");
@@ -1270,17 +1458,21 @@ export function createCreativeApi(options = {}) {
     return input;
   }
 
-  async function decision(principal, request, started, brief, decisionRequest, baseDesign = null) {
+  async function decision(principal, request, started, brief, decisionRequest, baseDesign = null,
+    selectedDesignVersionId = undefined, selectedDesignHash = undefined) {
     if (decisionRequest === undefined) return undefined;
     const branchMode = request.operation === "edit" && request.payload.selection_mode === "branch";
-    const expectedCurrentDesignVersionId = branchMode ? undefined : (baseDesign?.design_version_id ?? null);
+    const expectedCurrentDesignVersionId = branchMode ? undefined
+      : (selectedDesignVersionId === undefined ? (baseDesign?.design_version_id ?? null) : selectedDesignVersionId);
+    const expectedCurrentDesignHash = branchMode ? undefined
+      : (selectedDesignHash === undefined ? (baseDesign?.design_hash ?? null) : selectedDesignHash);
     await assertCurrentCreativeContext(started.scope, brief, baseDesign, request.operation,
-      expectedCurrentDesignVersionId);
+      expectedCurrentDesignVersionId, expectedCurrentDesignHash);
     const input = decisionInput(decisionRequest, principal, request, brief, started);
     const resolveRoute = requiredPort(ports, "decisionPort.resolveRoute", request.operation);
     const route = routeFor(await resolveRoute(Object.freeze({ scope: started.scope, actor_id: principal.actor_id, decision: input })), request.operation);
     await assertCurrentCreativeContext(started.scope, brief, baseDesign, request.operation,
-      expectedCurrentDesignVersionId);
+      expectedCurrentDesignVersionId, expectedCurrentDesignHash);
     if (route.provider.model !== PINNED_JEV_MODEL_ID) throw new CreativeApiError("unsupported_version", request.operation, "decision_route.model");
     const result = await runMetered(principal, request, started, "jev_decision", route, "decisionPort.execute",
       async ({ method, attempt, reservation_ref, signal, deadline_at, transportAttemptId, dispatch_intent_ref, recordTransportAttempt, setDecisionRequest }) => {
@@ -1328,8 +1520,8 @@ export function createCreativeApi(options = {}) {
           dispatch_intent_ref, recordTransportAttempt, signal, deadline_at }));
         return { value: raw, usage: raw?.usage, provider_outcome: raw?.status === "complete" || raw?.status === "review" ? "succeeded" : "failed" };
       }, () => assertCurrentCreativeContext(started.scope, brief, baseDesign,
-        request.operation, expectedCurrentDesignVersionId),
-      creativeContextFence(brief, baseDesign, expectedCurrentDesignVersionId));
+        request.operation, expectedCurrentDesignVersionId, expectedCurrentDesignHash),
+      creativeContextFence(brief, baseDesign, expectedCurrentDesignVersionId, expectedCurrentDesignHash));
     if (!result.decision_request) throw new CreativeApiError("unavailable", request.operation, "decision_request");
     let validated;
     try { validated = validateDecisionResult(result.decision_request, result.value, {
@@ -1342,7 +1534,7 @@ export function createCreativeApi(options = {}) {
     return validated;
   }
 
-  async function runImageOperation(principal, request, started, brief, baseDesign) {
+  async function runImageOperation(principal, request, started, brief, baseDesign, expectedSelection = null) {
     const operation = request.operation;
     const plan = request.payload.plan;
     if (!isRecord(plan)) throw new CreativeApiError("invalid_request", operation, "plan");
@@ -1399,17 +1591,25 @@ export function createCreativeApi(options = {}) {
     if (operation === "edit" && plan.operation === "correction.apply") {
       throw new CreativeApiError("unavailable", operation, "correction_handoff");
     }
+    const assertImageContext = async () => {
+      await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
+        expectedCurrentDesignVersionId, expectedCurrentDesignHash);
+      await verifyRequestedAssetPermissions(started.scope, brief, plan, operation);
+      await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
+        expectedCurrentDesignVersionId, expectedCurrentDesignHash);
+    };
     const branchMode = operation === "edit" && request.payload.selection_mode === "branch";
-    const expectedCurrentDesignVersionId = branchMode ? undefined : (baseDesign?.design_version_id ?? null);
-    await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
-      expectedCurrentDesignVersionId);
+    const expectedCurrentDesignVersionId = branchMode ? undefined
+      : (operation === "generate" ? (expectedSelection?.design_version_id ?? null) : (baseDesign?.design_version_id ?? null));
+    const expectedCurrentDesignHash = branchMode ? undefined
+      : (operation === "generate" ? (expectedSelection?.design_hash ?? null) : (baseDesign?.design_hash ?? null));
+    await assertImageContext();
     const decisionResult = await decision(principal, request, started, brief,
-      request.payload.decision_request, baseDesign);
+      request.payload.decision_request, baseDesign, expectedCurrentDesignVersionId, expectedCurrentDesignHash);
     const method = operation === "generate" ? "provider.generate" : "provider.edit";
     const resolveRoute = requiredPort(ports, "provider.resolveRoute", operation);
     const route = routeFor(await resolveRoute(Object.freeze({ scope: started.scope, actor_id: principal.actor_id, operation, plan })), operation);
-    await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
-      expectedCurrentDesignVersionId);
+    await assertImageContext();
     const metered = await runMetered(principal, request, started, operation === "generate" ? "image_generation" : "image_edit", route, method,
       async ({ method: dispatch, scope, actor_id, started: job, route: resolved, attempt, signal, deadline_at,
         reservation_ref, transportAttemptId, dispatch_intent_ref, recordTransportAttempt }) => {
@@ -1419,9 +1619,8 @@ export function createCreativeApi(options = {}) {
           recordTransportAttempt,
           signal, deadline_at }));
         return { value, usage: value?.usage, provider_outcome: "succeeded" };
-      }, () => assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
-        expectedCurrentDesignVersionId),
-      creativeContextFence(brief, baseDesign, expectedCurrentDesignVersionId));
+      }, assertImageContext,
+      creativeContextFence(brief, baseDesign, expectedCurrentDesignVersionId, expectedCurrentDesignHash));
     const generated = metered.value;
     const usage = normalizeUsage(generated?.usage);
     if (!isRecord(generated) || !isRecord(generated.artifact) ||
@@ -1568,10 +1767,15 @@ export function createCreativeApi(options = {}) {
     }
     if (operation === "generate" || operation === "edit") {
       const brief = await loadBrief(scope, payload.brief_id, operation);
+      if (typeof ports.storage?.isBriefUsable === "function" &&
+        !(await ports.storage.isBriefUsable(Object.freeze({ scope, brief_id: brief.brief_id, brief_hash: canonicalHash(brief) })))) {
+        throw new CreativeApiError("stale_version", operation, "brief_invalidation");
+      }
       const baseDesign = operation === "edit"
         ? await loadDesign(scope, brief, payload.design_version_id, operation)
         : null;
       const branchMode = operation === "edit" && payload.selection_mode === "branch";
+      let expectedSelection = Object.freeze({ design_version_id: null, design_hash: null });
       if (operation === "edit") {
         const getCurrent = requiredPort(ports, "storage.getCurrentDesignVersion", operation);
         const current = await getCurrent(Object.freeze({ scope, brief_id: brief.brief_id }));
@@ -1587,9 +1791,14 @@ export function createCreativeApi(options = {}) {
       } else {
         const getCurrent = requiredPort(ports, "storage.getCurrentDesignVersion", operation);
         const current = await getCurrent(Object.freeze({ scope, brief_id: brief.brief_id }));
-        if (current !== null) throw new CreativeApiError("stale_version", operation, "brief_id");
+        if (current !== null) {
+          assertScopedRecord(current, scope, operation, brief.brief_id);
+          const selected = await loadDesign(scope, brief, current.design_version_id, operation, { allowHistorical: true });
+          if (selected.brief_hash === canonicalHash(brief)) throw new CreativeApiError("stale_version", operation, "brief_id");
+          expectedSelection = Object.freeze({ design_version_id: selected.design_version_id, design_hash: selected.design_hash });
+        }
       }
-      const output = await runImageOperation(principal, request, started, brief, baseDesign);
+      const output = await runImageOperation(principal, request, started, brief, baseDesign, expectedSelection);
       const { artifact_bytes: _artifactBytes, creation_evidence: creationEvidence, ...publishedOutput } = output;
       const selectionMode = operation === "edit" && payload.selection_mode === "branch" ? "branch" : "advance";
       const creation = Object.freeze({
@@ -1613,8 +1822,10 @@ export function createCreativeApi(options = {}) {
         lease_token: started.lease_token,
         job_result: publishedOutput,
         expected_brief_hash: canonicalHash(brief),
-        expected_current_design_version_id: selectionMode === "advance" ? (baseDesign?.design_version_id ?? null) : null,
-        expected_current_design_hash: selectionMode === "advance" ? (baseDesign?.design_hash ?? null) : null,
+        expected_current_design_version_id: selectionMode === "advance"
+          ? (operation === "generate" ? expectedSelection.design_version_id : (baseDesign?.design_version_id ?? null)) : null,
+        expected_current_design_hash: selectionMode === "advance"
+          ? (operation === "generate" ? expectedSelection.design_hash : (baseDesign?.design_hash ?? null)) : null,
         expected_parent_design_version_id: baseDesign?.design_version_id ?? null,
         expected_parent_design_hash: baseDesign?.design_hash ?? null });
       const prepare = ports.storage?.prepareDesignVersion;
@@ -1648,7 +1859,10 @@ export function createCreativeApi(options = {}) {
             job_id: prepared.job_id, payload_hash: prepared.payload_hash }), transaction)
           : await requiredPort(ports, "storage.saveDesignVersion", operation)(saveInput, transaction);
         if (!isRecord(saved) || saved.status !== "saved") throw new CreativeApiError("stale_version", operation);
-      }, creativeContextFence(brief, baseDesign, branchMode ? undefined : (baseDesign?.design_version_id ?? null)));
+      }, creativeContextFence(brief, baseDesign, branchMode ? undefined
+        : (operation === "generate" ? expectedSelection.design_version_id : (baseDesign?.design_version_id ?? null)),
+      branchMode ? undefined
+        : (operation === "generate" ? expectedSelection.design_hash : (baseDesign?.design_hash ?? null))));
       return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse", schema_version: CREATIVE_API_VERSION,
         operation_id: job.job_id, job: publicJob(job, job.job_id), result: Object.freeze({
           design_version: output.design, usage: output.usage, telemetry_evidence: output.telemetry_evidence,
@@ -1946,6 +2160,8 @@ export function createCreativeApi(options = {}) {
       }
       await emitTrace({ event: "creative_api.request", operation, request_id: request.request_id,
         tenant_id: principal.tenant_id, project_id: principal.project_id, actor_id: principal.actor_id });
+      if (operation === "brief.create") return await createBrief(principal, request);
+      if (operation === "brief.invalidate") return await invalidateBrief(principal, request);
       if (operation === "list") {
         const scope = scopeFor(principal, boundedString(request.payload.brief_id, "brief_id"));
         const limit = request.payload.limit === undefined ? 20 : request.payload.limit;
@@ -1957,11 +2173,10 @@ export function createCreativeApi(options = {}) {
           throw new CreativeApiError("unavailable", operation);
         }
         const brief = await loadBrief(scope, scope.brief_id, operation);
-        const items = page.items.map((item) => {
+        const items = await Promise.all(page.items.map((item) => {
           assertScopedRecord(item, scope, operation, scope.brief_id);
-          return validateDesignVersion(item, { trustedScope: { ...scope, design_version_id: item.design_version_id }, brief_hash: canonicalHash(brief),
-            known_source_refs: brief.source_identity.map((source) => source.source_id) });
-        });
+          return loadDesign(scope, brief, item.design_version_id, operation, { allowHistorical: true });
+        }));
         const sorted = [...items].sort(compareOrder);
         if (canonicalSerialize(sorted) !== canonicalSerialize(items) ||
           (after && items.some((item) => !isAfterCursor(item, after)))) throw new CreativeApiError("failed", operation, "page_order");
@@ -1974,8 +2189,8 @@ export function createCreativeApi(options = {}) {
         const scope = scopeFor(principal, boundedString(request.payload.brief_id, "brief_id"));
         const brief = await loadBrief(scope, scope.brief_id, operation);
         const [left, right] = await Promise.all([
-          loadDesign(scope, brief, request.payload.left_design_version_id, operation),
-          loadDesign(scope, brief, request.payload.right_design_version_id, operation),
+          loadDesign(scope, brief, request.payload.left_design_version_id, operation, { allowHistorical: true }),
+          loadDesign(scope, brief, request.payload.right_design_version_id, operation, { allowHistorical: true }),
         ]);
         return projectPublicIdentifiers(Object.freeze({ ok: true, contract: "CreativeApiResponse", schema_version: CREATIVE_API_VERSION,
           result: Object.freeze({ left, right, changed_fields: Object.freeze([

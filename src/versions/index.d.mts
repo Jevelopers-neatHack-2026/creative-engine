@@ -3,6 +3,7 @@ export type {
   CreateCreativeVersionApiPortsOptions,
   CreativeVersionApiPorts,
   CreativeVersionRuntimeJobs,
+  CreativeVersionRuntimePlanning,
   CreativeVersionRuntimePorts,
   CreativeVersionRuntimeStorage,
 } from "./api-ports.mjs";
@@ -11,6 +12,7 @@ export {
   VersionStoreError,
 } from "./store.mjs";
 export type {
+  BriefActionResult,
   PreparedVersion,
   SavedVersion,
   StaleVersion,

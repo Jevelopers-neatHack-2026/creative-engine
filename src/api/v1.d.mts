@@ -1,6 +1,7 @@
 import type {
   CreativeBrief,
   DesignVersion,
+  EventIntelligencePackage,
   EditPlan,
   TrustedScope,
 } from "../contracts/creative/v1.mjs";
@@ -22,9 +23,21 @@ import type {
   MeteringPort,
 } from "../contracts/metering.mjs";
 import type { CreativeTelemetryConfiguration, CreativeTelemetryEvidence } from "../telemetry/index.mjs";
+import type {
+  ApprovalStalenessRequest,
+  AssetPermissionEvidence,
+  CreativeBriefPlan,
+  InvalidationReceipt,
+  NormalizedResearchInvalidation,
+  PlanningScope,
+  ProducerAcknowledgment,
+  ResearchInvalidationEventInput,
+  TrustedInvalidationEvidence,
+} from "../planning/index.mjs";
 
 export type CreativeOperation =
-  | "generate" | "edit" | "inspect" | "list" | "compare" | "restore" | "cancel" | "handoff" | "job.status";
+  | "generate" | "edit" | "inspect" | "list" | "compare" | "restore" | "cancel" | "handoff" | "job.status"
+  | "brief.create" | "brief.invalidate";
 export type CreativeJobStatus = "queued" | "running" | "completed" | "cancelled" | "failed";
 export type CreativeErrorCode =
   | "invalid_request" | "unsupported_version" | "unauthorized" | "permission_denied"
@@ -121,7 +134,18 @@ export type CreativeApiRequest =
   | (CreativeApiRequestEnvelope & { operation: "handoff"; action_id: string;
       payload: { brief_id: string; design_version_id: string; approval_ref: string; destination_ref: string } })
   | (CreativeApiRequestEnvelope & { operation: "job.status"; action_id?: string;
-      payload: { job_id: string } });
+      payload: { job_id: string } })
+  | (CreativeApiRequestEnvelope & { operation: "brief.create"; action_id: string;
+      payload: {
+        customer_preferences?: Array<{ preference_id: string; value: string }>;
+        artistic_intent?: Array<{ interpretation_id: string; text: string }>;
+        additional_required_fact_keys?: string[];
+        fact_corrections?: Array<{ fact_id: string; proposed_value: unknown }>;
+        locked_fields?: Array<{ field: string; reason: string }>;
+        expected_brief_hash?: string;
+      } })
+  | (CreativeApiRequestEnvelope & { operation: "brief.invalidate"; action_id: string;
+      payload: { event_id: string } });
 
 export interface TrustedCreativeActor extends TrustedScope {
   actor_id: string;
@@ -205,6 +229,12 @@ export interface ProviderUsageRecord {
 export interface CreativeRuntimePorts {
   storage?: {
     getBrief(input: { scope: TrustedScope; brief_id: string }): Promise<CreativeBrief | null> | CreativeBrief | null;
+    getBriefVersionByHash?(input: { scope: TrustedScope; brief_id: string; brief_hash: string }):
+      Promise<CreativeBrief | null> | CreativeBrief | null;
+    isBriefUsable?(input: { scope: TrustedScope; brief_id: string; brief_hash: string }):
+      Promise<boolean> | boolean;
+    isAssetFenced?(input: { scope: TrustedScope; asset_id: string; content_hash: string }):
+      Promise<boolean> | boolean;
     getDesignVersion(input: { scope: TrustedScope; brief_id: string; design_version_id: string }): Promise<DesignVersion | null> | DesignVersion | null;
     getCurrentDesignVersion(input: { scope: TrustedScope; brief_id: string }): Promise<DesignVersion | null> | DesignVersion | null;
     getSelection(input: { scope: TrustedScope; brief_id: string }): Promise<DesignSelection | null> | DesignSelection | null;
@@ -291,6 +321,42 @@ export interface CreativeRuntimePorts {
       handoff: ArtworkHandoff; transport_attempt_id: string; dispatch_intent_ref: string }): Promise<ConsumptionReceipt>;
   };
   trace?: { record(event: Record<string, unknown>): Promise<void> | void };
+  /** Trusted Research and rights adapters. Request JSON can identify a package/event,
+   * but never supplies verified facts, permission evidence, or invalidation authority. */
+  planning?: {
+    getCurrentResearchPackage?(input: { scope: PlanningScope }):
+      Promise<EventIntelligencePackage | Record<string, unknown>> | EventIntelligencePackage | Record<string, unknown>;
+    saveBriefAction?(input: { scope: PlanningScope; actor_id: string; action_id: string; request_hash: string;
+      plan: CreativeBriefPlan; expected_brief_hash: string | null }):
+      Promise<{ status: "saved" | "replayed"; brief_hash: string; plan: CreativeBriefPlan } |
+        { status: "stale"; brief_hash: string | null } | { status: "conflict" }> |
+      { status: "saved" | "replayed"; brief_hash: string; plan: CreativeBriefPlan } |
+        { status: "stale"; brief_hash: string | null } | { status: "conflict" };
+    getBriefVersionByHash?(input: { scope: PlanningScope; brief_id: string; brief_hash: string }):
+      Promise<CreativeBrief | null> | CreativeBrief | null;
+    isBriefUsable?(input: { scope: PlanningScope; brief_id: string; brief_hash: string }): Promise<boolean> | boolean;
+    getInvalidationEvent?(input: { scope: PlanningScope; event_id: string }):
+      Promise<ResearchInvalidationEventInput> | ResearchInvalidationEventInput;
+    invalidationVerifier?: {
+      verifyInvalidation(input: { event: NormalizedResearchInvalidation; trusted_scope: PlanningScope; now: string }):
+        Promise<TrustedInvalidationEvidence>;
+    };
+    approvalStaleness?: {
+      markBriefStale(input: ApprovalStalenessRequest):
+        Promise<ApprovalStalenessRequest & { status: "acknowledged" }>;
+    };
+    producerAcknowledgment?: {
+      acknowledgeInvalidation(input: { event_id: string; idempotency_key: string; event_hash: string;
+        durable_receipt_id: string; tenant_id: string; project_id: string }): Promise<ProducerAcknowledgment>;
+    };
+    assetPermissionVerifier?: {
+      verifyAssetUse(input: { tenant_id: string; project_id: string; asset_id: string; content_hash: string;
+        action: "reproduce" | "modify"; package_id: string; package_hash: string; now: string }):
+        Promise<AssetPermissionEvidence>;
+    };
+    applyInvalidation?(input: { trusted_scope: PlanningScope; event_id: string }):
+      Promise<CreativeInvalidationResult> | CreativeInvalidationResult;
+  };
 }
 
 export interface DesignSelection {
@@ -403,7 +469,24 @@ export type CreativeApiResult =
   | { items: DesignVersion[]; next_cursor: string | null }
   | { left: DesignVersion; right: DesignVersion; changed_fields: readonly string[] }
   | { selection: DesignSelection }
-  | { handoff: ArtworkHandoff; receipt: ConsumptionReceipt | null };
+  | { handoff: ArtworkHandoff; receipt: ConsumptionReceipt | null }
+  | CreativeBriefPlan
+  | { invalidation: CreativeInvalidationResult;
+      local_status: "pending" | "acknowledged" };
+
+export interface CreativeInvalidationResult {
+  event_id: string;
+  event_hash: string;
+  durable_receipt: InvalidationReceipt;
+  approval_staleness: {
+    requested: number;
+    acknowledged: number;
+    status: "acknowledged" | "pending";
+    receipts: readonly (ApprovalStalenessRequest & { status: "acknowledged" })[];
+  };
+  producer_acknowledgment: ProducerAcknowledgment | null;
+  verification_classification: "owner_verified" | "synthetic_test";
+}
 
 export interface CreativeApiErrorResponse {
   ok: false;

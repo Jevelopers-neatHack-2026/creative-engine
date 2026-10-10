@@ -40,6 +40,10 @@ export interface SavedVersion {
   created_at: string;
   replayed: boolean;
 }
+export type BriefActionResult =
+  | Readonly<{ status: "saved" | "replayed"; brief_hash: string; plan: import("../planning/index.mjs").CreativeBriefPlan }>
+  | Readonly<{ status: "stale"; brief_hash: string | null }>
+  | Readonly<{ status: "conflict" }>;
 export interface StaleVersion { status: "stale"; code: "stale_version"; current: unknown; replayed?: boolean }
 export interface PreparedVersion { status: "prepared"; action_id: string; job_id: string; payload_hash: string }
 export type VersionWriteResult = SavedVersion | StaleVersion | PreparedVersion;
@@ -48,8 +52,13 @@ export class CreativeVersionStore {
   constructor(options: { databasePath: string; objectRoot: string; now?: () => number; maxArtifactBytes?: number });
   close(): void;
   getBrief(input: { scope: VersionScope | Omit<VersionScope, "brief_id">; brief_id: string }): CreativeBrief | null;
+  getBriefVersionByHash(input: { scope: VersionScope | Omit<VersionScope, "brief_id">; brief_id: string; brief_hash: string }): CreativeBrief | null;
+  isBriefUsable(input: { scope: VersionScope | Omit<VersionScope, "brief_id">; brief_id: string; brief_hash?: string }): boolean;
+  isAssetFenced(input: { scope: VersionScope | Omit<VersionScope, "brief_id">; asset_id: string; content_hash: string }): boolean;
   putBrief(input: { scope: TrustedScope; brief: CreativeBrief; expected_brief_hash?: string | null }):
     Readonly<{ status: "saved" | "stale"; brief_hash: string | null }>;
+  saveBriefAction(input: { scope: TrustedScope; actor_id: string; action_id: string; request_hash: string;
+    plan: import("../planning/index.mjs").CreativeBriefPlan; expected_brief_hash?: string | null }): BriefActionResult;
   recordAttemptEvidence(input: { scope: VersionScope; actor_id: string; job_id: string; lease_token: string;
     action_id: string; request_hash: string; creation: CreativeVersionCreationEvidence }):
     Readonly<{ status: "recorded" | "replayed" }>;

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { canonicalHash, canonicalSerialize } from "../contracts/index.mjs";
 import { CreativeVersionStore, VersionStoreError } from "./store.mjs";
+import { applyResearchInvalidation } from "../planning/index.mjs";
 
 const OPERATIONS = new Set(["generate", "edit", "inspect", "list", "compare", "restore", "cancel", "handoff", "job.status"]);
 const HASH = /^sha256:[a-f0-9]{64}$/;
@@ -68,6 +69,7 @@ function contextFenceMatches(store, scope, fence) {
     const checkedScope = briefScope(scope, fence.brief_id);
     const brief = store.getBrief({ scope: checkedScope, brief_id: checkedScope.brief_id });
     if (!brief || canonicalHash(brief) !== fence.brief_hash) return false;
+    if (!store.isBriefUsable({ scope: checkedScope, brief_id: checkedScope.brief_id, brief_hash: fence.brief_hash })) return false;
     if (fence.design_version_id !== undefined) {
       safeReference(fence.design_version_id, "context_fence.design_version_id");
       safeHash(fence.design_hash, "context_fence.design_hash");
@@ -125,6 +127,9 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
 
   const storage = {
     getBrief(input) { return serial(() => store.getBrief(input)); },
+    getBriefVersionByHash(input) { return serial(() => store.getBriefVersionByHash(input)); },
+    isBriefUsable(input) { return serial(() => store.isBriefUsable(input)); },
+    isAssetFenced(input) { return serial(() => store.isAssetFenced(input)); },
     getDesignVersion(input) { return serial(() => store.getDesignVersion(input)); },
     getCurrentDesignVersion(input) { return serial(() => store.getCurrentDesignVersion(input)); },
     getSelection(input) { return serial(() => store.getSelection(input)); },
@@ -203,6 +208,36 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
     },
     selectDesignVersion(input, transaction) {
       return serial(() => store.selectDesignVersion(input, transaction));
+    },
+  };
+
+  const externalPlanning = otherPorts.planning ?? {};
+  const planning = {
+    ...externalPlanning,
+    saveBriefAction(input) { return serial(() => store.saveBriefAction(input)); },
+    getBriefVersionByHash(input) { return serial(() => store.getBriefVersionByHash(input)); },
+    isBriefUsable(input) { return serial(() => store.isBriefUsable(input)); },
+    async applyInvalidation(input) {
+      if (!record(input?.trusted_scope)) throw new VersionStoreError("scope_denied", "planning.trusted_scope");
+      const scope = Object.freeze({
+        tenant_id: safeReference(input.trusted_scope.tenant_id, "scope.tenant_id"),
+        project_id: safeReference(input.trusted_scope.project_id, "scope.project_id"),
+      });
+      if (typeof externalPlanning.getInvalidationEvent !== "function") {
+        throw new VersionStoreError("unavailable", "planning.invalidation_event", true);
+      }
+      const event_id = safeReference(input.event_id, "event_id");
+      const event = await externalPlanning.getInvalidationEvent({ scope, event_id });
+      if (!record(event) || event.event_id !== event_id) {
+        throw new VersionStoreError("unavailable", "planning.invalidation_event", true);
+      }
+      return applyResearchInvalidation({ trusted_scope: scope, event, ports: {
+        clock: { now: () => store.timestamp() },
+        store: store.planningStore(scope),
+        verifier: externalPlanning.invalidationVerifier,
+        approvalStaleness: externalPlanning.approvalStaleness,
+        producerAcknowledgment: externalPlanning.producerAcknowledgment,
+      } });
     },
   };
 
@@ -479,6 +514,6 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
     },
   };
 
-  const ports = { ...otherPorts, storage: { ...otherPorts.storage, ...storage }, jobs: { ...otherPorts.jobs, ...jobs } };
+  const ports = { ...otherPorts, storage: { ...otherPorts.storage, ...storage }, jobs: { ...otherPorts.jobs, ...jobs }, planning };
   return Object.freeze({ ports, storage: ports.storage, jobs: ports.jobs });
 }

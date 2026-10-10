@@ -198,6 +198,7 @@ export interface CreativeBriefStore {
   recordProducerAcknowledgment(response: ProducerAcknowledgment): ProducerAcknowledgment;
   isAssetFenced(tenantId: string, projectId: string, assetId: string, contentHash: string): boolean;
   isFactFenced(tenantId: string, projectId: string, packageId: string, packageHash: string, factId: string): boolean;
+  isPackageFenced(tenantId: string, projectId: string, packageId: string, packageHash: string): boolean;
   getInvalidationHistory(): readonly Readonly<Record<string, string | number>>[];
   close(): void;
 }
@@ -266,7 +267,7 @@ export interface AssetPermissionEvidence {
   readonly project_id: string;
   readonly asset_id: string;
   readonly content_hash: string;
-  readonly action: "reproduce";
+  readonly action: "reproduce" | "modify";
   readonly package_id: string;
   readonly package_hash: string;
   readonly owner_evidence_status: "verified" | "unknown";
@@ -311,4 +312,5 @@ export declare function createCreativeBriefStore(input: {
   readonly database: SqliteDatabase;
   readonly trustedScope: PlanningScope;
 }): CreativeBriefStore;
+export declare function initializeCreativeBriefDatabase(database: SqliteDatabase): void;
 export declare function openCreativeBriefStore(path: string, trustedScope: PlanningScope): CreativeBriefStore;

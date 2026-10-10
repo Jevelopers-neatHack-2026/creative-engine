@@ -13,6 +13,7 @@ test("public API subpath exports the typed runtime symbols and errors", async ()
   assert.equal(apiModule.CREATIVE_API_VERSION, "1.0");
   assert.deepEqual(apiModule.CREATIVE_API_OPERATIONS, [
     "generate", "edit", "inspect", "list", "compare", "restore", "cancel", "handoff", "job.status",
+    "brief.create", "brief.invalidate",
   ]);
   const error = new apiModule.CreativeApiError("invalid_request", "generate", "plan");
   assert.ok(error instanceof Error);

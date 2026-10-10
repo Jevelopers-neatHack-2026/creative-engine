@@ -11,6 +11,7 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
 const ISO_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const VERIFIED_INVALIDATION_EVENTS = new WeakSet();
 const VERIFIED_INVALIDATION_EVIDENCE = new WeakSet();
+const INITIALIZED_DATABASES = new WeakSet();
 
 /** Internal handoff from the planner's trusted verifier path to the durable adapter. */
 export function acceptVerifiedInvalidation(event, evidence) {
@@ -231,6 +232,15 @@ function initialize(database) {
         SELECT RAISE(ABORT, 'producer acknowledgments are immutable');
       END;
   `);
+  INITIALIZED_DATABASES.add(database);
+}
+
+/** Initializes the brief and invalidation tables on an already-open SQLite connection. */
+export function initializeCreativeBriefDatabase(database) {
+  if (!database || typeof database.exec !== "function" || typeof database.prepare !== "function") {
+    fail("invalid_store", "A synchronous SQLite database connection is required.", "database");
+  }
+  if (!INITIALIZED_DATABASES.has(database)) initialize(database);
 }
 
 function makeBriefReceipt(row) {
@@ -273,7 +283,7 @@ function createStore(database, scope, closeDatabase) {
   if (!database || typeof database.exec !== "function" || typeof database.prepare !== "function") {
     fail("invalid_store", "A synchronous SQLite database connection is required.", "database");
   }
-  initialize(database);
+  if (!INITIALIZED_DATABASES.has(database)) initialize(database);
 
   function requireScope(tenantId, projectId, field) {
     if (tenantId !== scope.tenant_id || projectId !== scope.project_id) {
@@ -598,6 +608,17 @@ function createStore(database, scope, closeDatabase) {
           AND source_package_hash = ? AND kind = 'fact' AND target_id = ? LIMIT 1
       `).get(scope.tenant_id, scope.project_id, checkedId(packageId, "source_package_id"),
         requiredString(packageHash, "source_package_hash", HASH_PATTERN), checkedId(factId, "fact_id"));
+      return Boolean(row);
+    },
+
+    isPackageFenced(tenantId, projectId, packageId, packageHash) {
+      requireScope(tenantId, projectId, "package.scope");
+      const row = database.prepare(`
+        SELECT 1 AS found FROM creative_invalidation_fences
+        WHERE tenant_id = ? AND project_id = ? AND source_package_id = ?
+          AND source_package_hash = ? LIMIT 1
+      `).get(scope.tenant_id, scope.project_id, checkedId(packageId, "source_package_id"),
+        requiredString(packageHash, "source_package_hash", HASH_PATTERN));
       return Boolean(row);
     },
 

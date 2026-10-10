@@ -6,7 +6,7 @@ import {
   validateCreativeBrief,
 } from "../contracts/index.mjs";
 import { acceptVerifiedInvalidation } from "./store.mjs";
-export { createCreativeBriefStore, openCreativeBriefStore } from "./store.mjs";
+export { createCreativeBriefStore, initializeCreativeBriefDatabase, openCreativeBriefStore } from "./store.mjs";
 
 export const CREATIVE_BRIEF_PLANNER_VERSION = "creative-engine.planning/1.0";
 export const CREATIVE_BRIEF_REQUIRED_FACT_KEYS = Object.freeze(["event_name", "event_date"]);

@@ -37,6 +37,10 @@
       "types": "./src/preflight/index.d.mts",
       "import": "./src/preflight/index.mjs"
     },
+    "./planning": {
+      "types": "./src/planning/index.d.mts",
+      "import": "./src/planning/index.mjs"
+    },
     "./versions": {
       "types": "./src/versions/index.d.mts",
       "import": "./src/versions/index.mjs"
@@ -48,7 +52,7 @@
   },
   "scripts": {
     "bootstrap": "npm ci --ignore-scripts --offline",
-    "build": "node scripts/runtime-check.mjs && node --check evals/creative/validator.mjs && node --check scripts/acceptance-gate.mjs && node --check scripts/access-preflight-check.mjs && node --check scripts/creative-metering-check.mjs && node --check src/contracts/validation.mjs && node --check src/contracts/scope.mjs && node --check src/contracts/creative/v1.mjs && node --check src/contracts/decision-port/v1.mjs && node --check src/contracts/metering.mjs && node --check src/contracts/approval-handoff.mjs && node --check src/contracts/index.mjs && node --check src/runtime/creative-runtime.mjs && node --check src/api/v1.mjs && node --check src/preflight/access.mjs && node --check src/preflight/openai-images.mjs && node --check src/preflight/index.mjs && node --check src/storage/content-addressed.mjs && node --check src/versions/store.mjs && node --check src/versions/api-ports.mjs && node --check src/versions/index.mjs && node --check src/telemetry/privacy.mjs && node --check src/telemetry/usage.mjs && node --check src/telemetry/evidence.mjs && node --check src/telemetry/retry.mjs && node --check src/telemetry/sqlite-outbox.mjs && node --check src/telemetry/index.mjs && node --check fixtures/versions/check.mjs",
+    "build": "node scripts/runtime-check.mjs && node --check evals/creative/validator.mjs && node --check scripts/acceptance-gate.mjs && node --check scripts/access-preflight-check.mjs && node --check scripts/creative-metering-check.mjs && node --check src/contracts/validation.mjs && node --check src/contracts/scope.mjs && node --check src/contracts/creative/v1.mjs && node --check src/contracts/decision-port/v1.mjs && node --check src/contracts/metering.mjs && node --check src/contracts/approval-handoff.mjs && node --check src/contracts/index.mjs && node --check src/runtime/creative-runtime.mjs && node --check src/api/v1.mjs && node --check src/planning/index.mjs && node --check src/planning/store.mjs && node --check src/preflight/access.mjs && node --check src/preflight/openai-images.mjs && node --check src/preflight/index.mjs && node --check src/storage/content-addressed.mjs && node --check src/versions/store.mjs && node --check src/versions/api-ports.mjs && node --check src/versions/index.mjs && node --check src/telemetry/privacy.mjs && node --check src/telemetry/usage.mjs && node --check src/telemetry/evidence.mjs && node --check src/telemetry/retry.mjs && node --check src/telemetry/sqlite-outbox.mjs && node --check src/telemetry/index.mjs && node --check fixtures/versions/check.mjs",
     "check:contracts": "node --test tests/contracts/creative-contract.test.mjs tests/contracts/fixture-manifest.test.mjs tests/contracts/dependency-boundary.test.mjs tests/contracts/acceptance-gate.test.mjs",
     "check:decision-contract": "node --test tests/contracts/decision-port.test.mjs tests/contracts/fixture-manifest.test.mjs tests/contracts/dependency-boundary.test.mjs tests/contracts/acceptance-gate.test.mjs",
     "check:eval-policy": "node --test tests/evaluation/*.test.mjs",
@@ -56,6 +60,7 @@
     "check:handoff-contract": "node --test tests/contracts/approval/*.test.mjs",
     "check:api": "node scripts/runtime-check.mjs && node scripts/api-check.mjs --out build/api-check-evidence.json",
     "check:access-preflight": "node --test tests/preflight/*.test.mjs",
+    "check:brief": "node --test tests/planning/brief.test.mjs tests/api/brief-api.test.mjs",
     "check:versions": "node fixtures/versions/check.mjs mock",
     "check:creative-metering": "node scripts/creative-metering-check.mjs",
     "test": "node --test tests/contracts/*.test.mjs tests/api/*.test.mjs"

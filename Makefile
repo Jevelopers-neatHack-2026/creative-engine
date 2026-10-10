@@ -1,4 +1,4 @@
-.PHONY: bootstrap build check acceptance typecheck-contracts typecheck-boundary-contracts typecheck-api typecheck-preflight typecheck-versions typecheck-telemetry
+.PHONY: bootstrap build check acceptance typecheck-contracts typecheck-boundary-contracts typecheck-api typecheck-preflight typecheck-versions typecheck-telemetry typecheck-brief
 
 TARGET ?= all
 MODE ?= mock
@@ -22,6 +22,7 @@ build:
 	node --check scripts/access-preflight-check.mjs
 	$(MAKE) typecheck-api
 	$(MAKE) typecheck-preflight
+	$(MAKE) typecheck-brief
 	$(MAKE) typecheck-versions
 	$(MAKE) typecheck-telemetry
 
@@ -39,6 +40,9 @@ typecheck-api:
 typecheck-preflight:
 	node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc -p tests/preflight/types/tsconfig.json
 
+typecheck-brief:
+	node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --noEmit --strict --skipLibCheck false --module NodeNext --moduleResolution NodeNext --target ES2022 tests/api/brief-public-consumer.mts
+
 typecheck-versions:
 	node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --noEmit --strict --skipLibCheck false --module NodeNext --moduleResolution NodeNext --target ES2022 tests/versions/public-consumer.mts
 
@@ -49,6 +53,7 @@ check:
 	@case "$(TARGET):$(MODE)" in \
 		access-preflight:mock) npm run check:access-preflight && node scripts/access-preflight-check.mjs --mode mock --out build/access-preflight-evidence.json && $(MAKE) typecheck-preflight ;; \
 		access-preflight:live) node scripts/access-preflight-check.mjs --mode live --out build/access-preflight-live-gate.json ;; \
+		brief:mock) npm run check:brief && $(MAKE) typecheck-brief ;; \
 		versions:mock) npm run check:versions ;; \
 		creative-metering:mock) npm run check:creative-metering && $(MAKE) typecheck-telemetry ;; \
 		contracts:mock) npm run check:contracts ;; \
@@ -58,7 +63,7 @@ check:
 		handoff-contract:mock) npm run check:handoff-contract && $(MAKE) typecheck-boundary-contracts ;; \
 		api:mock) npm run check:api && $(MAKE) typecheck-api ;; \
 		controls:mock) node fixtures/controls/check.mjs ;; \
-		all:mock) npm test && npm run check:eval-policy && npm run check:metering-contract && npm run check:handoff-contract && npm run check:access-preflight && node scripts/access-preflight-check.mjs --mode mock --out build/access-preflight-evidence.json && npm run check:versions && npm run check:creative-metering && $(MAKE) typecheck-contracts && $(MAKE) typecheck-api && $(MAKE) typecheck-preflight && $(MAKE) typecheck-telemetry && node fixtures/controls/check.mjs ;; \
+		all:mock) npm test && npm run check:eval-policy && npm run check:metering-contract && npm run check:handoff-contract && npm run check:access-preflight && node scripts/access-preflight-check.mjs --mode mock --out build/access-preflight-evidence.json && npm run check:brief && npm run check:versions && npm run check:creative-metering && $(MAKE) typecheck-contracts && $(MAKE) typecheck-api && $(MAKE) typecheck-preflight && $(MAKE) typecheck-brief && $(MAKE) typecheck-telemetry && node fixtures/controls/check.mjs ;; \
 		*) echo "Unsupported TARGET=$(TARGET) MODE=$(MODE): only offline mock checks are implemented and no live provider dispatch exists; access-preflight's live gate is fail-closed." >&2; exit 2 ;; \
 	esac
 

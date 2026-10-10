@@ -62,6 +62,51 @@
         "record": null
       }
     },
+    "event_intelligence_asset_permission_protocol": {
+      "triage": "CE-02",
+      "owner_role": "Agent and research",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/event-intelligence/issues/18",
+      "required_outcome": "Publish exact allowed, unknown, denied, expired, and revoked asset states with tenant/project, package, asset, content hash, action, expiry, and verification semantics.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null,
+      "accepted_inputs": [],
+      "independent_verification": {
+        "status": "pending",
+        "record": null
+      }
+    },
+    "event_intelligence_invalidation_delivery": {
+      "triage": "CE-02",
+      "owner_role": "Agent and research",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/event-intelligence/issues/20",
+      "required_outcome": "Agree authenticated, durable, idempotent correction, rights, and freshness invalidation delivery and producer acknowledgment semantics.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null,
+      "accepted_inputs": [],
+      "independent_verification": {
+        "status": "pending",
+        "record": null
+      }
+    },
+    "application_approval_staleness_consumer": {
+      "triage": "CE-02",
+      "owner_role": "Product and frontend",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/getticketstub.com/issues/1",
+      "required_outcome": "Accept durable approval-staleness requests and acknowledgments and enforce stale approval at actual consumption after brief fact or asset changes.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null,
+      "accepted_inputs": [],
+      "independent_verification": {
+        "status": "pending",
+        "record": null
+      }
+    },
     "shared_contracts_decision_port": {
       "triage": "CE-C02",
       "owner_role": "Agent and research",
