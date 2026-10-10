@@ -1,0 +1,17 @@
+{
+  "negative_cases": [
+    "missing_question_key",
+    "foreign_question_key",
+    "unknown_choice",
+    "invalid_probability_distribution",
+    "invalid_score_legend",
+    "non_finite_score",
+    "fabricated_noul_confidence",
+    "unsupported_question_version",
+    "unsupported_model_version",
+    "unsupported_policy_version",
+    "missing_budget_or_cancel_reference",
+    "result_scope_mismatch"
+  ],
+  "safe_outcomes": ["timeout", "abstain", "cancelled", "untrusted_source_injection"]
+}
