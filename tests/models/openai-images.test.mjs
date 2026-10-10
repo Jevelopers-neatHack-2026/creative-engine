@@ -11,7 +11,7 @@ import {
   normalizeOpenAIImageUsage,
 } from "../../src/models/openai-images.mjs";
 import { readPrivateOpenAIImageRequestId } from "../../src/models/openai-images.mjs";
-import { corruptPngCrc, makeInvalidIndexedPng, makePng, makePng16Rgba } from "../../fixtures/models/png.mjs";
+import { chunk, corruptPngCrc, makeInvalidIndexedPng, makePng, makePng16Rgba } from "../../fixtures/models/png.mjs";
 
 const MODEL = "gpt-image-2.5-sunburst-2026-09-08";
 const NOW = Date.parse("2026-10-10T18:00:00.000Z");
@@ -68,6 +68,13 @@ function input(operation = "generate", overrides = {}) {
     controller,
     recordTransportAttempt: async (id) => {
       assert.equal(id, "transport-image-001");
+      return "dispatch-image-001";
+    },
+    revalidateDispatch: async (binding) => {
+      assert.equal(binding.transport_attempt_id, "transport-image-001");
+      assert.equal(binding.billable_attempt_id, "billable-image-001");
+      assert.equal(binding.reservation_ref, "reservation-image-001");
+      assert.match(binding.target_binding_sha256, /^sha256:[a-f0-9]{64}$/);
       return "dispatch-image-001";
     },
     ...overrides,
@@ -197,6 +204,7 @@ function providerHarness({ operation = "generate", outputBytes = makePng(), usag
   const events = ports.events ?? [];
   const authority = makeAuthorityPorts({ now, events, ...ports });
   let fetchCount = 0;
+  let lastRequestBody;
   const interceptedFetch = fetchImpl ?? (async () => responseImage(outputBytes, usage));
   const provider = createOpenAIImagesProvider({
     model_id: MODEL,
@@ -221,13 +229,14 @@ function providerHarness({ operation = "generate", outputBytes = makePng(), usag
     fetchImpl: async (url, init) => {
       events.push("fetch.called");
       fetchCount += 1;
+      lastRequestBody = init.body;
       return interceptedFetch(url, init);
     },
     now,
     idFactory: () => "generated-artifact-01",
   });
   const ctx = input(operation, inputOverride);
-  return { provider, ctx, events, get fetchCount() { return fetchCount; } };
+  return { provider, ctx, events, get fetchCount() { return fetchCount; }, get lastRequestBody() { return lastRequestBody; } };
 }
 
 test("explicit candidate pins remain unevaluated and prototype model names are rejected", () => {
@@ -612,6 +621,28 @@ test("transport acknowledgement is awaited and must confirm the exact dispatch i
   });
 });
 
+test("the last awaited runtime dispatch fence follows all provider authority revalidation", async (t) => {
+  await t.test("runtime fence rejection prevents POST", async () => {
+    const events = [];
+    const harness = providerHarness({ ports: { events }, inputOverride: {
+      async revalidateDispatch() { events.push("runtime.dispatch.revalidate"); throw new Error("private runtime detail"); },
+    } });
+    await assert.rejects(harness.provider.generate(harness.ctx), (error) => {
+      assert.equal(error.code, "dispatch_fence_closed");
+      assert.doesNotMatch(JSON.stringify(error), /private runtime detail/);
+      return true;
+    });
+    assert.equal(harness.fetchCount, 0);
+    assert.ok(events.indexOf("authority.post_transport_ack") < events.indexOf("capability.revalidate"));
+    assert.ok(events.indexOf("capability.revalidate") < events.indexOf("runtime.dispatch.revalidate"));
+  });
+  await t.test("wrong dispatch identity prevents POST", async () => {
+    const harness = providerHarness({ inputOverride: { async revalidateDispatch() { return "dispatch-foreign"; } } });
+    await assert.rejects(harness.provider.generate(harness.ctx), (error) => error.code === "dispatch_fence_closed");
+    assert.equal(harness.fetchCount, 0);
+  });
+});
+
 test("grant revocation or expiry during C03 acknowledgement prevents POST and publication", async (t) => {
   for (const mode of ["revoked", "expired", "finance-lease-expired", "capability-revoked", "capability-expired", "credential-expired"]) await t.test(mode, async () => {
     let fetchCount = 0;
@@ -733,6 +764,83 @@ test("partial and missing provider usage remains raw, identity-bound, and unknow
   assert.equal(readPrivateOpenAIImageRequestId(missingUsage), "req-private-fixture-id");
 });
 
+test("public usage normalizer rejects accessor-backed counters and identities without invoking them", () => {
+  let getterCalls = 0;
+  const usage = Object.defineProperty({}, "input_tokens", {
+    enumerable: true,
+    get() { getterCalls += 1; throw new Error("Bearer synthetic-private-usage"); },
+  });
+  const detail = Object.defineProperty({}, "image_tokens", {
+    enumerable: true,
+    get() { getterCalls += 1; throw new Error("Bearer synthetic-private-detail"); },
+  });
+  const identities = Object.defineProperty({}, "provider_request_id", {
+    enumerable: true,
+    get() { getterCalls += 1; throw new Error("Bearer synthetic-private-id"); },
+  });
+  for (const [raw, refs] of [[usage, {}], [{ input_tokens_details: detail }, {}], [{ input_tokens: 1 }, identities]]) {
+    assert.throws(() => normalizeOpenAIImageUsage(raw, refs), (error) => {
+      assert.ok(error instanceof OpenAIImagesProviderError);
+      assert.equal(error.code, "usage_invalid");
+      assert.doesNotMatch(JSON.stringify(error), /synthetic-private|Bearer/);
+      return true;
+    });
+  }
+  assert.equal(getterCalls, 0);
+  let proxyTrapCalls = 0;
+  const proxy = new Proxy({}, { ownKeys() { proxyTrapCalls += 1; throw new Error("Bearer proxy marker"); } });
+  assert.throws(() => normalizeOpenAIImageUsage(proxy), (error) => {
+    assert.ok(error instanceof OpenAIImagesProviderError);
+    assert.equal(error.code, "usage_invalid");
+    assert.doesNotMatch(JSON.stringify(error), /proxy marker|Bearer/);
+    return true;
+  });
+  assert.equal(proxyTrapCalls, 0, "proxy detection rejects before invoking the ownKeys trap");
+  assert.equal(normalizeOpenAIImageUsage({ input_tokens: 10, output_tokens: 3 }, {
+    transport_attempt_id: "transport-safe-01",
+  }).input_tokens, 10);
+});
+
+test("documented prompt and mask limits reject before POST and accept exact prompt and mask boundaries", async (t) => {
+  for (const operation of ["generate", "edit"]) await t.test(`${operation} prompt bound`, async () => {
+    for (const prompt of ["x".repeat(32_000), "😀".repeat(32_000)]) {
+      const accepted = providerHarness({ operation, promptPort: { render: () => prompt },
+        assetPort: { async readArtifact() { return makePng(); }, async readReference() { return makePng({ transparent: true }); } } });
+      const result = await accepted.provider[operation](accepted.ctx);
+      assert.equal(result.usage.completeness, "unknown");
+      assert.equal(accepted.fetchCount, 1);
+      const postedPrompt = operation === "generate"
+        ? JSON.parse(accepted.lastRequestBody ?? "null")?.prompt
+        : accepted.lastRequestBody?.get("prompt");
+      assert.equal(postedPrompt, prompt);
+    }
+    const rejected = providerHarness({ operation, promptPort: { render: () => "😀".repeat(32_001) },
+      assetPort: { async readArtifact() { return makePng(); }, async readReference() { return makePng({ transparent: true }); } } });
+    await assert.rejects(rejected.provider[operation](rejected.ctx), (error) => error.code === "prompt_invalid");
+    assert.equal(rejected.fetchCount, 0);
+  });
+
+  const maskBase = makePng({ transparent: true });
+  const maskLimit = 4 * 1024 * 1024 - 1;
+  const padding = Buffer.alloc(maskLimit - maskBase.length - 12);
+  const paddedMask = Buffer.concat([maskBase.subarray(0, maskBase.length - 12), chunk("ruST", padding), maskBase.subarray(-12)]);
+  assert.equal(paddedMask.byteLength, maskLimit);
+  const acceptedMask = providerHarness({ operation: "edit", assetPort: {
+    async readArtifact() { return makePng(); }, async readReference() { return paddedMask; },
+  } });
+  await acceptedMask.provider.edit(acceptedMask.ctx);
+  assert.equal(acceptedMask.fetchCount, 1);
+
+  const oversizedMask = Buffer.concat([maskBase.subarray(0, maskBase.length - 12),
+    chunk("ruST", Buffer.alloc(maskLimit + 1 - maskBase.length - 12)), maskBase.subarray(-12)]);
+  assert.equal(oversizedMask.byteLength, maskLimit + 1);
+  const rejectedMask = providerHarness({ operation: "edit", assetPort: {
+    async readArtifact() { return makePng(); }, async readReference() { return oversizedMask; },
+  } });
+  await assert.rejects(rejectedMask.provider.edit(rejectedMask.ctx), (error) => error.code === "mask_invalid");
+  assert.equal(rejectedMask.fetchCount, 0);
+});
+
 test("public usage references preserve safe transport identity and screen sensitive identity values", async (t) => {
   const safeProviderRef = normalizeOpenAIImageUsage({}, {
     transport_attempt_id: "transport-image-001", provider_request_id: "provider-request-safe-hash",
@@ -802,7 +910,11 @@ test("observed raw usage accompanies failed outcomes without publishing artifact
   for (const [name, makeResponse, code] of cases) await t.test(name, async () => {
     const retainedUsage = [];
     const harness = providerHarness({ fetchImpl: async () => makeResponse(harness),
-      inputOverride: { recordPrivateProviderUsage: async (value) => { retainedUsage.push(value); } } });
+      inputOverride: { recordPrivateProviderUsage: async (value) => {
+        retainedUsage.push(value);
+        return { status: "recorded", transport_attempt_id: value.usage.transport_attempt_id,
+          target_binding_sha256: value.target_binding_sha256, usage_sha256: "sha256:" + "a".repeat(64) };
+      } } });
     let failure;
     try { await harness.provider.generate(harness.ctx); } catch (error) { failure = error; }
     assert.ok(failure instanceof OpenAIImagesProviderError);
@@ -838,15 +950,50 @@ test("observed raw usage accompanies failed outcomes without publishing artifact
     recordPrivateProviderUsage: async () => { throw new Error("Bearer private-store-secret"); },
   } });
   await assert.rejects(persistenceFailure.provider.generate(persistenceFailure.ctx), (error) => {
-    assert.equal(error.code, "private_usage_attribution_unavailable");
+    assert.equal(error.code, "private_attribution_unavailable");
     assert.equal(error.provider_outcome, "unknown");
     assert.equal(error.usage.completeness, "unknown");
-    assert.ok(error.usage.missing_fields.includes("usage.unmapped_fields"));
+    assert.ok(error.usage.missing_fields.includes("private_attribution_unavailable"));
     assert.equal(Object.hasOwn(error, "artifact"), false);
     assert.doesNotMatch(JSON.stringify(error), /private-store-secret|Bearer/);
     return true;
   });
   assert.equal(persistenceFailure.fetchCount, 1, "failed private attribution never triggers an automatic retry");
+});
+
+test("failed or mismatched private attribution ACK stages bounded usage for reconciliation and never publishes", async () => {
+  const staged = [];
+  const rawId = "req-private-stage-fixture-01";
+  const harness = providerHarness({ inputOverride: {
+    async recordPrivateProviderRequestId() { return { status: "unavailable" }; },
+    async recordPrivateProviderUsage(value) {
+      return { status: "recorded", transport_attempt_id: "transport-foreign",
+        target_binding_sha256: value.target_binding_sha256 };
+    },
+    async stagePrivateProviderAttribution(value) {
+      staged.push(value);
+      return { status: "staged", pending_ref: "private-attribution:fixture-01",
+        transport_attempt_id: "transport-image-001", payload_sha256: TEST_HASH };
+    },
+  }, fetchImpl: async () => new Response(JSON.stringify({ data: [{ b64_json: makePng().toString("base64") }],
+    usage: { input_tokens: 12, output_tokens: 8, total_tokens: 20 } }),
+  { status: 200, headers: { "content-type": "application/json", "x-request-id": rawId } }) });
+  await assert.rejects(harness.provider.generate(harness.ctx), (error) => {
+    assert.equal(error.code, "private_attribution_unavailable");
+    assert.equal(error.provider_outcome, "unknown");
+    assert.equal(error.usage.input_tokens, 12);
+    assert.equal(error.usage.output_tokens, 8);
+    assert.equal(error.usage.total_tokens, 20);
+    assert.ok(error.usage.missing_fields.includes("private_attribution_pending_reconciliation"));
+    assert.equal(Object.hasOwn(error, "artifact"), false);
+    assert.doesNotMatch(JSON.stringify(error), /req-private-stage-fixture-01/);
+    return true;
+  });
+  assert.equal(harness.fetchCount, 1);
+  assert.equal(staged.length, 1);
+  assert.equal(staged[0].provider_request_id, rawId);
+  assert.equal(staged[0].usage.input_tokens, 12);
+  assert.equal(staged[0].usage.transport_attempt_id, "transport-image-001");
 });
 
 test("provider output refusal, malformed base64, timeout, and post-response deadline never publish an artifact", async (t) => {

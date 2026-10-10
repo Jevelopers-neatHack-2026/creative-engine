@@ -13,7 +13,7 @@ function crc32(bytes) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-function chunk(name, data) {
+export function chunk(name, data) {
   const type = Buffer.from(name, "ascii");
   const result = Buffer.alloc(12 + data.length);
   result.writeUInt32BE(data.length, 0);

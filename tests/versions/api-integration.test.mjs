@@ -1150,6 +1150,72 @@ test("actual paired API cancellation after dispatch fences publication and retai
     .get(job.job_id).count, 0, "late provider completion cannot create visible version intent after cancellation");
 });
 
+test("private provider attribution can be durably staged and reconciled after restart without redispatch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-provider-attribution-reconcile-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const databasePath = join(root, "versions.sqlite");
+  const objectRoot = join(root, "objects");
+  const brief = await fixture("brief");
+  let store = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  t.after(() => store?.close());
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief });
+  const basePorts = () => createCreativeVersionApiPorts({ store, idFactory: () => "attribution-dispatch-id" }).ports;
+  let ports = basePorts();
+  const action_id = "action-private-pending-01";
+  const request_hash = canonicalHash({ action_id, operation: "generate" });
+  const started = await ports.jobs.begin({ scope: SCOPE, actor_id: "actor-api-1", action_id,
+    request_hash, operation: "generate" });
+  assert.equal(started.kind, "started");
+  const transport_attempt_id = "transport-private-pending-01";
+  const billable_attempt_id = "billable-private-pending-01";
+  const reservation_ref = "reservation-private-pending-01";
+  const authorized = await ports.jobs.authorizeDispatch({ scope: SCOPE, actor_id: "actor-api-1",
+    job_id: started.job_id, lease_token: started.lease_token, action_id, operation: "generate",
+    billable_attempt_id, reservation_ref, provider_name: "openai", provider_model: "gpt-image-2.5-sunburst-2026-09-08",
+    transport_attempt_id, context_fence: { brief_id: SCOPE.brief_id, brief_hash: canonicalHash(brief),
+      expected_current_design_version_id: null, expected_current_design_hash: null } });
+  assert.equal(authorized.status, "authorized");
+  const provider_request_id = "req-private-reconcile-fixture-01";
+  const provider_request_ref = `provider-request-${createHash("sha256").update(provider_request_id).digest("hex")}`;
+  const usage = { completeness: "unknown", missing_fields: ["usage.profile_mapping_pending"],
+    transport_attempt_id, provider_request_id: provider_request_ref, input_tokens: 12,
+    output_tokens: 8, total_tokens: 20 };
+  const pending = await ports.jobs.stagePrivateProviderAttribution({ scope: SCOPE, actor_id: "actor-api-1",
+    job_id: started.job_id, action_id, request_hash, operation: "generate", provider: "openai",
+    model: "gpt-image-2.5-sunburst-2026-09-08", reservation_ref, billable_attempt_id,
+    transport_attempt_id, dispatch_intent_ref: authorized.dispatch_intent_ref,
+    target_binding_sha256: `sha256:${"c".repeat(64)}`, provider_request_id, provider_request_ref, usage });
+  assert.equal(pending.status, "staged");
+  assert.equal(pending.transport_attempt_id, transport_attempt_id);
+  assert.match(pending.payload_sha256, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM private_provider_attributions").get().count, 0);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM private_provider_usage_attributions").get().count, 0);
+  const pendingRow = store.db.prepare("SELECT payload_json FROM private_provider_attribution_pending WHERE pending_ref=?")
+    .get(pending.pending_ref);
+  assert.ok(pendingRow);
+  assert.match(pendingRow.payload_json, /req-private-reconcile-fixture-01/,
+    "raw response identity remains in restricted durable storage");
+
+  store.close();
+  store = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  ports = basePorts();
+  const reconciled = await ports.jobs.reconcilePrivateProviderAttributions({ scope: SCOPE, limit: 10 });
+  assert.deepEqual(reconciled, { reconciled: 1, remaining: 0 });
+  const rawRequest = store.db.prepare(`SELECT provider_request_id,provider_request_ref,transport_attempt_id
+    FROM private_provider_attributions WHERE job_id=?`).get(started.job_id);
+  assert.equal(rawRequest.provider_request_id, provider_request_id);
+  assert.equal(rawRequest.provider_request_ref, provider_request_ref);
+  assert.equal(rawRequest.transport_attempt_id, transport_attempt_id);
+  const rawUsage = store.db.prepare(`SELECT usage_sha256,usage_json FROM private_provider_usage_attributions
+    WHERE job_id=?`).get(started.job_id);
+  assert.ok(rawUsage);
+  assert.equal(canonicalHash(JSON.parse(rawUsage.usage_json)), rawUsage.usage_sha256);
+  assert.equal(JSON.parse(rawUsage.usage_json).input_tokens, 12);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM private_provider_attribution_reconciliations").get().count, 1);
+  assert.deepEqual(await ports.jobs.reconcilePrivateProviderAttributions({ scope: SCOPE, limit: 10 }),
+    { reconciled: 0, remaining: 0 }, "replay does not create duplicates or call any provider");
+});
+
 test("artifact corruption inside paired publication rolls back the caller-owned SQLite transaction", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "creative-version-corrupt-publish-"));
   t.after(async () => rm(root, { recursive: true, force: true }));

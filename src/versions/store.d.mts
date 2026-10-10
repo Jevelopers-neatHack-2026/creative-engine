@@ -1,7 +1,8 @@
 import type { CreativeVersionCreationEvidence } from "../api/v1.mjs";
 import type { CreativeBrief, DesignVersion, TrustedScope } from "../contracts/creative/v1.mjs";
 import type { CreativePublicationTransaction, DesignSelection, PrivateProviderRequestAttribution,
-  PrivateProviderUsageAttribution } from "../api/v1.mjs";
+  PrivateProviderUsageAttribution, PrivateProviderAttributionPending,
+  PrivateProviderAttributionPendingResult } from "../api/v1.mjs";
 
 export type VersionStoreErrorCode = "invalid_request" | "unsupported_version" | "scope_denied" | "not_found"
   | "conflict" | "stale_version" | "integrity_error" | "unknown_completion" | "unavailable" | "cancelled";
@@ -75,10 +76,13 @@ export class CreativeVersionStore {
     Readonly<{ status: "recorded" | "replayed" }>;
   /** Private backend-only request identity persistence; raw values are never returned by public job/version reads. */
   recordPrivateProviderAttribution(input: PrivateProviderRequestAttribution):
-    Readonly<{ status: "recorded" | "replayed" }>;
+    import("../api/v1.mjs").PrivateProviderRequestAttributionResult;
   /** Retain bounded sanitized provider usage separately from any owner mapping or Finance settlement. */
   recordPrivateProviderUsageAttribution(input: PrivateProviderUsageAttribution):
-    Readonly<{ status: "recorded" | "replayed" }>;
+    import("../api/v1.mjs").PrivateProviderUsageAttributionResult;
+  stagePrivateProviderAttribution(input: PrivateProviderAttributionPending): PrivateProviderAttributionPendingResult;
+  reconcilePrivateProviderAttributions(input: { scope: VersionScope; limit?: number }):
+    Readonly<{ reconciled: number; remaining: number }>;
   saveDesignVersion(input: VersionWriteInput, options?: { faultInjector?: (point: string) => void }): Promise<VersionWriteResult>;
   prepareDesignVersion(input: VersionWriteInput, options?: { faultInjector?: (point: string) => void }): Promise<VersionWriteResult>;
   commitPreparedDesignVersion(input: { scope: VersionScope; brief_id: string; action_id: string; job_id: string;

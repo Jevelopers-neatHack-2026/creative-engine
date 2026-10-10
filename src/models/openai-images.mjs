@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { types as utilTypes } from "node:util";
 import { inflateSync } from "node:zlib";
 import { decodeOpenAIImageRgba, ImageCodecUnavailableError } from "./codec-runtime/index.mjs";
 
@@ -6,6 +7,8 @@ const GENERATION_ENDPOINT = "https://api.openai.com/v1/images/generations";
 const EDIT_ENDPOINT = "https://api.openai.com/v1/images/edits";
 const RETRY_MAPPING_REF = "openai-images-direct/retry-policy-v1";
 const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+const MAX_EDIT_MASK_BYTES = 4 * 1024 * 1024 - 1;
+const MAX_PROMPT_CODE_POINTS = 32_000;
 const MAX_EDIT_INPUT_BYTES = 100 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = Math.ceil(MAX_IMAGE_BYTES * 4 / 3) + 1024 * 1024;
 const MAX_DECODED_BYTES = 64 * 1024 * 1024;
@@ -157,11 +160,15 @@ function snapshotProviderInput(value) {
     dispatch_intent_ref: value.dispatch_intent_ref,
     reservation_ref: value.reservation_ref,
     recordTransportAttempt: value.recordTransportAttempt,
+    revalidateDispatch: value.revalidateDispatch,
     ...(typeof value.recordPrivateProviderRequestId === "function" ? {
       recordPrivateProviderRequestId: value.recordPrivateProviderRequestId,
     } : {}),
     ...(typeof value.recordPrivateProviderUsage === "function" ? {
       recordPrivateProviderUsage: value.recordPrivateProviderUsage,
+    } : {}),
+    ...(typeof value.stagePrivateProviderAttribution === "function" ? {
+      stagePrivateProviderAttribution: value.stagePrivateProviderAttribution,
     } : {}),
     signal: value.signal,
     deadline_at: value.deadline_at,
@@ -745,29 +752,67 @@ function freezeUsageObservation(result) {
 }
 
 /** Preserve allowlisted provider counters; only a reviewed owner profile may map them for settlement. */
-export function normalizeOpenAIImageUsage(raw, { transport_attempt_id, provider_request_id } = {}) {
+export function normalizeOpenAIImageUsage(raw, identities = {}) {
+  const snapshotData = (value, field, allowedKeys, { rejectUnknown = false } = {}) => {
+    if (value === null || typeof value !== "object") return undefined;
+    // util.types.isProxy is a native brand check and does not invoke proxy
+    // traps. Reject before Array.isArray/getPrototypeOf/ownKeys can do so.
+    if (utilTypes.isProxy(value)) {
+      fail("usage_invalid", "Provider usage must contain bounded data fields.", { outcome: "unknown", field });
+    }
+    if (!isRecord(value)) return undefined;
+    let descriptors;
+    let keys;
+    try {
+      keys = Reflect.ownKeys(value);
+      if (keys.length > 32 || keys.some((key) => typeof key !== "string")) {
+        fail("usage_invalid", "Provider usage must contain bounded data fields.", { outcome: "unknown", field });
+      }
+      descriptors = Object.getOwnPropertyDescriptors(value);
+    } catch {
+      fail("usage_invalid", "Provider usage must contain bounded data fields.", { outcome: "unknown", field });
+    }
+    const result = Object.create(null);
+    for (const key of keys) {
+      const descriptor = descriptors[key];
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+        fail("usage_invalid", "Provider usage accessors are not accepted.", { outcome: "unknown", field });
+      }
+      if (rejectUnknown && !allowedKeys.has(key)) {
+        fail("usage_invalid", "Provider usage contains an unsupported field.", { outcome: "unknown", field });
+      }
+      result[key] = descriptor.value;
+    }
+    return result;
+  };
+  const identityData = snapshotData(identities, "usage.identities", new Set(["transport_attempt_id", "provider_request_id"]), { rejectUnknown: true }) ?? Object.create(null);
+  const transport_attempt_id = identityData.transport_attempt_id;
+  const provider_request_id = identityData.provider_request_id;
   const result = { completeness: "unknown", missing_fields: ["usage.profile_mapping_pending"] };
   if (transport_attempt_id !== undefined) result.transport_attempt_id = checkRef(transport_attempt_id, "transport_attempt_id");
   const safeRequestRef = safeProviderRequestRef(provider_request_id);
   if (safeRequestRef) result.provider_request_id = safeRequestRef;
   if (typeof provider_request_id === "string") PRIVATE_PROVIDER_REQUEST_IDS.set(result, provider_request_id);
-  if (!isRecord(raw)) {
+  const rawData = snapshotData(raw, "usage", new Set([
+    "input_tokens", "output_tokens", "total_tokens", "input_tokens_details", "output_tokens_details",
+  ]));
+  if (!rawData) {
     result.missing_fields = Object.freeze(["usage"]);
     return freezeUsageObservation(result);
   }
 
   const missing = new Set(result.missing_fields);
   for (const name of ["input_tokens", "output_tokens", "total_tokens"]) {
-    if (!Object.hasOwn(raw, name)) { missing.add(`usage.${name}`); continue; }
-    const quantity = exactUsage(raw[name]);
+    if (!Object.hasOwn(rawData, name)) { missing.add(`usage.${name}`); continue; }
+    const quantity = exactUsage(rawData[name]);
     if (quantity === undefined) missing.add(`usage.${name}`);
     else result[name] = Number(quantity);
   }
   for (const parent of ["input_tokens", "output_tokens"]) {
     const detailsKey = `${parent}_details`;
-    if (!Object.hasOwn(raw, detailsKey)) { missing.add(`usage.${detailsKey}`); continue; }
-    const details = raw[detailsKey];
-    if (!isRecord(details)) { missing.add(`usage.${detailsKey}`); continue; }
+    if (!Object.hasOwn(rawData, detailsKey)) { missing.add(`usage.${detailsKey}`); continue; }
+    const details = snapshotData(rawData[detailsKey], `usage.${detailsKey}`, new Set(["text_tokens", "image_tokens"]));
+    if (!details) { missing.add(`usage.${detailsKey}`); continue; }
     const safeDetails = {};
     for (const part of ["text_tokens", "image_tokens"]) {
       if (!Object.hasOwn(details, part)) { missing.add(`usage.${detailsKey}.${part}`); continue; }
@@ -780,7 +825,7 @@ export function normalizeOpenAIImageUsage(raw, { transport_attempt_id, provider_
     }
     result[detailsKey] = Object.freeze(safeDetails);
   }
-  if (Object.keys(raw).some((key) => ![
+  if (Object.keys(rawData).some((key) => ![
     "input_tokens", "output_tokens", "total_tokens", "input_tokens_details", "output_tokens_details",
   ].includes(key))) missing.add("usage.unmapped_fields");
   result.missing_fields = Object.freeze([...missing]);
@@ -870,7 +915,8 @@ function validateAttempt(input, operation, profile) {
       input.attempt.tenant_id !== input.scope.tenant_id || input.attempt.project_id !== input.scope.project_id ||
       typeof input.attempt.budget_scope_id !== "string" || !input.attempt.billable_attempt_id ||
       !isDate(input.deadline_at) || !input.signal || typeof input.signal.aborted !== "boolean" ||
-      typeof input.recordTransportAttempt !== "function" || typeof input.dispatch_intent_ref !== "string" ||
+      typeof input.recordTransportAttempt !== "function" || typeof input.revalidateDispatch !== "function" ||
+      typeof input.dispatch_intent_ref !== "string" ||
       typeof input.reservation_ref !== "string" || !OPAQUE_REF.test(input.reservation_ref) ||
       typeof input.transport_attempt_id !== "string" || !OPAQUE_REF.test(input.transport_attempt_id)) {
     fail("provider_attempt_mismatch", "Metered attempt does not match the pinned image operation.", { outcome: "failed" });
@@ -1098,7 +1144,7 @@ async function prepareEditAssets(input, assetPort) {
     }
     const rawMask = await callTrustedPort("mask_unavailable", "The scoped edit mask could not be read.", () =>
       assetPort.readReference({ scope: input.scope, source_ref: maskRef, expected_media_type: "image/png" }), "failed");
-    if (!(rawMask instanceof Uint8Array) || rawMask.byteLength === 0 || rawMask.byteLength > MAX_IMAGE_BYTES) {
+    if (!(rawMask instanceof Uint8Array) || rawMask.byteLength === 0 || rawMask.byteLength > MAX_EDIT_MASK_BYTES) {
       fail("mask_invalid", "Mask bytes are empty or exceed the boundary limit.", { outcome: "failed" });
     }
     const bytes = Buffer.from(rawMask);
@@ -1127,7 +1173,8 @@ function makePrompt(input, promptPort, operation) {
       base_design: input.base_design ?? null, decision_result: input.decision_result }), "failed")
     .then((result) => {
       const text = typeof result === "string" ? result : result?.prompt;
-      if (typeof text !== "string" || text.trim().length === 0 || Buffer.byteLength(text, "utf8") > 64_000) {
+      if (typeof text !== "string" || text.trim().length === 0 || Buffer.byteLength(text, "utf8") > 128_000 ||
+          [...text].length > MAX_PROMPT_CODE_POINTS) {
         fail("prompt_invalid", "Prompt renderer did not return bounded prompt text.", { outcome: "failed" });
       }
       return text;
@@ -1191,23 +1238,13 @@ function knownProviderError(payload, status) {
 }
 
 async function providerError(response, retryContext, providerRequestRef, rawProviderRequestId, transportAttemptId,
-  targetBindingSha256, recordPrivateProviderUsage, now) {
+  targetBindingSha256, input, now) {
   let payload;
   try { payload = await readJsonBounded(response); } catch { payload = {}; }
   const mapped = knownProviderError(payload, response.status);
   let usage = usageFromPayload(payload, transportAttemptId, rawProviderRequestId, targetBindingSha256);
-  if (usage && typeof recordPrivateProviderUsage === "function") {
-    try {
-      await recordPrivateProviderUsage(Object.freeze({ target_binding_sha256: targetBindingSha256, usage }));
-    } catch {
-      usage = normalizeOpenAIImageUsage({
-        ...usage,
-        completeness: "unknown",
-        missing_fields: [...usage.missing_fields, "private_usage_attribution_unavailable"],
-      }, { transport_attempt_id: transportAttemptId, provider_request_id: rawProviderRequestId });
-      if (typeof targetBindingSha256 === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetBindingSha256);
-    }
-  }
+  usage = await recordProviderResponseAttribution(input, { transportAttemptId, targetBindingSha256,
+    rawProviderRequestId, providerRequestRef, usage });
   let retry;
   if ((response.status === 429 && mapped.code === "provider_rate_limited") || response.status === 503) {
     const errorNow = now();
@@ -1225,6 +1262,72 @@ async function providerError(response, retryContext, providerRequestRef, rawProv
   }
   fail(mapped.code, "Provider returned a bounded failure response.", {
     outcome: mapped.outcome, http_status: response.status, retry, provider_request_ref: providerRequestRef, usage,
+    private_provider_request_id: rawProviderRequestId,
+  });
+}
+
+function usageWithMissingField(usage, field, rawProviderRequestId, targetBindingSha256) {
+  if (!usage) return undefined;
+  const updated = Object.freeze({ ...usage, completeness: "unknown",
+    missing_fields: Object.freeze([...new Set([...usage.missing_fields, field])]) });
+  if (typeof rawProviderRequestId === "string") PRIVATE_PROVIDER_REQUEST_IDS.set(updated, rawProviderRequestId);
+  if (typeof targetBindingSha256 === "string") PRIVATE_TARGET_BINDING_SHA256.set(updated, targetBindingSha256);
+  return updated;
+}
+
+async function recordProviderResponseAttribution(input, { transportAttemptId, targetBindingSha256,
+  rawProviderRequestId, providerRequestRef, usage }) {
+  let unavailable = false;
+  if (typeof rawProviderRequestId === "string") {
+    if (!providerRequestRef || Buffer.byteLength(rawProviderRequestId, "utf8") > 512 ||
+        /[\u0000-\u001f\u007f]/.test(rawProviderRequestId)) {
+      return fail("private_attribution_unavailable", "Provider response attribution is outside the bounded private record contract.", {
+        outcome: "unknown", provider_request_ref: providerRequestRef, usage: usageWithMissingField(usage,
+          "private_attribution_unavailable", rawProviderRequestId, targetBindingSha256),
+        private_provider_request_id: rawProviderRequestId,
+      });
+    }
+    if (typeof input.recordPrivateProviderRequestId === "function") {
+      try {
+        const ack = await input.recordPrivateProviderRequestId(Object.freeze({
+          provider_request_id: rawProviderRequestId, provider_request_ref: providerRequestRef,
+        }));
+        if (!isRecord(ack) || !["recorded", "replayed"].includes(ack.status) ||
+            ack.transport_attempt_id !== transportAttemptId || ack.provider_request_ref !== providerRequestRef) unavailable = true;
+      } catch { unavailable = true; }
+    }
+  }
+  if (usage && typeof input.recordPrivateProviderUsage === "function") {
+    try {
+      const ack = await input.recordPrivateProviderUsage(Object.freeze({ target_binding_sha256: targetBindingSha256, usage }));
+      if (!isRecord(ack) || !["recorded", "replayed"].includes(ack.status) ||
+          ack.transport_attempt_id !== transportAttemptId || ack.target_binding_sha256 !== targetBindingSha256) unavailable = true;
+    } catch { unavailable = true; }
+  }
+  if (!unavailable) return usage;
+
+  let staged = false;
+  if (typeof input.stagePrivateProviderAttribution === "function") {
+    try {
+      const ack = await input.stagePrivateProviderAttribution(Object.freeze({
+        target_binding_sha256: targetBindingSha256,
+        ...(typeof rawProviderRequestId === "string" ? {
+          provider_request_id: rawProviderRequestId, provider_request_ref: providerRequestRef,
+        } : {}),
+        ...(usage ? { usage } : {}),
+      }));
+      staged = isRecord(ack) && ["staged", "replayed"].includes(ack.status) &&
+        typeof ack.pending_ref === "string" && ack.transport_attempt_id === transportAttemptId &&
+        typeof ack.payload_sha256 === "string" && HASH.test(ack.payload_sha256);
+    } catch { staged = false; }
+  }
+  const retained = usageWithMissingField(usage,
+    staged ? "private_attribution_pending_reconciliation" : "private_attribution_unavailable",
+    rawProviderRequestId, targetBindingSha256);
+  fail("private_attribution_unavailable", staged
+    ? "Provider response attribution is durably staged but awaits local reconciliation."
+    : "Provider response attribution could not be durably recorded.", {
+    outcome: "unknown", provider_request_ref: providerRequestRef, usage: retained,
     private_provider_request_id: rawProviderRequestId,
   });
 }
@@ -1400,6 +1503,22 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
         reservation_ref: reservationRef, billable_attempt_id: expected.billable_attempt_id,
         deadline_at: input.deadline_at, phase: "post_transport_ack", checked_at: new Date(capabilityCheckAt).toISOString(),
       })), { ...capabilityExpected, account_ref: expected.account_ref, project_ref: expected.project_ref }, now());
+    let finalDispatchIntent;
+    try {
+      finalDispatchIntent = await input.revalidateDispatch(Object.freeze({
+        reservation_ref: reservationRef,
+        billable_attempt_id: input.attempt.billable_attempt_id,
+        transport_attempt_id: transportId,
+        dispatch_intent_ref: input.dispatch_intent_ref,
+        target_binding_sha256: targetSha,
+        signal: input.signal,
+      }));
+    } catch {
+      fail("dispatch_fence_closed", "Current creative dispatch authorization could not be confirmed after provider revalidation.", { outcome: "unknown" });
+    }
+    if (finalDispatchIntent !== input.dispatch_intent_ref) {
+      fail("dispatch_fence_closed", "Current creative dispatch authorization did not match the recorded intent.", { outcome: "unknown" });
+    }
     const postAck = Object.freeze({ ...postAckAuthority, capability: postAckCapability });
     const fenceNow = now();
     assertLiveFence(input, postAck, credential, fenceNow, deadlineMs, expected, transportAckState);
@@ -1414,26 +1533,9 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
     }
     const rawProviderRequestId = responseHeader(response, "x-request-id");
     const providerRequestRef = safeProviderRequestRef(rawProviderRequestId);
-    if (typeof rawProviderRequestId === "string") {
-      if (!providerRequestRef || rawProviderRequestId.length > 16_384 || /[\u0000-\u001f\u007f]/.test(rawProviderRequestId)) {
-        fail("private_attribution_unavailable", "Private provider response attribution could not be durably recorded.", {
-          outcome: "unknown", provider_request_ref: providerRequestRef,
-        });
-      }
-      if (typeof input.recordPrivateProviderRequestId === "function") {
-        try {
-          await input.recordPrivateProviderRequestId(Object.freeze({
-            provider_request_id: rawProviderRequestId,
-            provider_request_ref: providerRequestRef,
-          }));
-        } catch {
-          fail("private_attribution_unavailable", "Private provider response attribution could not be durably recorded.", {
-            outcome: "unknown", provider_request_ref: providerRequestRef,
-          });
-        }
-      }
-    }
     if (!response || typeof response.ok !== "boolean" || !Number.isInteger(response.status) || !response.body) {
+      await recordProviderResponseAttribution(input, { transportAttemptId: transportId, targetBindingSha256: targetSha,
+        rawProviderRequestId, providerRequestRef });
       fail("provider_response_invalid", "Provider transport returned an invalid response envelope.", {
         outcome: "unknown", provider_request_ref: providerRequestRef,
         private_provider_request_id: rawProviderRequestId,
@@ -1444,10 +1546,12 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
         started_at: input.started_at ?? new Date(initialNow).toISOString(), deadline_at: input.deadline_at,
         max_attempts: retryPolicy.max_attempts ?? 3, max_elapsed_ms: retryPolicy.max_elapsed_ms ?? 60_000,
         max_delay_ms: retryPolicy.max_delay_ms ?? 10_000 }, providerRequestRef, rawProviderRequestId, transportId,
-        targetSha, input.recordPrivateProviderUsage, now);
+        targetSha, input, now);
     }
     let payload;
     try { payload = await readJsonBounded(response); } catch (error) {
+      await recordProviderResponseAttribution(input, { transportAttemptId: transportId, targetBindingSha256: targetSha,
+        rawProviderRequestId, providerRequestRef });
       if (error instanceof OpenAIImagesProviderError) {
         if (providerRequestRef) error.provider_request_ref = providerRequestRef;
         if (typeof rawProviderRequestId === "string") PRIVATE_PROVIDER_REQUEST_IDS.set(error, rawProviderRequestId);
@@ -1460,22 +1564,8 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
     });
     if (typeof targetSha === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetSha);
     const observedUsage = Object.hasOwn(payload, "usage") ? usage : undefined;
-    if (observedUsage && typeof input.recordPrivateProviderUsage === "function") {
-      try {
-        await input.recordPrivateProviderUsage(Object.freeze({ target_binding_sha256: targetSha, usage: observedUsage }));
-      } catch {
-        const unavailableUsage = normalizeOpenAIImageUsage({
-          ...observedUsage,
-          completeness: "unknown",
-          missing_fields: [...observedUsage.missing_fields, "private_usage_attribution_unavailable"],
-        }, { transport_attempt_id: transportId, provider_request_id: rawProviderRequestId });
-        PRIVATE_TARGET_BINDING_SHA256.set(unavailableUsage, targetSha);
-        const error = new OpenAIImagesProviderError("private_usage_attribution_unavailable",
-          "Private provider usage attribution could not be durably recorded.", { outcome: "unknown" });
-        attachUsageObservation(error, unavailableUsage, rawProviderRequestId);
-        throw error;
-      }
-    }
+    await recordProviderResponseAttribution(input, { transportAttemptId: transportId, targetBindingSha256: targetSha,
+      rawProviderRequestId, providerRequestRef, usage: observedUsage });
     if (input.signal.aborted || now() >= deadlineMs) {
       fail("provider_outcome_unknown", "Cancellation or deadline occurred after transport; output remains unpublished.", {
         outcome: "unknown", provider_request_ref: providerRequestRef, usage: observedUsage,

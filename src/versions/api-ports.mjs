@@ -402,6 +402,12 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
     recordPrivateProviderUsageAttribution(input) {
       return serial(() => store.recordPrivateProviderUsageAttribution(input));
     },
+    stagePrivateProviderAttribution(input) {
+      return serial(() => store.stagePrivateProviderAttribution(input));
+    },
+    reconcilePrivateProviderAttributions(input) {
+      return serial(() => store.reconcilePrivateProviderAttributions(input));
+    },
     async completeIfActive(input, publish) {
       return serial(async () => {
         if (typeof publish !== "function") throw new VersionStoreError("invalid_request", "publish");

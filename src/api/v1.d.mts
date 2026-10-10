@@ -103,6 +103,8 @@ export interface PrivateProviderRequestAttribution {
 
 export interface PrivateProviderRequestAttributionResult {
   readonly status: "recorded" | "replayed";
+  readonly transport_attempt_id: string;
+  readonly provider_request_ref: string;
 }
 
 export interface PrivateProviderUsageAttribution {
@@ -125,6 +127,36 @@ export interface PrivateProviderUsageAttribution {
 
 export interface PrivateProviderUsageAttributionResult {
   readonly status: "recorded" | "replayed";
+  readonly transport_attempt_id: string;
+  readonly target_binding_sha256: `sha256:${string}`;
+  readonly usage_sha256: `sha256:${string}`;
+}
+
+/** Durable same-attempt fallback when one private attribution write is temporarily unavailable. */
+export interface PrivateProviderAttributionPending {
+  readonly scope: TrustedScope;
+  readonly actor_id: string;
+  readonly job_id: string;
+  readonly action_id: string;
+  readonly request_hash: `sha256:${string}`;
+  readonly operation: "generate" | "edit";
+  readonly provider: "openai";
+  readonly model: string;
+  readonly reservation_ref: string;
+  readonly billable_attempt_id: string;
+  readonly transport_attempt_id: string;
+  readonly dispatch_intent_ref: string;
+  readonly target_binding_sha256: `sha256:${string}`;
+  readonly provider_request_id?: string;
+  readonly provider_request_ref?: string;
+  readonly usage?: ProviderUsageRecord;
+}
+
+export interface PrivateProviderAttributionPendingResult {
+  readonly status: "staged" | "replayed";
+  readonly pending_ref: string;
+  readonly transport_attempt_id: string;
+  readonly payload_sha256: `sha256:${string}`;
 }
 
 export type DispatchAuthorizationResult =
@@ -368,6 +400,10 @@ export interface CreativeRuntimePorts {
     /** Retain sanitized raw provider counters privately for later owner-reviewed mapping/reconciliation. */
     recordPrivateProviderUsageAttribution?(input: PrivateProviderUsageAttribution):
       Promise<PrivateProviderUsageAttributionResult> | PrivateProviderUsageAttributionResult;
+    stagePrivateProviderAttribution?(input: PrivateProviderAttributionPending):
+      Promise<PrivateProviderAttributionPendingResult> | PrivateProviderAttributionPendingResult;
+    reconcilePrivateProviderAttributions?(input: { scope: TrustedScope; limit?: number }):
+      Promise<Readonly<{ reconciled: number; remaining: number }>> | Readonly<{ reconciled: number; remaining: number }>;
   };
   provider?: {
     resolveRoute(input: { scope: TrustedScope; actor_id: string; operation: "generate" | "edit"; plan: EditPlan }):
@@ -472,16 +508,33 @@ export interface ProviderInput {
   transport_attempt_id: string;
   dispatch_intent_ref: string;
   recordTransportAttempt(transport_attempt_id: string): Promise<string>;
+  /** Last current job, lease, creative-context, deadline, and rights fence after all provider-side async revalidation. */
+  revalidateDispatch(input: Readonly<{
+    reservation_ref: string;
+    billable_attempt_id: string;
+    transport_attempt_id: string;
+    dispatch_intent_ref: string;
+    target_binding_sha256: `sha256:${string}`;
+    signal: AbortSignal;
+  }>): Promise<string>;
   /** Called as soon as an HTTP response exposes x-request-id; raw value is private and never public JSON. */
   recordPrivateProviderRequestId?(input: Readonly<{
     provider_request_id: string;
     provider_request_ref: string;
-  }>): Promise<void>;
+  }>): Promise<PrivateProviderRequestAttributionResult>;
   /** Called after bounded normalization when the response actually contains a usage object. */
   recordPrivateProviderUsage?(input: Readonly<{
     target_binding_sha256: `sha256:${string}`;
     usage: ProviderUsageRecord;
-  }>): Promise<void>;
+  }>): Promise<PrivateProviderUsageAttributionResult>;
+  /** Stages exact private response attribution for retry without another provider transport. */
+  stagePrivateProviderAttribution?(input: Readonly<{
+    target_binding_sha256: `sha256:${string}`;
+    provider_request_id?: string;
+    provider_request_ref?: string;
+    usage?: ProviderUsageRecord;
+  }>): Promise<Readonly<{ status: "staged" | "replayed"; pending_ref: string;
+    transport_attempt_id: string; payload_sha256: `sha256:${string}` }>>;
   signal: AbortSignal;
   deadline_at: string;
 }

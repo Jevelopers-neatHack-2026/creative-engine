@@ -18,7 +18,7 @@ import {
 import { createCreativeBriefStore } from "../planning/index.mjs";
 import { initializeCreativeBriefDatabase } from "../planning/store.mjs";
 
-const STORAGE_VERSION = 5;
+const STORAGE_VERSION = 6;
 const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 const ID_PATTERN = /^[A-Za-z0-9_.:-]{1,256}$/;
 const HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
@@ -329,7 +329,7 @@ function readStoredObjectSync(objectRoot, contentHash) {
 
 function makeSchema(db) {
   const version = db.prepare("PRAGMA user_version").get().user_version;
-  if (![0, 1, 2, 3, 4, STORAGE_VERSION].includes(version)) {
+  if (![0, 1, 2, 3, 4, 5, STORAGE_VERSION].includes(version)) {
     db.close();
     reject("unsupported_version", "storage_version");
   }
@@ -476,6 +476,38 @@ function makeSchema(db) {
       BEFORE UPDATE ON private_provider_usage_attributions BEGIN SELECT RAISE(ABORT,'private provider usage attribution is immutable'); END;
     CREATE TRIGGER IF NOT EXISTS private_provider_usage_attributions_no_delete
       BEFORE DELETE ON private_provider_usage_attributions BEGIN SELECT RAISE(ABORT,'private provider usage attribution is immutable'); END;
+    CREATE TABLE IF NOT EXISTS private_provider_attribution_pending (
+      tenant_id TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      pending_ref TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      transport_attempt_id TEXT NOT NULL,
+      payload_sha256 TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(tenant_id,project_id,pending_ref),
+      UNIQUE(tenant_id,project_id,job_id,transport_attempt_id,payload_sha256),
+      FOREIGN KEY(tenant_id,project_id,job_id,transport_attempt_id)
+        REFERENCES creative_dispatch_intents(tenant_id,project_id,job_id,transport_attempt_id)
+    ) STRICT;
+    CREATE TRIGGER IF NOT EXISTS private_provider_attribution_pending_no_update
+      BEFORE UPDATE ON private_provider_attribution_pending BEGIN SELECT RAISE(ABORT,'pending provider attribution is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS private_provider_attribution_pending_no_delete
+      BEFORE DELETE ON private_provider_attribution_pending BEGIN SELECT RAISE(ABORT,'pending provider attribution is immutable'); END;
+    CREATE TABLE IF NOT EXISTS private_provider_attribution_reconciliations (
+      tenant_id TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      pending_ref TEXT NOT NULL,
+      payload_sha256 TEXT NOT NULL,
+      reconciled_at TEXT NOT NULL,
+      PRIMARY KEY(tenant_id,project_id,pending_ref),
+      FOREIGN KEY(tenant_id,project_id,pending_ref)
+        REFERENCES private_provider_attribution_pending(tenant_id,project_id,pending_ref)
+    ) STRICT;
+    CREATE TRIGGER IF NOT EXISTS private_provider_attribution_reconciliations_no_update
+      BEFORE UPDATE ON private_provider_attribution_reconciliations BEGIN SELECT RAISE(ABORT,'provider attribution reconciliation is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS private_provider_attribution_reconciliations_no_delete
+      BEFORE DELETE ON private_provider_attribution_reconciliations BEGIN SELECT RAISE(ABORT,'provider attribution reconciliation is immutable'); END;
     CREATE TABLE IF NOT EXISTS creative_cancel_requests (
       tenant_id TEXT NOT NULL,
       project_id TEXT NOT NULL,
@@ -994,7 +1026,7 @@ export class CreativeVersionStore {
           existing.provider_request_id === provider_request_id && existing.provider_request_ref === provider_request_ref;
         if (!same) reject("conflict", "provider_attribution.identity");
         this.db.exec("COMMIT");
-        return freezeReturned({ status: "replayed" });
+        return freezeReturned({ status: "replayed", transport_attempt_id, provider_request_ref });
       }
       this.db.prepare(`INSERT INTO private_provider_attributions
         (tenant_id,project_id,job_id,action_id,actor_id,request_hash,operation,provider_name,provider_model,
@@ -1005,7 +1037,7 @@ export class CreativeVersionStore {
           provider_model, reservation_ref, billable_attempt_id, transport_attempt_id, dispatch_intent_ref,
           provider_request_id, provider_request_ref, this.timestamp());
       this.db.exec("COMMIT");
-      return freezeReturned({ status: "recorded" });
+      return freezeReturned({ status: "recorded", transport_attempt_id, provider_request_ref });
     } catch (error) {
       this.rollback();
       if (error instanceof VersionStoreError) throw error;
@@ -1093,7 +1125,7 @@ export class CreativeVersionStore {
           existing.usage_sha256 === usage_sha256 && existing.usage_json === usage_json;
         if (!same) reject("conflict", "provider_usage_attribution.identity");
         this.db.exec("COMMIT");
-        return freezeReturned({ status: "replayed" });
+        return freezeReturned({ status: "replayed", transport_attempt_id, target_binding_sha256, usage_sha256 });
       }
       this.db.prepare(`INSERT INTO private_provider_usage_attributions
         (tenant_id,project_id,job_id,action_id,actor_id,request_hash,operation,provider_name,provider_model,
@@ -1104,12 +1136,194 @@ export class CreativeVersionStore {
           provider_model, reservation_ref, billable_attempt_id, transport_attempt_id, dispatch_intent_ref,
           target_binding_sha256, usage_sha256, usage_json, this.timestamp());
       this.db.exec("COMMIT");
-      return freezeReturned({ status: "recorded" });
+      return freezeReturned({ status: "recorded", transport_attempt_id, target_binding_sha256, usage_sha256 });
     } catch (error) {
       this.rollback();
       if (error instanceof VersionStoreError) throw error;
       reject("unavailable", "provider_usage_attribution", true);
     }
+  }
+
+  /** Stage bounded response attribution so transient append failures can be reconciled without redispatch. */
+  stagePrivateProviderAttribution(input) {
+    this.assertOpen();
+    if (!isRecord(input) || !isRecord(input.scope) ||
+        (input.provider_request_id === undefined) === (input.provider_request_ref !== undefined) ||
+        input.provider_request_id === undefined && input.usage === undefined) {
+      reject("invalid_request", "provider_attribution_pending");
+    }
+    const tenant_id = reference(input.scope.tenant_id, "scope.tenant_id");
+    const project_id = reference(input.scope.project_id, "scope.project_id");
+    const actor_id = reference(input.actor_id, "actor_id");
+    const job_id = reference(input.job_id, "job_id");
+    const action_id = reference(input.action_id, "action_id");
+    const request_hash = hash(input.request_hash, "request_hash");
+    if (!["generate", "edit"].includes(input.operation) || input.provider !== "openai") {
+      reject("invalid_request", "provider_attribution_pending.operation");
+    }
+    const provider_model = reference(input.model, "provider_attribution_pending.model", 256);
+    const reservation_ref = reference(input.reservation_ref, "reservation_ref");
+    const billable_attempt_id = reference(input.billable_attempt_id, "billable_attempt_id");
+    const transport_attempt_id = reference(input.transport_attempt_id, "transport_attempt_id");
+    const dispatch_intent_ref = reference(input.dispatch_intent_ref, "dispatch_intent_ref");
+    const target_binding_sha256 = hash(input.target_binding_sha256, "target_binding_sha256");
+    let provider_request_id;
+    let provider_request_ref;
+    if (input.provider_request_id !== undefined) {
+      provider_request_id = input.provider_request_id;
+      if (typeof provider_request_id !== "string" || provider_request_id.length < 1 ||
+          Buffer.byteLength(provider_request_id, "utf8") > 512 || /[\u0000-\u001f\u007f]/.test(provider_request_id)) {
+        reject("invalid_request", "provider_attribution_pending.provider_request_id");
+      }
+      provider_request_ref = reference(input.provider_request_ref, "provider_request_ref");
+      const expectedProviderRequestRef = `provider-request-${createHash("sha256").update(provider_request_id, "utf8").digest("hex")}`;
+      if (provider_request_ref !== expectedProviderRequestRef) reject("integrity_error", "provider_attribution_pending.provider_request_ref");
+    }
+    let usage;
+    let usage_sha256;
+    if (input.usage !== undefined) {
+      usage = snapshotJson(input.usage, "invalid_request", "provider_attribution_pending.usage");
+      const allowed = new Set(["completeness", "input_tokens", "output_tokens", "total_tokens",
+        "input_tokens_details", "output_tokens_details", "provider_request_id", "transport_attempt_id", "missing_fields"]);
+      if (!hasOnlyKeys(usage, [...allowed]) || !["complete", "partial", "incomplete", "unknown"].includes(usage.completeness) ||
+          usage.transport_attempt_id !== transport_attempt_id) {
+        reject("invalid_request", "provider_attribution_pending.usage");
+      }
+      for (const key of ["input_tokens", "output_tokens", "total_tokens"]) {
+        if (usage[key] !== undefined && (!Number.isSafeInteger(usage[key]) || usage[key] < 0)) {
+          reject("invalid_request", `provider_attribution_pending.usage.${key}`);
+        }
+      }
+      for (const key of ["input_tokens_details", "output_tokens_details"]) {
+        if (usage[key] === undefined) continue;
+        if (!isRecord(usage[key]) || Object.keys(usage[key]).some((name) => !["text_tokens", "image_tokens"].includes(name)) ||
+            Object.values(usage[key]).some((count) => !Number.isSafeInteger(count) || count < 0)) {
+          reject("invalid_request", `provider_attribution_pending.usage.${key}`);
+        }
+      }
+      if (usage.provider_request_id !== undefined && !/^provider-request-[a-f0-9]{64}$/.test(usage.provider_request_id)) {
+        reject("invalid_request", "provider_attribution_pending.usage.provider_request_id");
+      }
+      if (!Array.isArray(usage.missing_fields) || usage.missing_fields.length > 64 ||
+          usage.missing_fields.some((field) => typeof field !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(field))) {
+        reject("invalid_request", "provider_attribution_pending.usage.missing_fields");
+      }
+      const usage_json = canonicalSerialize(usage);
+      if (Buffer.byteLength(usage_json, "utf8") > 32 * 1024) reject("invalid_request", "provider_attribution_pending.usage_size");
+      usage_sha256 = canonicalHash(usage);
+    }
+    const payload = snapshotJson({ tenant_id, project_id, actor_id, job_id, action_id, request_hash,
+      operation: input.operation, provider: input.provider, model: provider_model, reservation_ref,
+      billable_attempt_id, transport_attempt_id, dispatch_intent_ref, target_binding_sha256,
+      ...(provider_request_id !== undefined ? { provider_request_id, provider_request_ref } : {}),
+      ...(usage !== undefined ? { usage, usage_sha256 } : {}) }, "invalid_request", "provider_attribution_pending");
+    const payload_json = canonicalSerialize(payload);
+    const payload_sha256 = canonicalHash(payload);
+    const pending_ref = `private-attribution:${payload_sha256.slice(7)}`;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const job = this.db.prepare(`SELECT actor_id,action_id,request_hash,operation,status FROM creative_jobs
+        WHERE tenant_id=? AND project_id=? AND job_id=?`).get(tenant_id, project_id, job_id);
+      if (!job || job.actor_id !== actor_id || job.action_id !== action_id || job.request_hash !== request_hash ||
+          job.operation !== input.operation || !["running", "cancelled", "failed", "completed"].includes(job.status)) {
+        reject("scope_denied", "provider_attribution_pending.job");
+      }
+      const dispatch = this.db.prepare(`SELECT billable_attempt_id,reservation_ref,dispatch_intent_ref,provider_name,provider_model
+        FROM creative_dispatch_intents WHERE tenant_id=? AND project_id=? AND job_id=? AND transport_attempt_id=?`)
+        .get(tenant_id, project_id, job_id, transport_attempt_id);
+      if (!dispatch || dispatch.billable_attempt_id !== billable_attempt_id || dispatch.reservation_ref !== reservation_ref ||
+          dispatch.dispatch_intent_ref !== dispatch_intent_ref || dispatch.provider_name !== "openai" ||
+          dispatch.provider_model !== provider_model) reject("integrity_error", "provider_attribution_pending.dispatch");
+      const existing = this.db.prepare(`SELECT payload_sha256 FROM private_provider_attribution_pending
+        WHERE tenant_id=? AND project_id=? AND pending_ref=?`).get(tenant_id, project_id, pending_ref);
+      if (existing) {
+        if (existing.payload_sha256 !== payload_sha256) reject("conflict", "provider_attribution_pending.identity");
+        this.db.exec("COMMIT");
+        return freezeReturned({ status: "replayed", pending_ref, transport_attempt_id, payload_sha256 });
+      }
+      this.db.prepare(`INSERT INTO private_provider_attribution_pending
+        (tenant_id,project_id,pending_ref,job_id,transport_attempt_id,payload_sha256,payload_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?)`).run(tenant_id, project_id, pending_ref, job_id, transport_attempt_id,
+          payload_sha256, payload_json, this.timestamp());
+      this.db.exec("COMMIT");
+      return freezeReturned({ status: "staged", pending_ref, transport_attempt_id, payload_sha256 });
+    } catch (error) {
+      this.rollback();
+      if (error instanceof VersionStoreError) throw error;
+      reject("unavailable", "provider_attribution_pending", true);
+    }
+  }
+
+  /** Retry append-only private attribution writes from durable pending rows; never invokes a provider. */
+  reconcilePrivateProviderAttributions(input) {
+    this.assertOpen();
+    if (!isRecord(input) || !isRecord(input.scope)) reject("invalid_request", "provider_attribution_reconciliation");
+    const tenant_id = reference(input.scope.tenant_id, "scope.tenant_id");
+    const project_id = reference(input.scope.project_id, "scope.project_id");
+    const limit = input.limit ?? 25;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) reject("invalid_request", "provider_attribution_reconciliation.limit");
+    const rows = this.db.prepare(`SELECT p.* FROM private_provider_attribution_pending p
+      LEFT JOIN private_provider_attribution_reconciliations r
+        ON r.tenant_id=p.tenant_id AND r.project_id=p.project_id AND r.pending_ref=p.pending_ref
+      WHERE p.tenant_id=? AND p.project_id=? AND r.pending_ref IS NULL ORDER BY p.created_at,p.pending_ref LIMIT ?`)
+      .all(tenant_id, project_id, limit);
+    let reconciled = 0;
+    for (const row of rows) {
+      let payload;
+      try { payload = JSON.parse(row.payload_json); } catch { reject("integrity_error", "provider_attribution_pending.payload"); }
+      if (canonicalHash(payload) !== row.payload_sha256 || payload.pending_ref !== undefined ||
+          payload.tenant_id !== tenant_id || payload.project_id !== project_id ||
+          payload.job_id !== row.job_id || payload.transport_attempt_id !== row.transport_attempt_id) {
+        reject("integrity_error", "provider_attribution_pending.payload");
+      }
+      const scope = Object.freeze({ tenant_id, project_id });
+      if (payload.provider_request_id !== undefined) {
+        const ack = this.recordPrivateProviderAttribution({ scope, actor_id: payload.actor_id, job_id: payload.job_id,
+          action_id: payload.action_id, request_hash: payload.request_hash, operation: payload.operation,
+          provider: payload.provider, model: payload.model, reservation_ref: payload.reservation_ref,
+          billable_attempt_id: payload.billable_attempt_id, transport_attempt_id: payload.transport_attempt_id,
+          dispatch_intent_ref: payload.dispatch_intent_ref, provider_request_id: payload.provider_request_id,
+          provider_request_ref: payload.provider_request_ref });
+        if (!["recorded", "replayed"].includes(ack.status) || ack.transport_attempt_id !== payload.transport_attempt_id ||
+            ack.provider_request_ref !== payload.provider_request_ref) reject("unavailable", "provider_attribution_reconciliation", true);
+      }
+      if (payload.usage !== undefined) {
+        const ack = this.recordPrivateProviderUsageAttribution({ scope, actor_id: payload.actor_id, job_id: payload.job_id,
+          action_id: payload.action_id, request_hash: payload.request_hash, operation: payload.operation,
+          provider: payload.provider, model: payload.model, reservation_ref: payload.reservation_ref,
+          billable_attempt_id: payload.billable_attempt_id, transport_attempt_id: payload.transport_attempt_id,
+          dispatch_intent_ref: payload.dispatch_intent_ref, target_binding_sha256: payload.target_binding_sha256,
+          usage_sha256: payload.usage_sha256, usage: payload.usage });
+        if (!["recorded", "replayed"].includes(ack.status) || ack.transport_attempt_id !== payload.transport_attempt_id ||
+            ack.target_binding_sha256 !== payload.target_binding_sha256 || ack.usage_sha256 !== payload.usage_sha256) {
+          reject("unavailable", "provider_attribution_reconciliation", true);
+        }
+      }
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const prior = this.db.prepare(`SELECT payload_sha256 FROM private_provider_attribution_reconciliations
+          WHERE tenant_id=? AND project_id=? AND pending_ref=?`).get(tenant_id, project_id, row.pending_ref);
+        if (prior) {
+          if (prior.payload_sha256 !== row.payload_sha256) reject("integrity_error", "provider_attribution_reconciliation.identity");
+        } else {
+          this.db.prepare(`INSERT INTO private_provider_attribution_reconciliations
+            (tenant_id,project_id,pending_ref,payload_sha256,reconciled_at) VALUES(?,?,?,?,?)`)
+            .run(tenant_id, project_id, row.pending_ref, row.payload_sha256, this.timestamp());
+          reconciled += 1;
+        }
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.rollback();
+        if (error instanceof VersionStoreError) throw error;
+        reject("unavailable", "provider_attribution_reconciliation", true);
+      }
+    }
+    const remaining = this.db.prepare(`SELECT COUNT(*) AS count FROM private_provider_attribution_pending p
+      LEFT JOIN private_provider_attribution_reconciliations r
+        ON r.tenant_id=p.tenant_id AND r.project_id=p.project_id AND r.pending_ref=p.pending_ref
+      WHERE p.tenant_id=? AND p.project_id=? AND r.pending_ref IS NULL`).get(tenant_id, project_id).count;
+    return freezeReturned({ reconciled, remaining });
   }
 
   prepareWrite(input) {

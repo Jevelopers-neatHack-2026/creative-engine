@@ -723,7 +723,7 @@ function startDeadline(operation, durationMs, clock = Date.now) {
 async function usageObservation({ attempt, trustedScope, rawUsage, profile, transportAttemptId, idFactory,
   usageProfileAuthority, targetBindingSha256, reservationRef, dispatchIntentRef, providerOutcome }) {
   const sourceObservationId = `usage:${idFactory()}`;
-  const fallback = () => createUsageObservation({
+  const fallback = () => Object.freeze({ observation: createUsageObservation({
     attempt,
     trustedScope,
     usage: isRecord(rawUsage) ? rawUsage : {},
@@ -731,7 +731,7 @@ async function usageObservation({ attempt, trustedScope, rawUsage, profile, tran
     sourceObservationId,
     source: "provider_response",
     transportAttemptId,
-  });
+  }) });
   if (typeof usageProfileAuthority?.mapProviderUsage !== "function" || !isRecord(rawUsage) ||
       typeof targetBindingSha256 !== "string" || !/^sha256:[a-f0-9]{64}$/.test(targetBindingSha256) ||
       typeof reservationRef !== "string" || typeof dispatchIntentRef !== "string") return fallback();
@@ -766,7 +766,20 @@ async function usageObservation({ attempt, trustedScope, rawUsage, profile, tran
           ? observation.provider_request_id !== undefined
           : observation.provider_request_id !== rawUsage.provider_request_id) ||
         observation.rate_card_ref !== undefined || observation.valuation !== undefined) return fallback();
-    return observation;
+    return Object.freeze({ observation,
+      ...(observation.completeness === "complete" ? { mapping: Object.freeze({
+        profile_ref: mapped.profile_ref,
+        profile_sha256: mapped.profile_sha256,
+        raw_usage_sha256: rawUsageSha256,
+        target_binding_sha256: targetBindingSha256,
+        attempt_binding_sha256: attemptBindingSha256,
+        source_observation_id: sourceObservationId,
+        transport_attempt_id: transportAttemptId,
+        billable_attempt_id: attempt.billable_attempt_id,
+        provider_name: attempt.provider.name,
+        model: attempt.provider.model,
+        observation_sha256: canonicalHash(observation),
+      }) } : {}) });
   } catch {
     return fallback();
   }
@@ -1658,7 +1671,9 @@ export function createCreativeApi(options = {}) {
         throw error;
       }
     };
-    const finishUsageMapping = async (dispatchContext, observation) => {
+    let settledUsageMappingCandidate;
+    const finishUsageMapping = async (dispatchContext, mappedUsage) => {
+      const observation = mappedUsage?.observation;
       // Generic legacy consumers use a synchronous local usage profile. The
       // CE-03 owner mapper is an asynchronous authority boundary and must be
       // followed by fresh rights/job checks. If those checks fail, retain an
@@ -1667,6 +1682,7 @@ export function createCreativeApi(options = {}) {
       if (typeof telemetry.usage_profile_authority?.mapProviderUsage !== "function") return observation;
       try {
         await revalidateMappedDispatch(dispatchContext);
+        if (mappedUsage?.mapping) settledUsageMappingCandidate = mappedUsage.mapping;
         return observation;
       } catch {
         return retainUsageWithoutSettlement(observation, dispatchContext.attempt);
@@ -1699,6 +1715,12 @@ export function createCreativeApi(options = {}) {
         throw error;
       }
       dispatchIntentRefs.set(transport_attempt_id, freshIntentRef);
+      try { assertFinalDispatchEligibility(signal); }
+      catch (error) {
+        preDispatchError = error;
+        throw error;
+      }
+      return freshIntentRef;
     };
     let outcome;
     let evidenceRefs = [];
@@ -1770,27 +1792,40 @@ export function createCreativeApi(options = {}) {
             }
             return intentRef;
           },
+          async revalidateDispatch(binding) {
+            if (!isRecord(binding) || binding.transport_attempt_id !== transportAttemptId ||
+                binding.billable_attempt_id !== attempt.billable_attempt_id ||
+                binding.reservation_ref !== dispatchContext.reservation_ref ||
+                binding.dispatch_intent_ref !== dispatch_intent_ref ||
+                typeof binding.target_binding_sha256 !== "string" ||
+                !/^sha256:[a-f0-9]{64}$/.test(binding.target_binding_sha256) || binding.signal !== dispatchContext.signal) {
+              throw new CreativeApiError("unavailable", request.operation, "dispatch_authorization");
+            }
+            return revalidateTransport({ transport_attempt_id: transportAttemptId,
+              billable_attempt_id: attempt.billable_attempt_id, reservation_ref: dispatchContext.reservation_ref,
+              dispatch_intent_ref, signal: dispatchContext.signal });
+          },
           setDecisionRequest(value) { validatedDecisionRequest = value; },
         }); } catch (error) {
           const failed = providerFailureUsage(error);
           if (!failed) throw error;
-          const usage_observation = await usageObservation({ attempt: dispatchContext.attempt,
+          const mappedUsage = await usageObservation({ attempt: dispatchContext.attempt,
             trustedScope: meteredTrustedScope(principal), rawUsage: failed.usage, profile: usageProfile,
             transportAttemptId, idFactory, usageProfileAuthority: telemetry.usage_profile_authority,
             targetBindingSha256: failed.target_binding_sha256, reservationRef: dispatchContext.reservation_ref,
             dispatchIntentRef: dispatch_intent_ref, providerOutcome: failed.provider_outcome });
           return { provider_outcome: failed.provider_outcome,
-            usage_observation: await finishUsageMapping(dispatchContext, usage_observation) };
+            usage_observation: await finishUsageMapping(dispatchContext, mappedUsage) };
         }
         providerValue = dispatched?.value;
         const rawUsage = dispatched?.usage;
-        const usage_observation = await usageObservation({ attempt: dispatchContext.attempt,
+        const mappedUsage = await usageObservation({ attempt: dispatchContext.attempt,
           trustedScope: meteredTrustedScope(principal), rawUsage, profile: usageProfile, transportAttemptId,
           idFactory, usageProfileAuthority: telemetry.usage_profile_authority,
           targetBindingSha256: dispatched?.value?.target_binding_sha256, reservationRef: dispatchContext.reservation_ref,
           dispatchIntentRef: dispatch_intent_ref, providerOutcome: dispatched?.provider_outcome ?? "succeeded" });
         return { provider_outcome: dispatched?.provider_outcome ?? "succeeded",
-          usage_observation: await finishUsageMapping(dispatchContext, usage_observation) };
+          usage_observation: await finishUsageMapping(dispatchContext, mappedUsage) };
       },
     });
       outcome = telemetryResult.outcome;
@@ -1812,9 +1847,18 @@ export function createCreativeApi(options = {}) {
       if (preDispatchError) throw preDispatchError;
       throw meteringFailure(outcome, request.operation);
     }
+    const mapping = settledUsageMappingCandidate;
+    const usageEvidence = mapping && outcome.settlement?.status === "settled" &&
+      outcome.observation_ack?.status && ["accepted", "duplicate"].includes(outcome.observation_ack.status) &&
+      outcome.observation_ack.source_observation_id === mapping.source_observation_id &&
+      outcome.observation_ack.effective_billable_attempt_id === mapping.billable_attempt_id &&
+      mapping.billable_attempt_id === attempt.billable_attempt_id
+      ? Object.freeze({ status: "settled_owner_mapping", ...mapping,
+        observation_ref: observationRef ?? mapping.source_observation_id }) : undefined;
     return { value: providerValue, attempt_id: attemptId, decision_request: validatedDecisionRequest,
       metering: outcome, transport_attempt_ids: Object.freeze([...dispatchIntentRefs.keys()]),
       usage_ref: observationRef ?? outcome.observation_ack?.source_observation_id,
+      ...(usageEvidence ? { usage_evidence: usageEvidence } : {}),
       evidence_refs: Object.freeze([...(evidenceRefs ?? [])]), telemetry_evidence: telemetryEvidence };
   }
 
@@ -1998,21 +2042,24 @@ export function createCreativeApi(options = {}) {
         : ports.jobs?.recordPrivateProviderAttribution;
       const privateUsageAttributionPort = route.provider.name === "openai"
         ? requiredPort(ports, "jobs.recordPrivateProviderUsageAttribution", operation) : undefined;
+      const privateAttributionPendingPort = route.provider.name === "openai"
+        ? requiredPort(ports, "jobs.stagePrivateProviderAttribution", operation) : undefined;
       const metered = await runMetered(principal, request, started, operation === "generate" ? "image_generation" : "image_edit", route, method,
       async ({ method: dispatch, scope, actor_id, started: job, route: resolved, attempt, signal, deadline_at,
-        reservation_ref, transportAttemptId, dispatch_intent_ref, recordTransportAttempt }) => {
+        reservation_ref, transportAttemptId, dispatch_intent_ref, recordTransportAttempt, revalidateDispatch }) => {
         const value = await dispatch(Object.freeze({ scope: started.scope, actor_id: principal.actor_id,
           job_id: started.job_id, attempt, route: resolved, brief, base_design: baseDesign, plan,
           ...(currentReferenceManifest ? { image_reference_manifest: currentReferenceManifest } : {}),
           decision_result: decisionResult, reservation_ref, transport_attempt_id: transportAttemptId, dispatch_intent_ref,
           recordTransportAttempt,
+          revalidateDispatch,
           ...(typeof privateAttributionPort === "function" ? {
             async recordPrivateProviderRequestId(attribution) {
               if (!isRecord(attribution) || typeof attribution.provider_request_id !== "string" ||
                   typeof attribution.provider_request_ref !== "string") {
                 throw new CreativeApiError("failed", operation, "provider_attribution");
               }
-              await privateAttributionPort(Object.freeze({
+              const ack = await privateAttributionPort(Object.freeze({
                 scope: started.scope,
                 actor_id: principal.actor_id,
                 job_id: started.job_id,
@@ -2028,6 +2075,12 @@ export function createCreativeApi(options = {}) {
                 provider_request_id: attribution.provider_request_id,
                 provider_request_ref: attribution.provider_request_ref,
               }));
+              if (!isRecord(ack) || !["recorded", "replayed"].includes(ack.status) ||
+                  ack.transport_attempt_id !== transportAttemptId ||
+                  ack.provider_request_ref !== attribution.provider_request_ref) {
+                throw new CreativeApiError("unavailable", operation, "provider_attribution_ack");
+              }
+              return ack;
             },
           } : {}),
           ...(typeof privateUsageAttributionPort === "function" ? {
@@ -2036,7 +2089,8 @@ export function createCreativeApi(options = {}) {
                   typeof attribution.target_binding_sha256 !== "string") {
                 throw new CreativeApiError("failed", operation, "provider_usage_attribution");
               }
-              await privateUsageAttributionPort(Object.freeze({
+              const usageHash = canonicalHash(attribution.usage);
+              const ack = await privateUsageAttributionPort(Object.freeze({
                 scope: started.scope,
                 actor_id: principal.actor_id,
                 job_id: started.job_id,
@@ -2050,9 +2104,51 @@ export function createCreativeApi(options = {}) {
                 transport_attempt_id: transportAttemptId,
                 dispatch_intent_ref,
                 target_binding_sha256: attribution.target_binding_sha256,
-                usage_sha256: canonicalHash(attribution.usage),
+                usage_sha256: usageHash,
                 usage: attribution.usage,
               }));
+              if (!isRecord(ack) || !["recorded", "replayed"].includes(ack.status) ||
+                  ack.transport_attempt_id !== transportAttemptId ||
+                  ack.target_binding_sha256 !== attribution.target_binding_sha256 || ack.usage_sha256 !== usageHash) {
+                throw new CreativeApiError("unavailable", operation, "provider_usage_attribution_ack");
+              }
+              return ack;
+            },
+          } : {}),
+          ...(typeof privateAttributionPendingPort === "function" ? {
+            async stagePrivateProviderAttribution(attribution) {
+              if (!isRecord(attribution) || typeof attribution.target_binding_sha256 !== "string" ||
+                  (attribution.provider_request_id === undefined) !== (attribution.provider_request_ref === undefined) ||
+                  attribution.provider_request_id === undefined && attribution.usage === undefined) {
+                throw new CreativeApiError("failed", operation, "provider_attribution_pending");
+              }
+              const pendingInput = Object.freeze({
+                scope: started.scope,
+                actor_id: principal.actor_id,
+                job_id: started.job_id,
+                action_id: request.action_id,
+                request_hash: started.request_hash,
+                operation,
+                provider: "openai",
+                model: route.provider.model,
+                reservation_ref,
+                billable_attempt_id: attempt.billable_attempt_id,
+                transport_attempt_id: transportAttemptId,
+                dispatch_intent_ref,
+                target_binding_sha256: attribution.target_binding_sha256,
+                ...(attribution.provider_request_id !== undefined ? {
+                  provider_request_id: attribution.provider_request_id,
+                  provider_request_ref: attribution.provider_request_ref,
+                } : {}),
+                ...(attribution.usage !== undefined ? { usage: attribution.usage } : {}),
+              });
+              const ack = await privateAttributionPendingPort(pendingInput);
+              if (!isRecord(ack) || !["staged", "replayed"].includes(ack.status) ||
+                  typeof ack.pending_ref !== "string" || ack.transport_attempt_id !== transportAttemptId ||
+                  typeof ack.payload_sha256 !== "string" || !/^sha256:[a-f0-9]{64}$/.test(ack.payload_sha256)) {
+                throw new CreativeApiError("unavailable", operation, "provider_attribution_pending_ack");
+              }
+              return ack;
             },
           } : {}),
           signal, deadline_at }));
@@ -2061,6 +2157,9 @@ export function createCreativeApi(options = {}) {
       creativeContextFence(brief, baseDesign, expectedCurrentDesignVersionId, expectedCurrentDesignHash));
     const generated = metered.value;
     const usage = normalizeUsage(generated?.usage);
+    const usageEvidence = metered.usage_evidence;
+    const effectiveUsageCompleteness = usageEvidence?.status === "settled_owner_mapping"
+      ? "complete" : (usage.completeness ?? "unknown");
     if (!isRecord(generated) || !isRecord(generated.artifact) ||
       typeof generated.artifact.artifact_id !== "string" || typeof generated.artifact.content_hash !== "string" ||
       typeof generated.artifact.media_type !== "string") {
@@ -2105,7 +2204,7 @@ export function createCreativeApi(options = {}) {
       provider: route.provider.name,
       model: route.provider.model,
       billable_attempt_id: metered.attempt_id,
-      usage_status: usage.completeness === "complete" ? "complete" : "incomplete",
+      usage_status: effectiveUsageCompleteness === "complete" ? "complete" : "incomplete",
     };
     const design = { ...designBase, design_hash: computeDesignVersionHash(designBase) };
     validateDesignVersion(design, {
@@ -2122,9 +2221,10 @@ export function createCreativeApi(options = {}) {
       ? [publicIdentifier(metered.usage_ref, "usage_ref", operation, 256)] : [];
     return { design, artifact_bytes: artifactBytes,
       telemetry_evidence: metered.telemetry_evidence,
+      ...(usageEvidence ? { usage_evidence: usageEvidence } : {}),
       creation_evidence: { transport_attempt_ids: [...metered.transport_attempt_ids], provider_request_ids: providerRequestIds,
         usage_refs: usageRefs, evidence_refs: [...metered.evidence_refs] },
-      usage: { completeness: usage.completeness ?? "unknown" }, attempt_id: metered.attempt_id };
+      usage: { completeness: effectiveUsageCompleteness }, attempt_id: metered.attempt_id };
   }
 
   async function executeNew(principal, request, started) {
@@ -2452,7 +2552,7 @@ export function createCreativeApi(options = {}) {
       throw new CreativeApiError("unavailable", request.operation, "stored_result");
     }
     if (["generate", "edit"].includes(request.operation)) {
-      assertStoredOnlyKeys(job.result, ["design", "usage", "attempt_id", "telemetry_evidence"], request.operation, "stored_result");
+      assertStoredOnlyKeys(job.result, ["design", "usage", "usage_evidence", "attempt_id", "telemetry_evidence"], request.operation, "stored_result");
       const currentBrief = await loadBrief(started.scope, request.payload.brief_id, request.operation);
       const storedDesignInput = job.result.design;
       if (!isRecord(storedDesignInput) || storedDesignInput.brief_id !== currentBrief.brief_id ||
@@ -2477,6 +2577,33 @@ export function createCreativeApi(options = {}) {
         brief_hash: canonicalHash(brief), known_source_refs: brief.source_identity.map((source) => source.source_id),
       });
       const current = await loadDesign(started.scope, brief, stored.design_version_id, request.operation);
+      if (job.result.usage_evidence !== undefined) {
+        const usageEvidence = job.result.usage_evidence;
+        const usageEvidenceKeys = ["status", "profile_ref", "profile_sha256", "raw_usage_sha256",
+          "target_binding_sha256", "attempt_binding_sha256", "source_observation_id", "transport_attempt_id",
+          "billable_attempt_id", "provider_name", "model", "observation_sha256", "observation_ref"];
+        try {
+          assertStoredOnlyKeys(usageEvidence, usageEvidenceKeys, request.operation, "stored_result.usage_evidence");
+          if (usageEvidence.status !== "settled_owner_mapping" ||
+              usageEvidence.billable_attempt_id !== current.billable_attempt_id ||
+              usageEvidence.provider_name !== current.provider || usageEvidence.model !== current.model ||
+              current.usage_status !== "complete" || job.result.usage?.completeness !== "complete" ||
+              typeof usageEvidence.profile_ref !== "string" || typeof usageEvidence.source_observation_id !== "string" ||
+              typeof usageEvidence.observation_ref !== "string" || typeof usageEvidence.transport_attempt_id !== "string" ||
+              !/^sha256:[a-f0-9]{64}$/.test(usageEvidence.profile_sha256) ||
+              !/^sha256:[a-f0-9]{64}$/.test(usageEvidence.raw_usage_sha256) ||
+              !/^sha256:[a-f0-9]{64}$/.test(usageEvidence.target_binding_sha256) ||
+              !/^sha256:[a-f0-9]{64}$/.test(usageEvidence.attempt_binding_sha256) ||
+              !/^sha256:[a-f0-9]{64}$/.test(usageEvidence.observation_sha256)) {
+            throw new CreativeApiError("unavailable", request.operation, "stored_result.usage_evidence");
+          }
+          for (const field of ["profile_ref", "source_observation_id", "observation_ref", "transport_attempt_id"]) {
+            assertSafePublicIdentifier(usageEvidence[field], { maxLength: 256 });
+          }
+        } catch {
+          throw new CreativeApiError("unavailable", request.operation, "stored_result.usage_evidence");
+        }
+      }
       if (canonicalSerialize(stored) !== canonicalSerialize(current) || !isRecord(job.result.usage) ||
         job.result.usage.completeness !== "complete" || job.result.attempt_id !== current.billable_attempt_id) {
         throw new CreativeApiError("unavailable", request.operation, "stored_result");
