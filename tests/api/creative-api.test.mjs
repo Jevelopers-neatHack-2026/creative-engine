@@ -781,6 +781,138 @@ test("inspection public text rejects credential, signed URL, and personal data v
   }
 });
 
+test("all public identifier fields reject credential-shaped values on fresh and persisted inspection replay", async () => {
+  await loadPlans();
+  const secret = "Bearer synthetic-inspection-id-secret";
+  const freshHarness = await setup();
+  const freshInspect = freshHarness.ports.inspection.inspect;
+  freshHarness.ports.inspection.inspect = async (input) => ({
+    ...(await freshInspect(input)), inspection_id: secret,
+  });
+  const freshBody = request("inspect", { brief_id: "brief-api-1", design_version_id: "design-api-1" }, "inspect-id-private-fresh");
+  const fresh = await freshHarness.api.invoke(actor(), freshBody);
+  assert.equal(fresh.ok, false);
+  assert.equal(fresh.error.code, "unavailable");
+  assert.equal(JSON.stringify(fresh).includes(secret), false);
+
+  const replayHarness = await setup();
+  const replayBody = request("inspect", { brief_id: "brief-api-1", design_version_id: "design-api-1" }, "inspect-id-private-replay");
+  const completed = await replayHarness.api.invoke(actor(), replayBody);
+  assert.equal(completed.ok, true, JSON.stringify(completed));
+  const stored = [...replayHarness.state.jobs.values()].find((job) => job.action_id === replayBody.action_id);
+  stored.result = structuredClone(stored.result);
+  stored.result.inspection.inspection_id = secret;
+  const replayRequest = structuredClone(replayBody);
+  replayRequest.event_id += ":replay";
+  replayRequest.request_id += ":replay";
+  replayRequest.correlation_id += ":replay";
+  const replay = await replayHarness.api.invoke(actor(), replayRequest);
+  assert.equal(replay.ok, false);
+  assert.equal(replay.error.code, "unavailable");
+  assert.equal(JSON.stringify(replay).includes(secret), false);
+});
+
+test("public projection rejects unsafe strings in nested hash-bound metadata and preserves safe optional metadata", async () => {
+  await loadPlans();
+  const secret = "sk-syntheticPublicIdentifierSecret123456789";
+  const safeHarness = await setup();
+  const original = safeHarness.state.designs.get("design-api-1");
+  const withSafeMetadata = versionFrom(original, { artifact: { ...original.artifact,
+    extra: JSON.parse('{"palette":"cobalt","treatment":"matte","__proto__":{"surface":"velvet"}}') } });
+  safeHarness.state.designs.set(withSafeMetadata.design_version_id, withSafeMetadata);
+  const listed = await safeHarness.api.invoke(actor(), request("list", { brief_id: "brief-api-1" }));
+  assert.equal(listed.ok, true, JSON.stringify(listed));
+  assert.equal(listed.result.items[0].artifact.extra.palette, "cobalt");
+  assert.equal(listed.result.items[0].artifact.extra.treatment, "matte");
+  assert.equal(Object.hasOwn(listed.result.items[0].artifact.extra, "__proto__"), true);
+  assert.deepEqual(listed.result.items[0].artifact.extra.__proto__, { surface: "velvet" });
+  assert.equal(listed.result.items[0].design_hash, withSafeMetadata.design_hash);
+
+  const unsafeHarness = await setup();
+  const unsafeBase = unsafeHarness.state.designs.get("design-api-1");
+  const withUnsafeMetadata = versionFrom(unsafeBase, { artifact: { ...unsafeBase.artifact,
+    extra: { nested: { display: secret } } } });
+  unsafeHarness.state.designs.set(withUnsafeMetadata.design_version_id, withUnsafeMetadata);
+  const rejectedList = await unsafeHarness.api.invoke(actor(), request("list", { brief_id: "brief-api-1" }));
+  assert.equal(rejectedList.ok, false);
+  assert.equal(rejectedList.error.code, "unavailable");
+  assert.equal(JSON.stringify(rejectedList).includes(secret), false);
+  const rejectedCompare = await unsafeHarness.api.invoke(actor(), request("compare", {
+    brief_id: "brief-api-1", left_design_version_id: "design-api-1", right_design_version_id: "design-api-1",
+  }));
+  assert.equal(rejectedCompare.ok, false);
+  assert.equal(rejectedCompare.error.code, "unavailable");
+  assert.equal(JSON.stringify(rejectedCompare).includes(secret), false);
+});
+
+test("provider, approval, and receipt records reject credential-shaped values before exposing them", async () => {
+  await loadPlans();
+  const marker = "sk-syntheticPublicIdentifierSecret123456789";
+  const assertRejectedWithoutMarker = (response) => {
+    assert.equal(response.ok, false, JSON.stringify(response));
+    assert.equal(response.error.code, "unavailable");
+    assert.equal(JSON.stringify(response).includes(marker), false);
+  };
+
+  for (const field of ["design_version_id", "artifact.artifact_id", "artifact.media_type", "artifact.extra"]) {
+    const harness = await setup({ withDesign: false });
+    const original = harness.ports.provider.generate;
+    harness.ports.provider.generate = async (input) => {
+      const value = await original(input);
+      const parts = field.split(".");
+      if (parts.length === 2) value[parts[0]][parts[1]] = marker;
+      else value[field] = marker;
+      return value;
+    };
+    const body = generationRequest(`public-provider-${field}`);
+    const first = await harness.api.invoke(actor(), body);
+    assertRejectedWithoutMarker(first);
+    const replay = await harness.api.invoke(actor(), body);
+    assert.equal(JSON.stringify(replay).includes(marker), false);
+  }
+
+  for (const field of ["approval_id", "issuer_id", "key_id", "key_set_version", "revocation.record_ref"]) {
+    const harness = await setup();
+    const original = harness.ports.approval.verifyApproval;
+    harness.ports.approval.verifyApproval = async (input) => {
+      const value = await original(input);
+      const parts = field.split(".");
+      if (parts.length === 2) value.approval[parts[0]][parts[1]] = marker;
+      else value.approval[field] = marker;
+      return value;
+    };
+    const body = request("handoff", { brief_id: "brief-api-1", design_version_id: "design-api-1",
+      approval_ref: "approval-1", destination_ref: "print-1" }, `public-approval-${field}`);
+    assertRejectedWithoutMarker(await harness.api.invoke(actor(), body));
+    assert.equal(harness.state.calls.handoff, 0, "unsafe approval proof must be rejected before consumer submission");
+    const replay = await harness.api.invoke(actor(), body);
+    assert.equal(JSON.stringify(replay).includes(marker), false);
+  }
+
+  for (const field of ["receipt_id", "consumer_id", "access_grants.0.grant_ref"]) {
+    const harness = await setup();
+    const original = harness.ports.handoff.submit;
+    harness.ports.handoff.submit = async (input) => {
+      const value = await original(input);
+      const parts = field.split(".");
+      if (parts.length === 3) value[parts[0]][0][parts[2]] = marker;
+      else value[field] = marker;
+      return value;
+    };
+    const body = request("handoff", { brief_id: "brief-api-1", design_version_id: "design-api-1",
+      approval_ref: "approval-1", destination_ref: "print-1" }, `public-receipt-${field}`);
+    assertRejectedWithoutMarker(await harness.api.invoke(actor(), body));
+    const replay = await harness.api.invoke(actor(), body);
+    assert.equal(JSON.stringify(replay).includes(marker), false);
+  }
+
+  const correlationHarness = await setup({ withDesign: false });
+  const correlationBody = generationRequest("public-request-correlation");
+  correlationBody.correlation_id = marker;
+  assertRejectedWithoutMarker(await correlationHarness.api.invoke(actor(), correlationBody));
+  assert.equal(JSON.stringify(await correlationHarness.api.invoke(actor(), correlationBody)).includes(marker), false);
+});
+
 test("restore selects the existing immutable version by selection CAS without creating a version", async () => {
   await loadPlans();
   const { api, state } = await setup({ secondDesign: true });
