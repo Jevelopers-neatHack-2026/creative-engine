@@ -818,7 +818,7 @@ test("public projection rejects unsafe strings in nested hash-bound metadata and
   const safeHarness = await setup();
   const original = safeHarness.state.designs.get("design-api-1");
   const withSafeMetadata = versionFrom(original, { artifact: { ...original.artifact,
-    extra: JSON.parse('{"palette":"cobalt","treatment":"matte","vendor_id":42,"render_ref":{"revision":2},"optional_ref":null,"source_id":42,"usage_refs":{"vendor":2},"display":"Basic shapes create a balanced composition.","__proto__":{"surface":"velvet"}}') } });
+    extra: JSON.parse('{"palette":"cobalt","treatment":"matte","vendor_id":42,"render_ref":{"revision":2},"optional_ref":null,"source_id":42,"usage_refs":{"vendor":2},"display":"Basic illustrations support the main headline.","style_note":"Basic shapes create a balanced composition.","__proto__":{"surface":"velvet"}}') } });
   safeHarness.state.designs.set(withSafeMetadata.design_version_id, withSafeMetadata);
   const listed = await safeHarness.api.invoke(actor(), request("list", { brief_id: "brief-api-1" }));
   assert.equal(listed.ok, true, JSON.stringify(listed));
@@ -829,7 +829,8 @@ test("public projection rejects unsafe strings in nested hash-bound metadata and
   assert.equal(listed.result.items[0].artifact.extra.optional_ref, null);
   assert.equal(listed.result.items[0].artifact.extra.source_id, 42);
   assert.deepEqual(listed.result.items[0].artifact.extra.usage_refs, { vendor: 2 });
-  assert.equal(listed.result.items[0].artifact.extra.display, "Basic shapes create a balanced composition.");
+  assert.equal(listed.result.items[0].artifact.extra.display, "Basic illustrations support the main headline.");
+  assert.equal(listed.result.items[0].artifact.extra.style_note, "Basic shapes create a balanced composition.");
   assert.equal(Object.hasOwn(listed.result.items[0].artifact.extra, "__proto__"), true);
   assert.deepEqual(listed.result.items[0].artifact.extra.__proto__, { surface: "velvet" });
   assert.equal(listed.result.items[0].design_hash, withSafeMetadata.design_hash);
@@ -853,7 +854,7 @@ test("public projection rejects unsafe strings in nested hash-bound metadata and
 
 test("safe additive artifact metadata preserves canonical design identity across generate, replay, list, and compare", async () => {
   await loadPlans();
-  const safeExtra = JSON.parse('{"vendor_id":42,"render_ref":{"revision":2},"optional_ref":null,"source_id":42,"usage_refs":{"vendor":2},"display":"Basic shapes create a balanced composition."}');
+  const safeExtra = JSON.parse('{"vendor_id":42,"render_ref":{"revision":2},"optional_ref":null,"source_id":42,"usage_refs":{"vendor":2},"display":"Basic illustrations support the main headline.","style_note":"Basic shapes create a balanced composition."}');
   const harness = await setup({ withDesign: false });
   const originalGenerate = harness.ports.provider.generate;
   harness.ports.provider.generate = async (input) => {
@@ -900,11 +901,13 @@ test("public projection rejects sensitive object keys and Basic credentials with
   const privateKey = "sk-abcdefghijklmnopqrstuvwxyz1234";
   const privateText = "sk-syntheticPublicIdentifierSecret123456789";
   const basicCredential = "Basic dXNlcjpwYXNzd29yZA==";
+  const shortBasicCredential = "Basic dTpw";
   const cases = [
     { extra: { nested: { [privateKey]: "cobalt" } }, secrets: [privateKey], field: "result.design.artifact.extra.nested" },
     { extra: { nested: { "owner@example.test": "cobalt" } }, secrets: ["owner@example.test"], field: "result.design.artifact.extra.nested" },
     { extra: { nested: { [privateKey]: privateText } }, secrets: [privateKey, privateText], field: "result.design.artifact.extra.nested" },
     { extra: { display: basicCredential }, secrets: [basicCredential, "dXNlcjpwYXNzd29yZA=="], field: "result.design.artifact.extra.display" },
+    { extra: { display: shortBasicCredential }, secrets: [shortBasicCredential, "dTpw"], field: "result.design.artifact.extra.display" },
   ];
   const markerAbsent = (response, secrets) => {
     assert.equal(response.ok, false, JSON.stringify(response));

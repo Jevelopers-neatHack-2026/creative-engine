@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import {
   ContractError,
   canonicalHash,
@@ -107,7 +108,6 @@ function boundedString(value, field, max = 200) {
 
 const SENSITIVE_PUBLIC_TEXT = [
   /\bBearer\s+[A-Za-z0-9._~+/-]{8,}={0,2}/i,
-  /\bBasic\s+[A-Za-z0-9+/]{12,}={0,2}/i,
   /\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|secret|password|authorization|credential|cookie)\s*[:=]\s*["']?[^\s"'&,;]+/i,
   /\bAKIA[0-9A-Z]{16}\b/,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
@@ -117,8 +117,29 @@ const SENSITIVE_PUBLIC_TEXT = [
   /(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?!\d)/,
 ];
 
+const BASIC_AUTH_CANDIDATE = /\bBasic[\t ]+([A-Za-z0-9+/]+={0,2})(?![A-Za-z0-9+/=])/gi;
+const MAX_BASIC_AUTH_TOKEN_CHARS = 8192;
+
+function hasBasicAuthMaterial(value) {
+  BASIC_AUTH_CANDIDATE.lastIndex = 0;
+  let match;
+  while ((match = BASIC_AUTH_CANDIDATE.exec(value)) !== null) {
+    const token = match[1];
+    const unpadded = token.replace(/=+$/, "");
+    if (unpadded.length % 4 === 1) continue;
+    if (token.length > MAX_BASIC_AUTH_TOKEN_CHARS) return true;
+    const decoded = Buffer.from(token, "base64");
+    const canonical = decoded.toString("base64");
+    if (canonical !== token && canonical.replace(/=+$/, "") !== token) continue;
+    const colon = decoded.indexOf(0x3a);
+    if (colon <= 0 || [...decoded].some((byte) => byte < 0x20 || byte === 0x7f)) continue;
+    return true;
+  }
+  return false;
+}
+
 function hasSensitivePublicText(value) {
-  return SENSITIVE_PUBLIC_TEXT.some((pattern) => pattern.test(value));
+  return hasBasicAuthMaterial(value) || SENSITIVE_PUBLIC_TEXT.some((pattern) => pattern.test(value));
 }
 
 const SENSITIVE_PUBLIC_FIELD = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|credential|authorization|cookie|raw[_-]?response)/i;
