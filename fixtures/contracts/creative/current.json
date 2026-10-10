@@ -1,0 +1,83 @@
+{
+  "contract": "EventIntelligencePackage",
+  "schema_version": "1.1",
+  "event_id": "event-eip-1",
+  "tenant_id": "tenant-1",
+  "project_id": "project-1",
+  "correlation_id": "journey-1",
+  "producer": "event-intelligence@fixture",
+  "occurred_at": "2026-10-10T12:00:00Z",
+  "ingested_at": "2026-10-10T12:00:02Z",
+  "environment": "test",
+  "billing_mode": "simulated",
+  "source_refs": ["source:page-1", "asset:asset-1"],
+  "package_id": "eip-1",
+  "source_identity": [
+    {
+      "source_id": "page-1",
+      "uri": "https://example.test/events/1",
+      "retrieved_at": "2026-10-10T12:00:00Z",
+      "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "facts": [
+    {
+      "fact_id": "event-date-1",
+      "key": "event_date",
+      "status": "verified",
+      "value": "2027-05-18",
+      "provenance": [
+        {
+          "source_id": "page-1",
+          "retrieved_at": "2026-10-10T12:00:00Z",
+          "evidence_ref": "source:page-1#date"
+        }
+      ]
+    }
+  ],
+  "assets": {
+    "presence": "present",
+    "items": [
+      {
+        "asset_id": "asset-1",
+        "source_id": "page-1",
+        "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "media_type": "image/png"
+      }
+    ]
+  },
+  "preferences": {
+    "presence": "present",
+    "items": [
+      {"preference_id": "pref-1", "value": "blue and warm"}
+    ]
+  },
+  "interpretations": {
+    "presence": "present",
+    "items": [
+      {"interpretation_id": "idea-1", "text": "celebratory", "basis": "customer preference"}
+    ]
+  },
+  "permissions": {
+    "presence": "present",
+    "items": [
+      {
+        "asset_id": "asset-1",
+        "action": "reproduce",
+        "status": "granted",
+        "evidence_refs": ["page-1"]
+      }
+    ]
+  },
+  "locks": {
+    "presence": "present",
+    "items": [
+      {
+        "lock_id": "lock-1",
+        "field": "event_date",
+        "value_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "reason": "verified date must remain exact"
+      }
+    ]
+  }
+}
