@@ -841,43 +841,47 @@ function usageFromPayload(payload, transportAttemptId, rawProviderRequestId, tar
     if (typeof targetBindingSha256 === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetBindingSha256);
     return Object.freeze({ usage, present: false, unsupported_shape: false });
   }
-  const overLimitFields = [];
+  const projectionFindings = { tooManyFields: [], unmappedFields: [] };
   const boundedUsage = boundedParsedUsageObject(payload.usage, new Set([
     "input_tokens", "output_tokens", "total_tokens", "input_tokens_details", "output_tokens_details",
-  ]), "usage", overLimitFields);
+  ]), "usage", projectionFindings);
   const usage = normalizeOpenAIImageUsage(boundedUsage, {
     transport_attempt_id: transportAttemptId,
     provider_request_id: rawProviderRequestId,
   });
   if (typeof targetBindingSha256 === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetBindingSha256);
   let observation = usage;
-  for (const field of overLimitFields) {
+  for (const field of [...projectionFindings.unmappedFields, ...projectionFindings.tooManyFields]) {
     observation = usageWithMissingField(observation, field, rawProviderRequestId, targetBindingSha256);
   }
-  return Object.freeze({ usage: observation, present: true, unsupported_shape: overLimitFields.length > 0 });
+  return Object.freeze({ usage: observation, present: true,
+    unsupported_shape: projectionFindings.tooManyFields.length > 0 });
 }
 
 // This projection is only used on objects produced by readJsonBounded/JSON.parse.
 // Keep the provider's known counters without retaining an oversized response
 // extension; the public normalizer remains strict for arbitrary caller input.
-function boundedParsedUsageObject(value, allowedKeys, field, overLimitFields) {
+function boundedParsedUsageObject(value, allowedKeys, field, projectionFindings) {
   if (!isRecord(value)) return value;
   let count = 0;
+  let hasUnknownFields = false;
   for (const key in value) {
     if (!Object.hasOwn(value, key)) continue;
+    if (!allowedKeys.has(key)) hasUnknownFields = true;
     count += 1;
     if (count > 32) {
-      overLimitFields.push(`${field}.too_many_fields`);
+      projectionFindings.tooManyFields.push(`${field}.too_many_fields`);
       break;
     }
   }
+  if (hasUnknownFields) projectionFindings.unmappedFields.push(`${field}.unmapped_fields`);
   const projected = Object.create(null);
   for (const key of allowedKeys) {
     if (!Object.hasOwn(value, key)) continue;
     const child = value[key];
     if (key === "input_tokens_details" || key === "output_tokens_details") {
       projected[key] = boundedParsedUsageObject(child, new Set(["text_tokens", "image_tokens"]),
-        `usage.${key}`, overLimitFields);
+        `usage.${key}`, projectionFindings);
     } else {
       projected[key] = child;
     }

@@ -503,6 +503,88 @@ test("wide native usage preserves bounded counters and private request identity 
   }
 });
 
+test("small unknown native usage extensions remain unmapped through the API and C03", async (t) => {
+  const cases = [
+    ["200 root extension", 200, "root"],
+    ["200 input detail extension", 200, "input_tokens_details"],
+    ["200 output detail extension", 200, "output_tokens_details"],
+    ["400 root extension", 400, "root"],
+    ["400 input detail extension", 400, "input_tokens_details"],
+    ["400 output detail extension", 400, "output_tokens_details"],
+    ["200 no-extension mapped positive control", 200, "none"],
+  ];
+  for (const [index, [label, status, location]] of cases.entries()) {
+    await t.test(label, async (subtest) => {
+      const context = await setup(subtest);
+      const outputBytes = makePng({ width: 16, height: 16 });
+      const rawUsage = { input_tokens: 12, output_tokens: 8, total_tokens: 20,
+        input_tokens_details: { image_tokens: 10, text_tokens: 2 },
+        output_tokens_details: { image_tokens: 7, text_tokens: 1 } };
+      if (location === "root") rawUsage.unreviewed_billable_units = 9;
+      if (location === "input_tokens_details") rawUsage.input_tokens_details.unreviewed_billable_units = 9;
+      if (location === "output_tokens_details") rawUsage.output_tokens_details.unreviewed_billable_units = 9;
+      context.ports.telemetry = { ...context.ports.telemetry,
+        usage_profile_authority: mockOwnerUsageProfileAuthority() };
+      const requestId = `req-private-unknown-usage-${index}`;
+      context.ports.provider = createNativeProvider({ store: context.store,
+        referenceAssetBytes: context.referenceAssetBytes, fetchImpl: async () => {
+          context.counters.provider_posts += 1;
+          const body = status === 200
+            ? { data: [{ b64_json: outputBytes.toString("base64") }], usage: rawUsage }
+            : { error: { code: "invalid_request" }, usage: rawUsage };
+          return new Response(JSON.stringify(body),
+            { status, headers: { "content-type": "application/json", "x-request-id": requestId } });
+        } });
+      const plan = await jsonFixture("generate-plan");
+      plan.base.brief_hash = canonicalHash(context.brief);
+      plan.source_refs = [];
+      plan.steps[0].source_refs = [];
+      const request = apiRequest(`image-unknown-usage-${index}`, "generate", plan, "page-1");
+      request.source_refs = [];
+      const result = await context.api.invoke(authorizedActor(), request);
+
+      const isPositiveControl = location === "none";
+      assert.equal(result.ok, isPositiveControl, JSON.stringify(result));
+      assert.equal(context.counters.provider_posts, 1, "an unknown usage extension never retries the provider request");
+      assert.equal(context.counters.settlements, isPositiveControl ? 1 : 0);
+      assert.equal(context.counters.held, isPositiveControl ? 0 : 1);
+      assert.equal(context.store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length,
+        isPositiveControl ? 1 : 0, "an unmapped extension cannot publish artwork");
+      assert.equal(context.counters.usage_observations.length, 1);
+      const observation = context.counters.usage_observations[0];
+      assert.equal(observation.completeness === "complete", isPositiveControl);
+      if (!isPositiveControl) {
+        const marker = location === "root" ? "usage.unmapped_fields" : `usage.${location}.unmapped_fields`;
+        assert.ok(observation.missing_fields.includes(marker), JSON.stringify(observation.missing_fields));
+      }
+      assert.doesNotMatch(JSON.stringify(observation), /unreviewed_billable_units|extension_/,
+        "unknown provider field names and values are not copied into public telemetry");
+
+      const job = context.store.db.prepare("SELECT job_id FROM creative_jobs WHERE action_id=?")
+        .get(`image-unknown-usage-${index}`);
+      const identity = context.store.db.prepare("SELECT provider_request_id FROM private_provider_attributions WHERE job_id=?")
+        .get(job.job_id);
+      assert.equal(identity?.provider_request_id, requestId, "the private identity record preserves the actual request id");
+      const usageRow = context.store.db.prepare("SELECT usage_json FROM private_provider_usage_attributions WHERE job_id=?")
+        .get(job.job_id);
+      assert.ok(usageRow, "recognized usage counters remain in the restricted usage record");
+      const safeUsage = JSON.parse(usageRow.usage_json);
+      assert.equal(safeUsage.input_tokens, 12);
+      assert.equal(safeUsage.output_tokens, 8);
+      assert.equal(safeUsage.total_tokens, 20);
+      assert.doesNotMatch(JSON.stringify(safeUsage), /unreviewed_billable_units|extension_/);
+      if (isPositiveControl) {
+        assert.deepEqual(safeUsage.missing_fields, ["usage.profile_mapping_pending"]);
+      } else {
+        const marker = location === "root" ? "usage.unmapped_fields" : `usage.${location}.unmapped_fields`;
+        assert.ok(safeUsage.missing_fields.includes(marker), JSON.stringify(safeUsage.missing_fields));
+        assert.ok(safeUsage.missing_fields.includes("usage.profile_mapping_pending"));
+      }
+      assert.doesNotMatch(JSON.stringify(result), new RegExp(requestId));
+    });
+  }
+});
+
 test("wide native usage survives a transient writer failure, store reopen, and one reconciliation without redispatch", async (t) => {
   const context = await setup(t);
   const outputBytes = makePng({ width: 16, height: 16 });
