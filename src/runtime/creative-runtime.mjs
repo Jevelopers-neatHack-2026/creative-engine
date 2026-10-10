@@ -772,6 +772,23 @@ async function usageObservation({ attempt, trustedScope, rawUsage, profile, tran
   }
 }
 
+function retainUsageWithoutSettlement(observation, attempt) {
+  if (!isRecord(observation)) return undefined;
+  try {
+    const missing = Array.isArray(observation.missing_fields) ? [...observation.missing_fields] : [];
+    if (!missing.includes("usage.dispatch_authorization_not_current")) {
+      missing.push("usage.dispatch_authorization_not_current");
+    }
+    return validateUsageObservation({
+      ...observation,
+      completeness: observation.completeness === "unknown" ? "unknown" : "partial",
+      missing_fields: missing,
+    }, attempt);
+  } catch {
+    return undefined;
+  }
+}
+
 const OMIT_FAILURE_USAGE_VALUE = Symbol("omit_failure_usage_value");
 
 function snapshotFailureUsage(value) {
@@ -1641,6 +1658,20 @@ export function createCreativeApi(options = {}) {
         throw error;
       }
     };
+    const finishUsageMapping = async (dispatchContext, observation) => {
+      // Generic legacy consumers use a synchronous local usage profile. The
+      // CE-03 owner mapper is an asynchronous authority boundary and must be
+      // followed by fresh rights/job checks. If those checks fail, retain an
+      // incomplete observation for reconciliation instead of dropping known
+      // usage or letting C03 settle it.
+      if (typeof telemetry.usage_profile_authority?.mapProviderUsage !== "function") return observation;
+      try {
+        await revalidateMappedDispatch(dispatchContext);
+        return observation;
+      } catch {
+        return retainUsageWithoutSettlement(observation, dispatchContext.attempt);
+      }
+    };
     const revalidateTransport = async ({ transport_attempt_id, billable_attempt_id, reservation_ref,
       dispatch_intent_ref, signal }) => {
       boundedString(transport_attempt_id, "transport_attempt_id", 256);
@@ -1748,8 +1779,8 @@ export function createCreativeApi(options = {}) {
             transportAttemptId, idFactory, usageProfileAuthority: telemetry.usage_profile_authority,
             targetBindingSha256: failed.target_binding_sha256, reservationRef: dispatchContext.reservation_ref,
             dispatchIntentRef: dispatch_intent_ref, providerOutcome: failed.provider_outcome });
-          await revalidateMappedDispatch(dispatchContext);
-          return { provider_outcome: failed.provider_outcome, usage_observation };
+          return { provider_outcome: failed.provider_outcome,
+            usage_observation: await finishUsageMapping(dispatchContext, usage_observation) };
         }
         providerValue = dispatched?.value;
         const rawUsage = dispatched?.usage;
@@ -1758,8 +1789,8 @@ export function createCreativeApi(options = {}) {
           idFactory, usageProfileAuthority: telemetry.usage_profile_authority,
           targetBindingSha256: dispatched?.value?.target_binding_sha256, reservationRef: dispatchContext.reservation_ref,
           dispatchIntentRef: dispatch_intent_ref, providerOutcome: dispatched?.provider_outcome ?? "succeeded" });
-        await revalidateMappedDispatch(dispatchContext);
-        return { provider_outcome: dispatched?.provider_outcome ?? "succeeded", usage_observation };
+        return { provider_outcome: dispatched?.provider_outcome ?? "succeeded",
+          usage_observation: await finishUsageMapping(dispatchContext, usage_observation) };
       },
     });
       outcome = telemetryResult.outcome;

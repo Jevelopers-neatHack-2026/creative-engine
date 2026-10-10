@@ -123,7 +123,8 @@ async function setup(t) {
   store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief: trustedBrief });
 
   const referenceAssetBytes = new Map([["asset-2", referenceBytes]]);
-  const counters = { seed_dispatches: 0, provider_posts: 0, reserves: 0, settlements: 0, held: 0 };
+  const counters = { seed_dispatches: 0, provider_posts: 0, reserves: 0, settlements: 0, held: 0,
+    usage_observations: [] };
   let id = 0;
   const metering = {
     async reserveAttempt(attempt) {
@@ -135,7 +136,9 @@ async function setup(t) {
     async releaseBeforeDispatch() { return { status: "released" }; },
     async markAttemptInFlight(input) { return { status: "in_flight", reservation_id: input.reservation_id }; },
     async recordTransportAttempt() { return { status: "recorded" }; },
-    async recordUsageObservation(input) { return { status: "accepted",
+    async recordUsageObservation(input) {
+      counters.usage_observations.push(structuredClone(input.observation));
+      return { status: "accepted",
       source_observation_id: input.observation.source_observation_id,
       effective_billable_attempt_id: input.observation.billable_attempt_id }; },
     async settleReservation(input) {
@@ -572,6 +575,13 @@ test("cancellation, expired deadline, or revoked asset permission during async u
       assert.equal(context.counters.held, 1);
       assert.equal(context.store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, 0);
       assert.doesNotMatch(JSON.stringify(result), /req-private-late-map|input_tokens|total_tokens/);
+      assert.equal(context.counters.usage_observations.length, 1,
+        "C03 receives the observed usage even though the dispatch fence no longer permits settlement");
+      const lateObservation = context.counters.usage_observations[0];
+      assert.equal(lateObservation.completeness, "partial");
+      assert.ok(lateObservation.missing_fields.includes("usage.dispatch_authorization_not_current"));
+      assert.ok(lateObservation.usage_units.some((unit) => unit.name === "total_tokens" && unit.quantity === "20"),
+        "known token counts remain available for reconciliation without authorizing settlement");
       const rawUsage = context.store.db.prepare("SELECT usage_json FROM private_provider_usage_attributions WHERE action_id=?").get(actionId);
       assert.ok(rawUsage, "known native counters stay in the restricted attribution record for reconciliation");
       assert.deepEqual(JSON.parse(rawUsage.usage_json).missing_fields, ["usage.profile_mapping_pending"]);
