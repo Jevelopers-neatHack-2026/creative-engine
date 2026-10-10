@@ -202,6 +202,24 @@ test("recursive privacy screening catches secret-like keys and signed or encoded
     return value;
   })();
   const encodedSignedUrl = encodeURIComponent("https://example.test/image?X-Amz-Signature=synthetic-private-signature");
+  const malformedUtf8Cases = [];
+  for (const invalidByte of ["%FF", "%C3", "%80"]) {
+    for (const [label, sensitive] of [
+      ["basic", "Basic dXNlcjpwYXNz"],
+      ["email", "person@example.test"],
+      ["signed-url", "https://example.test/image?X-Amz-Signature=synthetic-private-signature"],
+    ]) {
+      for (const [position, value] of [
+        ["prefix", `${invalidByte}${encodeURIComponent(sensitive)}`],
+        ["suffix", `${encodeURIComponent(sensitive)}${invalidByte}`],
+        ["valid-prefix", `fixture-${encodeURIComponent(invalidByte)}-${encodeURIComponent(sensitive)}`],
+      ]) {
+        malformedUtf8Cases.push([`${label} ${invalidByte} ${position}`, sensitive.split(" ").at(-1), (research) => {
+          research.preferences.items[0].value = value;
+        }]);
+      }
+    }
+  }
   const cases = [
     ["email key", "person@example.test", (research) => { research.preferences.items[0]["person@example.test"] = "safe"; }],
     ["provider key", "ghp_" + "A".repeat(30), (research) => { research.preferences.items[0]["ghp_" + "A".repeat(30)] = "safe"; }],
@@ -211,12 +229,14 @@ test("recursive privacy screening catches secret-like keys and signed or encoded
     ["malformed suffix cannot shield encoded email URL", "person%40example.test", (research) => { research.source_identity[0].uri = "https://example.test/person%40example.test/%ZZ"; }],
     ["invalid UTF-8 suffix cannot shield encoded email URL", "person%40example.test", (research) => { research.source_identity[0].uri = "https://example.test/person%40example.test/%FF"; }],
     ["malformed prefix cannot shield encoded Basic credentials", "dXNlcjpwYXNz", (research) => { research.preferences.items[0].value = "%ZZ Basic%20dXNlcjpwYXNz"; }],
+    ["invalid UTF-8 byte cannot shield a percent-encoded Basic credential", "dXNlcjpwYXNz", (research) => { research.preferences.items[0].value = "%FF%42%61%73%69%63%20dXNlcjpwYXNz"; }],
     ["malformed prefix cannot shield encoded signed URL", "synthetic-private-signature", (research) => { research.source_identity[0].uri = "%ZZ " + encodedSignedUrl; }],
     ["URI with malformed encoding fails closed", "%ZZ", (research) => { research.source_identity[0].uri = "https://example.test/assets/%ZZ"; }],
     ["triple-encoded email URL", "person@example.test", (research) => { research.source_identity[0].uri = tripleEncodedEmailUrl; }],
     ["deep encoding fails closed", "person@example.test", (research) => { research.source_identity[0].uri = deeplyEncodedEmailUrl; }],
     ["URL userinfo", "user:password", (research) => { research.source_identity[0].uri = "https://user:password@example.test/path"; }],
     ["nested sensitive key", "person@example.test", (research) => { research.preferences.items[0]["person@example.test"] = { authorization: "synthetic-private-value" }; }],
+    ...malformedUtf8Cases,
   ];
   for (const [name, marker, mutate] of cases) {
     const research = completeResearchPackage();
@@ -271,6 +291,66 @@ test("Basic prose remains usable while credential-looking values are rejected", 
   } catch (error) { failure = error; }
   assert.equal(failure?.code, "sensitive_input");
   assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes("Og=="), false);
+});
+
+test("invalid UTF-8 escape bytes cannot shield encoded credentials across public brief fields", () => {
+  const percentEveryByte = (text) => [...Buffer.from(text, "utf8")]
+    .map((byte) => `%${byte.toString(16).padStart(2, "0")}`).join("");
+  const sensitiveValues = [
+    "Basic dXNlcjpwYXNz",
+    "person@example.test",
+    "https://example.test/a?X-Amz-Signature=synthetic-signature",
+  ];
+  const placements = ["customer", "artistic", "source-uri", "key"];
+  for (const invalidByte of ["%FF", "%C3", "%80"]) {
+    for (const secret of sensitiveValues) {
+      const encoded = percentEveryByte(secret);
+      for (const position of ["prefix", "middle", "suffix"]) {
+        const value = position === "prefix" ? invalidByte + encoded
+          : position === "suffix" ? encoded + invalidByte
+            : encoded.slice(0, 9) + invalidByte + encoded.slice(9);
+        for (const placement of placements) {
+          const research = completeResearchPackage();
+          const extra = placement === "customer"
+            ? { customer_preferences: [{ preference_id: "privacy-fixture", value }] }
+            : placement === "artistic"
+              ? { artistic_intent: [{ interpretation_id: "privacy-fixture", text: value }] }
+              : {};
+          if (placement === "source-uri") research.source_identity[0].uri = value;
+          if (placement === "key") research.preferences.items[0][value] = "safe";
+          let result;
+          let failure;
+          try { result = plan(research, baseTime, extra); } catch (error) { failure = error; }
+          const mustReject = placement === "source-uri" || position !== "middle";
+          const label = `${placement}/${position}/${invalidByte}/${secret}`;
+          if (mustReject) {
+            assert.equal(failure?.code, "sensitive_input", label);
+            assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes(secret), false, label);
+          } else if (failure) {
+            assert.equal(failure.code, "sensitive_input", label);
+            assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes(secret), false, label);
+          } else {
+            assert.equal(JSON.stringify(result).includes(secret), false, label);
+          }
+        }
+      }
+    }
+  }
+  const benign = [
+    "Basic illustrations with warm colors",
+    "Use 20% warm and 80% cool colors",
+    "Use 20% warm, 80% cool; café style",
+    "A literal %ZZ placeholder",
+    "A literal %FF placeholder",
+    "https://example.test/caf%C3%A9",
+    "https://example.test/illustrations%20for%20the%20event",
+  ];
+  for (const value of benign) {
+    const result = plan(completeResearchPackage(), baseTime, {
+      customer_preferences: [{ preference_id: "benign-encoded-text", value }],
+    });
+    assert.equal(result.brief.preferences.items.some((item) => item.value === value), true, value);
+  }
 });
 
 test("prototype-named additional fact keys produce ordinary missing-fact clarifications", () => {

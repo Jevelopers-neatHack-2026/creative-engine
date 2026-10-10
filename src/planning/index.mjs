@@ -89,11 +89,14 @@ function decodedVariants(value) {
       // Decode valid escape runs independently. A malformed neighbour must
       // not shield a valid encoded email, credential, or signed URL.
       const next = decoded.replace(/(?:%[0-9a-f]{2})+/gi, (run) => {
+        const bytes = Buffer.from(run.match(/[0-9a-f]{2}/gi).map((hex) => Number.parseInt(hex, 16)));
         try {
-          return decodeURIComponent(run);
+          return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
         } catch {
           malformed = true;
-          return run;
+          // Replace malformed byte sequences while preserving all independent
+          // ASCII/UTF-8 suffixes so invalid bytes cannot conceal sensitive text.
+          return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
         }
       });
       if (/%(?![0-9a-f]{2})/i.test(decoded)) malformed = true;
@@ -106,13 +109,22 @@ function decodedVariants(value) {
   return { variants, exhausted, malformed };
 }
 
+function privacyVariants(values) {
+  const expanded = [];
+  for (const value of values) {
+    expanded.push(value);
+    if (value.includes("\ufffd")) expanded.push(value.replace(/\ufffd+/g, ""));
+  }
+  return expanded;
+}
+
 function hasSignedUrl(value, variants) {
-  for (const variant of variants) {
+  for (const variant of privacyVariants(variants)) {
     const candidates = variant.match(/https?:\/\/[^\s"'<>]+/gi) ?? [];
     for (const candidate of candidates) {
       const candidateVariants = decodedVariants(candidate);
       if (candidateVariants.exhausted || candidateVariants.malformed) return true;
-      for (const decoded of candidateVariants.variants) {
+      for (const decoded of privacyVariants(candidateVariants.variants)) {
         if (SENSITIVE_VALUE.test(decoded) || hasBasicAuthMaterial(decoded)) return true;
       }
       const decoded = candidateVariants.variants.at(-1);
@@ -137,10 +149,10 @@ function hasSignedUrl(value, variants) {
 function hasSensitivePublicText(value, { uri = false } = {}) {
   const screening = decodedVariants(value);
   if (screening.exhausted || (uri && screening.malformed)) return true;
-  for (const variant of screening.variants) {
+  for (const variant of privacyVariants(screening.variants)) {
     if (SENSITIVE_VALUE.test(variant) || hasBasicAuthMaterial(variant)) return true;
   }
-  return hasSignedUrl(value, screening.variants);
+  return hasSignedUrl(value, privacyVariants(screening.variants));
 }
 
 function isRecord(value) {
