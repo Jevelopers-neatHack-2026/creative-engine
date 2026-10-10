@@ -1,0 +1,67 @@
+{
+  "evidence_version": "controls-offline-evidence/1.0",
+  "dependency_mode": "mock",
+  "billing_mode": "simulated",
+  "runtime": "v24.15.0",
+  "schema_version": "creative-controls/1.1",
+  "action_version": "creative-apply/1.1",
+  "contract_status": "local-consumer-proposal",
+  "source_fingerprint_sha256": "81550044f5fcd5bc68348e90b5d8e405aba03601e459d1da28cc8836ca3bb6fe",
+  "source_files": [
+    "src/controls/actions.mjs",
+    "src/controls/contract.mjs",
+    "src/controls/index.d.ts",
+    "src/controls/index.mjs",
+    "src/controls/schema.mjs",
+    "tests/controls/actions.test.mjs",
+    "tests/controls/concurrent-worker.mjs",
+    "examples/frontend-action-roundtrip/.gitignore",
+    "examples/frontend-action-roundtrip/app.mjs",
+    "examples/frontend-action-roundtrip/index.html",
+    "examples/frontend-action-roundtrip/package-lock.json",
+    "examples/frontend-action-roundtrip/package.json",
+    "examples/frontend-action-roundtrip/playwright.config.mjs",
+    "examples/frontend-action-roundtrip/server.mjs",
+    "examples/frontend-action-roundtrip/style.css",
+    "examples/frontend-action-roundtrip/tests/roundtrip.spec.mjs",
+    "fixtures/controls/check.mjs",
+    "fixtures/controls/invalid.json",
+    "fixtures/controls/older.json",
+    "fixtures/controls/state.mjs",
+    "fixtures/controls/unknown-field.json",
+    "fixtures/controls/valid.json",
+    ".github/workflows/controls.yml",
+    "docs/controls-integration.md"
+  ],
+  "fixture_schema_sha256": "538af5523c42e60c9bc285c262decc7e7d0dc5eab57aef44bf92844d3f0b5907",
+  "fixture_action_sha256": "ae6ba957c3196063c588203a9e5ad55ad8e8bc32a087284a1445ade4fd27f65e",
+  "checks": [
+    {
+      "command": "node --test tests/controls/actions.test.mjs",
+      "exit_code": 0,
+      "passed": true
+    },
+    {
+      "command": "npm test (Playwright Chromium + axe)",
+      "exit_code": 0,
+      "passed": true
+    }
+  ],
+  "browser_exercised": true,
+  "calls": {
+    "jev": 0,
+    "image": 0
+  },
+  "approval_created": false,
+  "purchase_created": false,
+  "pending": [
+    "canonical external schema publication and consumer acknowledgement",
+    "CE-01 API integration",
+    "CE-02 actual versioned brief integration",
+    "CE-08 actual version store integration",
+    "application authentication/authorization",
+    "harness outbox consumer and paid artwork dispatch",
+    "live providers and external release acceptance"
+  ],
+  "passed": true
+}
