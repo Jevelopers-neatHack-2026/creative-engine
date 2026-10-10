@@ -432,6 +432,198 @@ test("actual API holds and stages native response attribution on a transient usa
     { reconciled: 0, remaining: 0 });
 });
 
+test("wide native usage preserves bounded counters and private request identity before rejecting the response", async (t) => {
+  const cases = [
+    ["200 root width", 200, "root"],
+    ["200 detail width", 200, "details"],
+    ["400 root width", 400, "root"],
+    ["400 detail width", 400, "details"],
+  ];
+  for (const [index, [label, status, width]] of cases.entries()) {
+    await t.test(label, async (subtest) => {
+      const context = await setup(subtest);
+      const outputBytes = makePng({ width: 16, height: 16 });
+      const rawUsage = { input_tokens: 12, output_tokens: 8, total_tokens: 20,
+        input_tokens_details: { image_tokens: 10, text_tokens: 2 },
+        output_tokens_details: { image_tokens: 7, text_tokens: 1 } };
+      if (width === "root") {
+        for (let extra = 0; extra < 33; extra += 1) rawUsage[`extension_${extra}`] = extra;
+      } else {
+        for (let extra = 0; extra < 33; extra += 1) rawUsage.input_tokens_details[`extension_${extra}`] = extra;
+      }
+      const requestId = `req-private-wide-usage-${index}`;
+      context.ports.provider = createNativeProvider({ store: context.store,
+        referenceAssetBytes: context.referenceAssetBytes, fetchImpl: async () => {
+          context.counters.provider_posts += 1;
+          return new Response(JSON.stringify(status === 200
+            ? { data: [{ b64_json: outputBytes.toString("base64") }], usage: rawUsage }
+            : { error: { code: "invalid_request" }, usage: rawUsage }),
+          { status, headers: { "content-type": "application/json", "x-request-id": requestId } });
+        } });
+      const plan = await jsonFixture("generate-plan");
+      plan.base.brief_hash = canonicalHash(context.brief);
+      plan.source_refs = [];
+      plan.steps[0].source_refs = [];
+      const request = apiRequest(`image-wide-usage-${index}`, "generate", plan, "page-1");
+      request.source_refs = [];
+      const result = await context.api.invoke(authorizedActor(), request);
+
+      assert.equal(result.ok, false, JSON.stringify(result));
+      assert.equal(context.counters.provider_posts, 1);
+      assert.equal(context.counters.held, 1);
+      assert.equal(context.counters.settlements, 0);
+      assert.equal(context.store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, 0);
+      assert.equal(context.counters.usage_observations.length, 1);
+      assert.notEqual(context.counters.usage_observations[0].completeness, "complete");
+      assert.doesNotMatch(JSON.stringify(context.counters.usage_observations[0]), /extension_/,
+        "unrecognized provider extensions are never copied into public telemetry");
+
+      const job = context.store.db.prepare("SELECT job_id FROM creative_jobs WHERE action_id=?")
+        .get(`image-wide-usage-${index}`);
+      const identity = context.store.db.prepare("SELECT provider_request_id FROM private_provider_attributions WHERE job_id=?")
+        .get(job.job_id);
+      assert.equal(identity?.provider_request_id, requestId, "the bounded provider identity is retained privately");
+      const usageRow = context.store.db.prepare("SELECT usage_json FROM private_provider_usage_attributions WHERE job_id=?")
+        .get(job.job_id);
+      assert.ok(usageRow, "recognized native counters are durably retained despite unsupported width");
+      const safeUsage = JSON.parse(usageRow.usage_json);
+      assert.equal(safeUsage.completeness, "unknown");
+      assert.equal(safeUsage.input_tokens, 12);
+      assert.equal(safeUsage.output_tokens, 8);
+      assert.equal(safeUsage.total_tokens, 20);
+      assert.doesNotMatch(JSON.stringify(safeUsage), /extension_/);
+      assert.deepEqual(safeUsage.input_tokens_details, { image_tokens: 10, text_tokens: 2 });
+      assert.deepEqual(safeUsage.output_tokens_details, { image_tokens: 7, text_tokens: 1 });
+      assert.ok(safeUsage.missing_fields.includes(width === "root"
+        ? "usage.too_many_fields" : "usage.input_tokens_details.too_many_fields"),
+      JSON.stringify(safeUsage.missing_fields));
+      assert.doesNotMatch(JSON.stringify(result), new RegExp(requestId));
+      assert.equal(context.counters.provider_posts, 1, "usage rejection never retries or redispatches the response");
+    });
+  }
+});
+
+test("wide native usage survives a transient writer failure, store reopen, and one reconciliation without redispatch", async (t) => {
+  const context = await setup(t);
+  const outputBytes = makePng({ width: 16, height: 16 });
+  const rawUsage = { input_tokens: 12, output_tokens: 8, total_tokens: 20,
+    input_tokens_details: { image_tokens: 10, text_tokens: 2 },
+    output_tokens_details: { image_tokens: 7, text_tokens: 1 } };
+  for (let extra = 0; extra < 33; extra += 1) rawUsage.input_tokens_details[`extension_${extra}`] = extra;
+  const requestId = "req-private-wide-transient-usage";
+  context.ports.provider = createNativeProvider({ store: context.store, referenceAssetBytes: context.referenceAssetBytes,
+    fetchImpl: async () => {
+      context.counters.provider_posts += 1;
+      return new Response(JSON.stringify({ data: [{ b64_json: outputBytes.toString("base64") }], usage: rawUsage }),
+        { status: 200, headers: { "content-type": "application/json", "x-request-id": requestId } });
+    } });
+  const originalJobs = context.ports.jobs;
+  context.ports.jobs = { ...originalJobs,
+    async recordPrivateProviderAttribution(input) {
+      return { status: "unavailable", transport_attempt_id: input.transport_attempt_id,
+        provider_request_ref: input.provider_request_ref };
+    },
+    async recordPrivateProviderUsageAttribution() { throw new Error("transient usage storage outage"); },
+    async stagePrivateProviderAttribution(input) { return originalJobs.stagePrivateProviderAttribution(input); },
+  };
+  const plan = await jsonFixture("generate-plan");
+  plan.base.brief_hash = canonicalHash(context.brief);
+  plan.source_refs = [];
+  plan.steps[0].source_refs = [];
+  const request = apiRequest("image-wide-transient-action", "generate", plan, "page-1");
+  request.source_refs = [];
+  const result = await context.api.invoke(authorizedActor(), request);
+
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(context.counters.provider_posts, 1);
+  assert.equal(context.counters.held, 1);
+  assert.equal(context.counters.settlements, 0);
+  assert.equal(context.store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, 0);
+  const job = context.store.db.prepare("SELECT job_id FROM creative_jobs WHERE action_id=?")
+    .get("image-wide-transient-action");
+  const pending = context.store.db.prepare("SELECT pending_ref,payload_json,payload_sha256 FROM private_provider_attribution_pending WHERE job_id=?")
+    .get(job.job_id);
+  assert.ok(pending, "the real store staged the unavailable private writes");
+  assert.equal(canonicalHash(JSON.parse(pending.payload_json)), pending.payload_sha256);
+  const staged = JSON.parse(pending.payload_json);
+  assert.equal(staged.provider_request_id, requestId);
+  assert.equal(staged.usage.input_tokens, 12);
+  assert.equal(staged.usage.output_tokens, 8);
+  assert.equal(staged.usage.total_tokens, 20);
+  assert.equal(staged.usage.completeness, "unknown");
+  assert.ok(staged.usage.missing_fields.includes("usage.input_tokens_details.too_many_fields"));
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(requestId));
+
+  const databasePath = context.store.databasePath;
+  const objectRoot = context.store.objectRoot;
+  context.store.close();
+  const reopened = new CreativeVersionStore({ databasePath, objectRoot, now: () => NOW });
+  t.after(() => reopened.close());
+  assert.deepEqual(reopened.reconcilePrivateProviderAttributions({ scope: SCOPE, limit: 10 }),
+    { reconciled: 1, remaining: 0 });
+  const privateIdentity = reopened.db.prepare("SELECT provider_request_id,transport_attempt_id FROM private_provider_attributions WHERE job_id=?")
+    .get(job.job_id);
+  assert.equal(privateIdentity.provider_request_id, requestId);
+  const privateUsage = reopened.db.prepare("SELECT usage_json FROM private_provider_usage_attributions WHERE job_id=?")
+    .get(job.job_id);
+  assert.ok(privateUsage);
+  assert.equal(JSON.parse(privateUsage.usage_json).input_tokens_details.image_tokens, 10);
+  assert.deepEqual(reopened.reconcilePrivateProviderAttributions({ scope: SCOPE, limit: 10 }),
+    { reconciled: 0, remaining: 0 }, "reopen reconciliation is idempotent");
+  assert.equal(context.counters.provider_posts, 1, "reconciliation does not call the provider again");
+  assert.equal(reopened.db.prepare("SELECT COUNT(*) AS count FROM design_versions WHERE tenant_id=? AND project_id=? AND brief_id=?")
+    .get(SCOPE.tenant_id, SCOPE.project_id, SCOPE.brief_id).count, 0, "failed unknown usage never publishes artwork");
+});
+
+test("runtime rejects a staged attribution ACK unless ref and hash bind the exact pending payload", async (t) => {
+  const context = await setup(t);
+  const outputBytes = makePng({ width: 16, height: 16 });
+  const requestId = "req-private-stale-pending-ack";
+  context.ports.provider = createNativeProvider({ store: context.store, referenceAssetBytes: context.referenceAssetBytes,
+    fetchImpl: async () => {
+      context.counters.provider_posts += 1;
+      return new Response(JSON.stringify({ data: [{ b64_json: outputBytes.toString("base64") }],
+        usage: { input_tokens: 2, output_tokens: 3, total_tokens: 5 } }),
+      { status: 200, headers: { "content-type": "application/json", "x-request-id": requestId } });
+    } });
+  const originalJobs = context.ports.jobs;
+  context.ports.jobs = { ...originalJobs,
+    async recordPrivateProviderAttribution(input) {
+      return { status: "unavailable", transport_attempt_id: input.transport_attempt_id,
+        provider_request_ref: input.provider_request_ref };
+    },
+    async recordPrivateProviderUsageAttribution() { throw new Error("transient usage storage outage"); },
+    async stagePrivateProviderAttribution(input) {
+      return { status: "staged", transport_attempt_id: input.transport_attempt_id,
+        pending_ref: `private-attribution:${"f".repeat(64)}`, payload_sha256: `sha256:${"e".repeat(64)}` };
+    },
+  };
+  const plan = await jsonFixture("generate-plan");
+  plan.base.brief_hash = canonicalHash(context.brief);
+  plan.source_refs = [];
+  plan.steps[0].source_refs = [];
+  const request = apiRequest("image-stale-pending-ack-action", "generate", plan, "page-1");
+  request.source_refs = [];
+  const result = await context.api.invoke(authorizedActor(), request);
+
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(context.counters.provider_posts, 1);
+  assert.equal(context.counters.held, 1);
+  assert.equal(context.counters.settlements, 0);
+  assert.equal(context.store.listDesignVersions({ scope: SCOPE, brief_id: SCOPE.brief_id, limit: 10 }).items.length, 0);
+  const job = context.store.db.prepare("SELECT job_id FROM creative_jobs WHERE action_id=?")
+    .get("image-stale-pending-ack-action");
+  for (const table of ["private_provider_attributions", "private_provider_usage_attributions",
+    "private_provider_attribution_pending"]) {
+    assert.equal(context.store.db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE job_id=?`).get(job.job_id).count, 0,
+      `${table} did not persist a row for the stale ACK`);
+  }
+  assert.equal(context.counters.usage_observations.length, 1);
+  assert.ok(context.counters.usage_observations[0].missing_fields.includes("private_attribution_unavailable"));
+  assert.ok(!context.counters.usage_observations[0].missing_fields.includes("private_attribution_pending_reconciliation"));
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(requestId));
+});
+
 test("actual API refreshes current job and asset authority after native post-ack awaits and before POST", async (t) => {
   for (const kind of ["cancelled", "asset_revoked", "lease_expired"]) await t.test(kind, async (subtest) => {
     const context = await setup(subtest);

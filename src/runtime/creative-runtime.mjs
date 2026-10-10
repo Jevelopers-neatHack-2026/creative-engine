@@ -2142,10 +2142,36 @@ export function createCreativeApi(options = {}) {
                 } : {}),
                 ...(attribution.usage !== undefined ? { usage: attribution.usage } : {}),
               });
+              const pendingPayload = {
+                tenant_id: pendingInput.scope.tenant_id,
+                project_id: pendingInput.scope.project_id,
+                actor_id: pendingInput.actor_id,
+                job_id: pendingInput.job_id,
+                action_id: pendingInput.action_id,
+                request_hash: pendingInput.request_hash,
+                operation: pendingInput.operation,
+                provider: pendingInput.provider,
+                model: pendingInput.model,
+                reservation_ref: pendingInput.reservation_ref,
+                billable_attempt_id: pendingInput.billable_attempt_id,
+                transport_attempt_id: pendingInput.transport_attempt_id,
+                dispatch_intent_ref: pendingInput.dispatch_intent_ref,
+                target_binding_sha256: pendingInput.target_binding_sha256,
+                ...(pendingInput.provider_request_id !== undefined ? {
+                  provider_request_id: pendingInput.provider_request_id,
+                  provider_request_ref: pendingInput.provider_request_ref,
+                } : {}),
+                ...(pendingInput.usage !== undefined ? {
+                  usage: pendingInput.usage,
+                  usage_sha256: canonicalHash(pendingInput.usage),
+                } : {}),
+              };
+              const expectedPayloadSha256 = canonicalHash(pendingPayload);
+              const expectedPendingRef = `private-attribution:${expectedPayloadSha256.slice(7)}`;
               const ack = await privateAttributionPendingPort(pendingInput);
               if (!isRecord(ack) || !["staged", "replayed"].includes(ack.status) ||
-                  typeof ack.pending_ref !== "string" || ack.transport_attempt_id !== transportAttemptId ||
-                  typeof ack.payload_sha256 !== "string" || !/^sha256:[a-f0-9]{64}$/.test(ack.payload_sha256)) {
+                  ack.pending_ref !== expectedPendingRef || ack.transport_attempt_id !== transportAttemptId ||
+                  ack.payload_sha256 !== expectedPayloadSha256) {
                 throw new CreativeApiError("unavailable", operation, "provider_attribution_pending_ack");
               }
               return ack;

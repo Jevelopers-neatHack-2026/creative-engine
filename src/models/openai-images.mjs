@@ -833,13 +833,56 @@ export function normalizeOpenAIImageUsage(raw, identities = {}) {
 }
 
 function usageFromPayload(payload, transportAttemptId, rawProviderRequestId, targetBindingSha256) {
-  if (!isRecord(payload) || !Object.hasOwn(payload, "usage")) return undefined;
-  const usage = normalizeOpenAIImageUsage(payload.usage, {
+  if (!isRecord(payload) || !Object.hasOwn(payload, "usage")) {
+    const usage = normalizeOpenAIImageUsage(undefined, {
+      transport_attempt_id: transportAttemptId,
+      provider_request_id: rawProviderRequestId,
+    });
+    if (typeof targetBindingSha256 === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetBindingSha256);
+    return Object.freeze({ usage, present: false, unsupported_shape: false });
+  }
+  const overLimitFields = [];
+  const boundedUsage = boundedParsedUsageObject(payload.usage, new Set([
+    "input_tokens", "output_tokens", "total_tokens", "input_tokens_details", "output_tokens_details",
+  ]), "usage", overLimitFields);
+  const usage = normalizeOpenAIImageUsage(boundedUsage, {
     transport_attempt_id: transportAttemptId,
     provider_request_id: rawProviderRequestId,
   });
   if (typeof targetBindingSha256 === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetBindingSha256);
-  return usage;
+  let observation = usage;
+  for (const field of overLimitFields) {
+    observation = usageWithMissingField(observation, field, rawProviderRequestId, targetBindingSha256);
+  }
+  return Object.freeze({ usage: observation, present: true, unsupported_shape: overLimitFields.length > 0 });
+}
+
+// This projection is only used on objects produced by readJsonBounded/JSON.parse.
+// Keep the provider's known counters without retaining an oversized response
+// extension; the public normalizer remains strict for arbitrary caller input.
+function boundedParsedUsageObject(value, allowedKeys, field, overLimitFields) {
+  if (!isRecord(value)) return value;
+  let count = 0;
+  for (const key in value) {
+    if (!Object.hasOwn(value, key)) continue;
+    count += 1;
+    if (count > 32) {
+      overLimitFields.push(`${field}.too_many_fields`);
+      break;
+    }
+  }
+  const projected = Object.create(null);
+  for (const key of allowedKeys) {
+    if (!Object.hasOwn(value, key)) continue;
+    const child = value[key];
+    if (key === "input_tokens_details" || key === "output_tokens_details") {
+      projected[key] = boundedParsedUsageObject(child, new Set(["text_tokens", "image_tokens"]),
+        `usage.${key}`, overLimitFields);
+    } else {
+      projected[key] = child;
+    }
+  }
+  return projected;
 }
 
 function parseRetryAfter(value, nowMs) {
@@ -1242,7 +1285,8 @@ async function providerError(response, retryContext, providerRequestRef, rawProv
   let payload;
   try { payload = await readJsonBounded(response); } catch { payload = {}; }
   const mapped = knownProviderError(payload, response.status);
-  let usage = usageFromPayload(payload, transportAttemptId, rawProviderRequestId, targetBindingSha256);
+  const parsedUsage = usageFromPayload(payload, transportAttemptId, rawProviderRequestId, targetBindingSha256);
+  let usage = parsedUsage.present ? parsedUsage.usage : undefined;
   usage = await recordProviderResponseAttribution(input, { transportAttemptId, targetBindingSha256,
     rawProviderRequestId, providerRequestRef, usage });
   let retry;
@@ -1558,17 +1602,19 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
       }
       throw error;
     }
-    const usage = normalizeOpenAIImageUsage(payload.usage, {
-      transport_attempt_id: transportId,
-      provider_request_id: rawProviderRequestId,
-    });
-    if (typeof targetSha === "string") PRIVATE_TARGET_BINDING_SHA256.set(usage, targetSha);
-    const observedUsage = Object.hasOwn(payload, "usage") ? usage : undefined;
+    const parsedUsage = usageFromPayload(payload, transportId, rawProviderRequestId, targetSha);
+    const observedUsage = parsedUsage.present ? parsedUsage.usage : undefined;
     await recordProviderResponseAttribution(input, { transportAttemptId: transportId, targetBindingSha256: targetSha,
       rawProviderRequestId, providerRequestRef, usage: observedUsage });
     if (input.signal.aborted || now() >= deadlineMs) {
       fail("provider_outcome_unknown", "Cancellation or deadline occurred after transport; output remains unpublished.", {
         outcome: "unknown", provider_request_ref: providerRequestRef, usage: observedUsage,
+        private_provider_request_id: rawProviderRequestId,
+      });
+    }
+    if (parsedUsage.unsupported_shape) {
+      fail("usage_invalid", "Provider usage exceeded the supported field bound.", {
+        outcome: "unknown", field: "usage", provider_request_ref: providerRequestRef, usage: observedUsage,
         private_provider_request_id: rawProviderRequestId,
       });
     }
@@ -1623,7 +1669,7 @@ export function createOpenAIImagesProvider({ model_id, configuration, capability
       provider: "openai",
       model: profile.model_id,
       target_binding_sha256: targetSha,
-      usage,
+      usage: parsedUsage.usage,
     });
   }
 
