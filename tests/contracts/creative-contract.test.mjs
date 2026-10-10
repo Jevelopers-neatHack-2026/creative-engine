@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   ContractError,
@@ -6,6 +7,7 @@ import {
   canonicalSerialize,
 } from "../../src/contracts/index.mjs";
 import { ContractError as CreativeContractError } from "../../src/contracts/creative/v1.mjs";
+import { assertControlContractBinding, controlContractReference } from "../../src/controls/contract.mjs";
 import {
   assessResearchReadiness,
   computeDesignVersionHash,
@@ -213,8 +215,12 @@ test("CreativeBrief cannot grant permissions absent or unknown in its research p
 test("DesignControlSchema translates the checked-in producer's names, scope, versions, and hash", async () => {
   const wrapper = await fixture("creative/design-control-schema.json");
   const producer = await fixture("creative/controls-producer-valid.json");
+  const producerSource = JSON.parse(await readFile(new URL("../../fixtures/controls/valid.json", import.meta.url), "utf8"));
   const payload = producer.schema;
   const controlsScope = { ...trustedScope, tenant_id: wrapper.tenant_id, project_id: wrapper.project_id };
+  assert.deepEqual(producer, producerSource);
+  assert.deepEqual(producer.control_reference, controlContractReference(producerSource.schema));
+  assert.equal(assertControlContractBinding(producer.control_reference, producerSource.schema), producerSource.schema);
   assert.equal(producer.control_reference.control_contract, wrapper.control_contract);
   assert.equal(producer.control_reference.control_schema_version, wrapper.control_schema_version);
   assert.equal(producer.control_reference.tenant_id, wrapper.tenant_id);

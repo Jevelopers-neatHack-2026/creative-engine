@@ -1,4 +1,4 @@
-.PHONY: bootstrap build check acceptance
+.PHONY: bootstrap build check acceptance typecheck-contracts
 
 TARGET ?= all
 MODE ?= mock
@@ -13,6 +13,9 @@ build:
 	node --check src/controls/contract.mjs
 	node --check src/controls/actions.mjs
 	node --check src/controls/index.mjs
+
+typecheck-contracts:
+	node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc -p tests/contracts/types/tsconfig.json
 
 check:
 	@if [ "$(MODE)" != "mock" ]; then \

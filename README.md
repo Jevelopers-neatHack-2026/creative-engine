@@ -17,6 +17,13 @@ make check TARGET=all MODE=mock
 
 The contracts and control checks use synthetic fixtures and make no provider calls. `make acceptance TARGET=contracts` and `make acceptance TARGET=decision-contract` intentionally fail while external owner agreements remain pending. `MODE=live` fails closed because there is no live dispatch implementation.
 
+The standalone contracts workflow also checks the public package imports with TypeScript 5.9.3 in strict NodeNext mode. Reproduce that typecheck locally after installing the browser fixture's locked development tools:
+
+```sh
+npm ci --prefix examples/frontend-action-roundtrip
+make typecheck-contracts
+```
+
 The controls browser example has its own lockfile and dependency install. Its Node and Chromium roundtrip instructions, local evidence format, and remaining integration requirements are in [controls integration](docs/controls-integration.md). It uses mock application identity and state.
 
 ## Architecture and contracts

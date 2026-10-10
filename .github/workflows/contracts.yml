@@ -26,4 +26,7 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci --ignore-scripts --offline
+      - run: npm ci --prefix examples/frontend-action-roundtrip
+      - run: node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --version
+      - run: make typecheck-contracts
       - run: make check TARGET=all MODE=mock
