@@ -1,0 +1,147 @@
+import { createHash } from "node:crypto";
+import { readFile, realpath } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { canonicalHash } from "../src/contracts/validation.mjs";
+
+const requirements = {
+  contracts: [
+    "shared_contracts_creative_schemas",
+    "event_intelligence_producer",
+    "trusted_project_membership",
+    "creative_controls_consumer",
+  ],
+  "decision-contract": [
+    "shared_contracts_decision_port",
+    "harness_decision_port_consumer",
+    "harness_jev_transport_owner",
+  ],
+};
+
+function rawSha256(bytes) {
+  return "sha256:" + createHash("sha256").update(bytes).digest("hex");
+}
+
+function sameJson(left, right) {
+  function stable(value) {
+    if (Array.isArray(value)) return value.map(stable);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+    }
+    return value;
+  }
+  return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
+}
+
+function validNonzeroHash(value) {
+  return typeof value === "string" && /^sha256:(?!0{64}$)[a-f0-9]{64}$/.test(value);
+}
+
+async function readRepoFile(repoRoot, relativePath) {
+  if (typeof relativePath !== "string" || relativePath.length === 0 || path.isAbsolute(relativePath) || relativePath.includes("\\")) {
+    throw new Error("evidence path must be a nonempty repository-relative path");
+  }
+  const root = await realpath(repoRoot);
+  const file = await realpath(path.resolve(root, relativePath));
+  if (file !== root && !file.startsWith(root + path.sep)) throw new Error("evidence path escapes repository root");
+  return readFile(file);
+}
+
+async function verifyAgreement(id, agreement, repoRoot) {
+  if (!agreement || agreement.status !== "accepted") return false;
+  if (!/^(?!0{40}$)[a-f0-9]{40}$/.test(agreement.accepted_commit ?? "")) return false;
+  if (typeof agreement.owner_ref !== "string" || !agreement.owner_ref.startsWith("https://")) return false;
+  if (!Array.isArray(agreement.schema_hashes) || agreement.schema_hashes.length === 0 ||
+    agreement.schema_hashes.some((hash) => !validNonzeroHash(hash))) return false;
+  if (!Array.isArray(agreement.accepted_inputs) || agreement.accepted_inputs.length === 0) return false;
+  const derivedSchemaHashes = [];
+  try {
+    for (const input of agreement.accepted_inputs) {
+      if (!input || input.owner_ref !== agreement.owner_ref || input.owner_commit !== agreement.accepted_commit ||
+        !validNonzeroHash(input.file_sha256) || !validNonzeroHash(input.schema_hash)) return false;
+      const bytes = await readRepoFile(repoRoot, input.path);
+      if (rawSha256(bytes) !== input.file_sha256) return false;
+      let parsed;
+      try { parsed = JSON.parse(bytes.toString("utf8")); } catch { return false; }
+      if (canonicalHash(parsed) !== input.schema_hash) return false;
+      derivedSchemaHashes.push(input.schema_hash);
+    }
+    const uniqueDerived = [...new Set(derivedSchemaHashes)].sort();
+    if (!sameJson([...agreement.schema_hashes].sort(), uniqueDerived)) return false;
+
+    const review = agreement.review_record;
+    if (!review || !validNonzeroHash(review.sha256) || typeof review.path !== "string") return false;
+    const reviewBytes = await readRepoFile(repoRoot, review.path);
+    if (rawSha256(reviewBytes) !== review.sha256) return false;
+    const reviewEvidence = JSON.parse(reviewBytes.toString("utf8"));
+    if (reviewEvidence.agreement_id !== id || reviewEvidence.decision !== "accepted" ||
+      reviewEvidence.owner_role !== agreement.owner_role ||
+      reviewEvidence.owner_ref !== agreement.owner_ref ||
+      reviewEvidence.accepted_commit !== agreement.accepted_commit ||
+      !sameJson(reviewEvidence.schema_hashes, agreement.schema_hashes) ||
+      !sameJson(reviewEvidence.accepted_inputs, agreement.accepted_inputs)) return false;
+
+    // Hash consistency alone cannot authenticate an external owner. Require a
+    // distinct independent-review record whose author has checked the owner
+    // publication and which explicitly binds the same owner commit and export.
+    const independent = agreement.independent_verification;
+    if (!independent || independent.status !== "verified" ||
+      typeof independent.record?.path !== "string" || !validNonzeroHash(independent.record.sha256)) return false;
+    const verificationBytes = await readRepoFile(repoRoot, independent.record.path);
+    if (rawSha256(verificationBytes) !== independent.record.sha256) return false;
+    const verificationEvidence = JSON.parse(verificationBytes.toString("utf8"));
+    if (verificationEvidence.agreement_id !== id || verificationEvidence.verification !== "independent_owner_check" ||
+      typeof verificationEvidence.verifier_role !== "string" || verificationEvidence.verifier_role.trim() === "" ||
+      typeof verificationEvidence.verifier_id !== "string" || verificationEvidence.verifier_id.trim() === "" ||
+      typeof verificationEvidence.checked_at !== "string" || !Number.isFinite(Date.parse(verificationEvidence.checked_at)) ||
+      verificationEvidence.owner_ref !== agreement.owner_ref ||
+      verificationEvidence.accepted_commit !== agreement.accepted_commit ||
+      verificationEvidence.owner_review_sha256 !== review.sha256 ||
+      !sameJson(verificationEvidence.accepted_inputs, agreement.accepted_inputs)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function evaluateAcceptanceRecord(record, target, repoRoot) {
+  const selected = target === "all"
+    ? [...requirements.contracts, ...requirements["decision-contract"]]
+    : requirements[target];
+  if (!selected) throw new TypeError("Unknown acceptance target " + target + ".");
+  const allOwnersAccepted = record?.proposal_state === "accepted";
+  const unmet = [];
+  for (const id of selected) {
+    const agreement = record?.agreements?.[id];
+    if (!allOwnersAccepted || !(await verifyAgreement(id, agreement, repoRoot))) unmet.push(id);
+  }
+  return { selected, unmet, proposalState: record?.proposal_state ?? "missing" };
+}
+
+async function main() {
+  const target = process.argv[2] ?? "all";
+  if (!Object.hasOwn(requirements, target) && target !== "all") {
+    process.stderr.write("Unknown acceptance target " + target + ". Use contracts, decision-contract, or all.\n");
+    process.exitCode = 2;
+    return;
+  }
+
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const recordPath = path.join(repoRoot, "docs/contracts/canonical-owner-agreements.json");
+  const record = JSON.parse(await readFile(recordPath, "utf8"));
+  const { unmet, proposalState } = await evaluateAcceptanceRecord(record, target, repoRoot);
+  if (unmet.length > 0) {
+    process.stderr.write("Acceptance blocked: missing or unverified canonical owner agreement evidence for " + target + " (proposal_state=" + proposalState + ").\n");
+    for (const id of unmet) {
+      const agreement = record.agreements?.[id];
+      process.stderr.write("- " + id + " (" + (agreement?.owner_role ?? "owner unknown") + "; status=" + (agreement?.status ?? "missing") + ")\n");
+    }
+    process.exitCode = 2;
+    return;
+  }
+  process.stdout.write("Owner evidence passed local consistency checks, including independent-review records, for " + target + ".\n");
+}
+
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  await main();
+}
