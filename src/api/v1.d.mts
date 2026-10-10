@@ -39,11 +39,22 @@ export interface DispatchAuthorizationInput {
   operation: CreativeOperation;
   billable_attempt_id?: string;
   transport_attempt_id: string;
+  /** Atomically compared with authoritative creative records when inserting each transport intent. */
+  context_fence: CreativeContextFence;
 }
 
 export type DispatchAuthorizationResult =
   | { status: "authorized"; dispatch_intent_ref: string }
-  | { status: "cancelled" | "lease_lost" };
+  | { status: "cancelled" | "lease_lost" | "stale_context" };
+
+export interface CreativeContextFence {
+  brief_id: string;
+  brief_hash: string;
+  design_version_id?: string;
+  design_hash?: string;
+  expected_current_design_version_id?: string | null;
+  expected_current_design_hash?: string | null;
+}
 
 export interface CreativeApiRequestEnvelope {
   contract: "CreativeApiRequest";
@@ -130,6 +141,7 @@ export interface ExistingJob { kind: "existing"; job: CreativeJobRecord }
 export interface ConflictingJob { kind: "conflict" }
 export interface CompletedJob { status: "completed"; job: CreativeJobRecord; result?: unknown }
 export interface CancelledJob { status: "cancelled"; job?: CreativeJobRecord }
+export interface StaleContextJob { status: "stale_context"; job?: CreativeJobRecord }
 export type CancelJobResult =
   | { kind: "cancelled" | "replayed"; job: CreativeJobRecord }
   | { kind: "not_found" | "conflict" };
@@ -138,9 +150,11 @@ export type FailedJobResult =
   | { status: "cancelled"; job: CreativeJobRecord };
 
 export interface UsageRecord {
-  completeness: "complete" | "incomplete" | "unknown";
+  completeness: "complete" | "partial" | "incomplete" | "unknown";
   input_tokens?: number;
   output_tokens?: number;
+  provider_request_id?: string;
+  transport_attempt_id?: string;
   reason?: "usage_unavailable" | "usage_malformed";
 }
 
@@ -152,9 +166,14 @@ export interface CreativeRuntimePorts {
     getSelection(input: { scope: TrustedScope; brief_id: string }): Promise<DesignSelection | null> | DesignSelection | null;
     listDesignVersions(input: { scope: TrustedScope; brief_id: string; limit: number;
       after?: { occurred_at: string; design_version_id: string } }): Promise<{ items: DesignVersion[]; has_more: boolean }>;
+    /** Atomically compare brief hash and current design ID/hash before storing a new immutable version. */
     saveDesignVersion(input: { scope: TrustedScope; brief_id: string; design_version: DesignVersion;
-      expected_current_design_version_id: string | null }): Promise<{ status: "saved" | "stale" }> | { status: "saved" | "stale" };
+      expected_brief_hash: string; expected_current_design_version_id: string | null;
+      expected_current_design_hash: string | null }): Promise<{ status: "saved" | "stale" }> | { status: "saved" | "stale" };
+    /** Atomically compare brief, target, current selection identity/hash, and selection revision. */
     selectDesignVersion(input: { scope: TrustedScope; brief_id: string; design_version_id: string;
+      expected_brief_hash: string; expected_target_design_hash: string;
+      expected_selected_design_version_id: string; expected_selected_design_hash: string;
       expected_selection_revision: number }): Promise<{ status: "selected"; selection: DesignSelection } | { status: "stale" }> |
       { status: "selected"; selection: DesignSelection } | { status: "stale" };
     getHandoffContext(input: { scope: TrustedScope; brief_id: string; design_version_id: string }): Promise<{
@@ -166,14 +185,16 @@ export interface CreativeRuntimePorts {
   jobs?: {
     begin(input: { scope: TrustedScope; actor_id: string; action_id: string; request_hash: string; operation: CreativeOperation }):
       Promise<StartedJob | ExistingJob | ConflictingJob> | StartedJob | ExistingJob | ConflictingJob;
-    completeIfActive(input: { scope: TrustedScope; actor_id: string; job_id: string; lease_token: string; result: unknown },
-      publish: () => Promise<unknown>): Promise<CompletedJob | CancelledJob> | CompletedJob | CancelledJob;
+    /** The adapter must compare this fence in the same transaction that publishes the completed result. */
+    completeIfActive(input: { scope: TrustedScope; actor_id: string; job_id: string; lease_token: string;
+      result: unknown; publication_fence: CreativeContextFence }, publish: () => Promise<unknown>):
+      Promise<CompletedJob | CancelledJob | StaleContextJob> | CompletedJob | CancelledJob | StaleContextJob;
     failIfActive(input: { scope: TrustedScope; actor_id: string; job_id: string; lease_token: string;
       error: CreativeApiErrorShape }): Promise<FailedJobResult> | FailedJobResult;
     get(input: { scope: TrustedScope; job_id: string }): Promise<CreativeJobRecord | null> | CreativeJobRecord | null;
     cancel(input: { scope: TrustedScope; actor_id: string; job_id: string; target_action_id: string; action_id: string; request_hash: string }):
       Promise<CancelJobResult> | CancelJobResult;
-    /** Atomically linearize a dispatch intent with cancellation and lease ownership. */
+    /** Atomically compare context_fence and linearize each dispatch intent with cancellation and lease ownership. */
     authorizeDispatch(input: DispatchAuthorizationInput): Promise<DispatchAuthorizationResult> | DispatchAuthorizationResult;
   };
   provider?: {
@@ -238,6 +259,7 @@ export interface DecisionDispatchInput extends Omit<MeteredDispatchContext, "rec
   scope: TrustedScope;
   actor_id: string;
   request: DecisionPortRequest;
+  transport_attempt_id: string;
   deadline_at: string;
   dispatch_intent_ref: string;
   recordTransportAttempt(transport_attempt_id: string): Promise<string>;
@@ -258,6 +280,7 @@ export interface InspectionInput {
   attempt: MeteredAttemptRequest;
   brief: CreativeBrief;
   design_version: DesignVersion;
+  transport_attempt_id: string;
   dispatch_intent_ref: string;
   recordTransportAttempt(transport_attempt_id: string): Promise<string>;
   signal: AbortSignal;

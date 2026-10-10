@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { canonicalHash, computeDesignVersionHash } from "../../src/contracts/index.mjs";
-import { createConsumptionReceipt, hashCompositionLayerManifest } from "../../src/contracts/approval-handoff.mjs";
+import { canonicalHash, computeDesignVersionHash, ContractError } from "../../src/contracts/index.mjs";
+import { ApprovalHandoffContractError, createConsumptionReceipt, hashCompositionLayerManifest } from "../../src/contracts/approval-handoff.mjs";
 import { FakeMeteringAuthority } from "../../fixtures/contracts/metering/fake-authority.mjs";
-import { createCreativeApi } from "../../src/api/v1.mjs";
+import { MeteringContractError } from "../../src/contracts/metering.mjs";
+import { CreativeApiError, createCreativeApi } from "../../src/api/v1.mjs";
 
 const FIXTURE = async (name) => JSON.parse(await readFile(new URL(`../../fixtures/api/${name}.json`, import.meta.url), "utf8"));
 const NOW = Date.parse("2026-10-10T12:30:00.000Z");
@@ -65,7 +66,8 @@ function afterCursor(item, cursor) {
     (item.occurred_at === cursor.occurred_at && item.design_version_id > cursor.design_version_id);
 }
 
-function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign = false, longReservationId = false } = {}) {
+function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign = false, longReservationId = false,
+  beforeDispatchAuthorize, clock = { now: NOW } } = {}) {
   const brief = awaitableCloneBrief();
   const designs = new Map();
   const current = new Map();
@@ -99,6 +101,21 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
 
   function jobKey(scope, actorId, actionId) {
     return `${scope.tenant_id}/${scope.project_id}/${actorId}/${actionId}`;
+  }
+
+  function contextFenceMatches(fence) {
+    if (!fence || fence.brief_id !== brief.brief_id || fence.brief_hash !== canonicalHash(brief)) return false;
+    if (fence.design_version_id !== undefined) {
+      const design = designs.get(fence.design_version_id);
+      if (!design || design.design_hash !== fence.design_hash) return false;
+    }
+    if (Object.hasOwn(fence, "expected_current_design_version_id")) {
+      const selectedId = current.get(fence.brief_id) ?? null;
+      if (selectedId !== fence.expected_current_design_version_id) return false;
+      const selected = selectedId === null ? null : designs.get(selectedId);
+      if ((selected?.design_hash ?? null) !== (fence.expected_current_design_hash ?? null)) return false;
+    }
+    return true;
   }
 
   const jobs = {
@@ -135,10 +152,12 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
           leaseTokens.get(input.job_id) !== input.lease_token) return { status: "lease_lost" };
         if (job.status === "cancelled") return { status: "cancelled" };
         if (job.status !== "running") return { status: "lease_lost" };
+        if (beforeDispatchAuthorize) await beforeDispatchAuthorize(input);
+        if (!contextFenceMatches(input.context_fence)) return { status: "stale_context" };
         dispatchIntentCounter += 1;
         const dispatch_intent_ref = `dispatch-intent:${input.job_id}:${dispatchIntentCounter}`;
         dispatchIntents.push({ job_id: input.job_id, transport_attempt_id: input.transport_attempt_id,
-          billable_attempt_id: input.billable_attempt_id, dispatch_intent_ref });
+          billable_attempt_id: input.billable_attempt_id, context_fence: structuredClone(input.context_fence), dispatch_intent_ref });
         return { status: "authorized", dispatch_intent_ref };
       });
     },
@@ -149,6 +168,7 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
           job.actor_id !== input.actor_id || input.lease_token !== leaseTokens.get(input.job_id)) return { status: "cancelled" };
         if (job.status === "cancelled") return { status: "cancelled", job };
         if (job.status === "completed") return { status: "completed", job, result: job.result };
+        if (!contextFenceMatches(input.publication_fence)) return { status: "stale_context", job };
         const publishResult = await publish();
         job.status = "completed";
         job.result = input.result;
@@ -228,8 +248,11 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
     saveDesignVersion(input) {
       calls.storage.push({ method: "saveDesignVersion", scope: input.scope });
       if (input.scope.tenant_id !== brief.tenant_id || input.scope.project_id !== brief.project_id) throw new Error("foreign scope");
+      if (input.expected_brief_hash !== canonicalHash(brief)) return { status: "stale" };
       const currentId = current.get(input.brief_id) ?? null;
       if (currentId !== input.expected_current_design_version_id) return { status: "stale" };
+      const currentDesign = currentId === null ? null : designs.get(currentId);
+      if ((currentDesign?.design_hash ?? null) !== input.expected_current_design_hash) return { status: "stale" };
       designs.set(input.design_version.design_version_id, structuredClone(input.design_version));
       current.set(input.brief_id, input.design_version.design_version_id);
       selectionRevisions.set(input.brief_id, (selectionRevisions.get(input.brief_id) ?? 0) + 1);
@@ -238,9 +261,13 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
     selectDesignVersion(input) {
       calls.storage.push({ method: "selectDesignVersion", scope: input.scope });
       if (input.scope.tenant_id !== brief.tenant_id || input.scope.project_id !== brief.project_id) throw new Error("foreign scope");
-      if (!designs.has(input.design_version_id)) return { status: "stale" };
+      if (input.expected_brief_hash !== canonicalHash(brief)) return { status: "stale" };
+      if (designs.get(input.design_version_id)?.design_hash !== input.expected_target_design_hash) return { status: "stale" };
       const revision = selectionRevisions.get(input.brief_id) ?? 0;
       if (revision !== input.expected_selection_revision) return { status: "stale" };
+      const selectedId = current.get(input.brief_id);
+      if (selectedId !== input.expected_selected_design_version_id ||
+        designs.get(selectedId)?.design_hash !== input.expected_selected_design_hash) return { status: "stale" };
       current.set(input.brief_id, input.design_version_id);
       selectionRevisions.set(input.brief_id, revision + 1);
       return { status: "selected", selection: { tenant_id: brief.tenant_id, project_id: brief.project_id,
@@ -367,7 +394,7 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
     } }; },
     async inspect(input) {
       calls.inspection += 1;
-      const transport_attempt_id = `transport:inspect:${calls.inspection}`;
+      const transport_attempt_id = input.transport_attempt_id;
       await input.recordTransportAttempt(transport_attempt_id);
       return { tenant_id: input.scope.tenant_id, project_id: input.scope.project_id, brief_id: input.brief.brief_id,
         design_version_id: input.design_version.design_version_id, artifact_id: input.design_version.artifact.artifact_id,
@@ -381,7 +408,9 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
     resolveRoute() { return { retry_mapping_ref: "retry:jev-v1", provider: {
       name: "fixture-jev", model: "jev-1.13.0", endpoint: "test:/jev", sdk: { name: "fixture-sdk", version: "1.0" },
     } }; },
-    execute: async ({ request: input }) => { calls.decision += 1;
+    execute: async ({ request: input, transport_attempt_id, recordTransportAttempt }) => {
+      await recordTransportAttempt(transport_attempt_id);
+      calls.decision += 1;
       calls.decisionReservationRefs.push(input.budget_ref.reservation_ref);
       return ({ contract: "DecisionPortResult", schema_version: "1.0",
       event_id: `result:${input.event_id}`, tenant_id: input.tenant_id, project_id: input.project_id,
@@ -405,11 +434,11 @@ function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign
 
   const api = createCreativeApi({
     ports: portMap,
-    now: () => NOW,
+    now: () => clock.now,
     idFactory: () => { idCounter += 1; return `generated-id-${idCounter}`; },
   });
   const state = { brief, designs, current, selectionRevisions, jobs: records, actions, calls, authority, handoffContexts,
-    stateArtifactBytes, leaseTokens, dispatchIntents };
+    stateArtifactBytes, leaseTokens, dispatchIntents, clock };
   return { api, state, ports: portMap };
 
 }
@@ -600,7 +629,7 @@ test("inspection output omits unknown provider usage fields and untrusted notes"
   const inspect = ports.inspection.inspect;
   ports.inspection.inspect = async (input) => ({ ...(await inspect(input)), usage: {
     completeness: "complete", input_tokens: 1, output_tokens: 1,
-    transport_attempt_id: `transport:inspect:${state.calls.inspection}`,
+    transport_attempt_id: input.transport_attempt_id,
     access_token: "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
     reason: "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
   } });
@@ -610,6 +639,99 @@ test("inspection output omits unknown provider usage fields and untrusted notes"
   assert.equal(response.ok, true, JSON.stringify(response));
   assert.deepEqual(response.result.usage, { completeness: "complete", input_tokens: 1, output_tokens: 1 });
   assert.equal(JSON.stringify(response).includes("SYNTHETIC-NOT-A-REAL-CREDENTIAL"), false);
+});
+
+test("inspection normalizes nested observations and rejects credential-shaped nested fields on replay", async () => {
+  await loadPlans();
+  const malicious = await setup();
+  const secret = "SYNTHETIC-NOT-A-REAL-CREDENTIAL";
+  const inspect = malicious.ports.inspection.inspect;
+  malicious.ports.inspection.inspect = async (input) => ({ ...(await inspect(input)), observations: [{
+    observer: { type: "model", id: "observer-model", api_key: secret },
+    content_hash: input.design_version.artifact.content_hash,
+    uncertainty: { status: "unknown", raw_response: secret }, summary: "Observed safely.",
+  }] });
+  const rejected = await malicious.api.invoke(actor(), request("inspect", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1",
+  }, "inspect-nested-private"));
+  assert.equal(rejected.ok, false);
+  assert.equal(JSON.stringify(rejected).includes(secret), false);
+  assert.equal(malicious.state.calls.inspection, 1);
+
+  const replayHarness = await setup();
+  const replayInspect = replayHarness.ports.inspection.inspect;
+  replayHarness.ports.inspection.inspect = async (input) => ({ ...(await replayInspect(input)), observations: [{
+    observer: { type: "model", id: "observer-model" },
+    content_hash: input.design_version.artifact.content_hash,
+    uncertainty: { status: "unknown" }, summary: "Observed safely.",
+  }] });
+  const body = request("inspect", { brief_id: "brief-api-1", design_version_id: "design-api-1" }, "inspect-replay-private");
+  const first = await replayHarness.api.invoke(actor(), body);
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const stored = [...replayHarness.state.jobs.values()].find((job) => job.action_id === "inspect-replay-private");
+  stored.result = structuredClone(stored.result);
+  stored.result.inspection.observations[0].observer.api_key = secret;
+  stored.result.inspection.observations[0].uncertainty.raw_response = secret;
+  const replay = structuredClone(body);
+  replay.event_id += ":replay";
+  replay.request_id += ":replay";
+  replay.correlation_id += ":replay";
+  const rejectedReplay = await replayHarness.api.invoke(actor(), replay);
+  assert.equal(rejectedReplay.ok, false);
+  assert.equal(rejectedReplay.error.code, "unavailable");
+  assert.equal(JSON.stringify(rejectedReplay).includes(secret), false);
+});
+
+test("inspection public text rejects credential, signed URL, and personal data values on fresh and replay paths", async () => {
+  await loadPlans();
+  const sensitiveCases = [
+    { path: ["observer", "id"], value: "Bearer synthetic-private-token" },
+    { path: ["uncertainty", "note"], value: "https://assets.example/art?X-Amz-Signature=synthetic-signature" },
+    { path: ["summary"], value: "Visible contact: designer@example.test" },
+  ];
+
+  for (const [index, sensitive] of sensitiveCases.entries()) {
+    const liveHarness = await setup();
+    const liveInspect = liveHarness.ports.inspection.inspect;
+    liveHarness.ports.inspection.inspect = async (input) => {
+      const result = await liveInspect(input);
+      const observation = {
+        observer: { type: "model", id: "observer-model" },
+        content_hash: input.design_version.artifact.content_hash,
+        uncertainty: { status: "unknown" },
+        summary: "A blue-green mark is visible near the upper right.",
+      };
+      let target = observation;
+      for (const key of sensitive.path.slice(0, -1)) target = target[key];
+      target[sensitive.path.at(-1)] = sensitive.value;
+      return { ...result, observations: [observation] };
+    };
+    const body = request("inspect", { brief_id: "brief-api-1", design_version_id: "design-api-1" }, `inspect-text-private-${index}`);
+    const rejected = await liveHarness.api.invoke(actor(), body);
+    assert.equal(rejected.ok, false);
+    assert.equal(JSON.stringify(rejected).includes(sensitive.value), false);
+
+    const replayHarness = await setup();
+    const replayBody = request("inspect", { brief_id: "brief-api-1", design_version_id: "design-api-1" }, `inspect-text-replay-${index}`);
+    const completed = await replayHarness.api.invoke(actor(), replayBody);
+    assert.equal(completed.ok, true, JSON.stringify(completed));
+    const stored = [...replayHarness.state.jobs.values()].find((job) => job.action_id === replayBody.action_id);
+    stored.result = structuredClone(stored.result);
+    stored.result.inspection.observations = [{ observer: { type: "model", id: "observer-model" },
+      content_hash: stored.result.inspection.artifact_hash, uncertainty: { status: "unknown" },
+      summary: "A blue-green mark is visible near the upper right." }];
+    let target = stored.result.inspection.observations[0];
+    for (const key of sensitive.path.slice(0, -1)) target = target[key];
+    target[sensitive.path.at(-1)] = sensitive.value;
+    const replay = structuredClone(replayBody);
+    replay.event_id += ":replay";
+    replay.request_id += ":replay";
+    replay.correlation_id += ":replay";
+    const rejectedReplay = await replayHarness.api.invoke(actor(), replay);
+    assert.equal(rejectedReplay.ok, false);
+    assert.equal(rejectedReplay.error.code, "unavailable");
+    assert.equal(JSON.stringify(rejectedReplay).includes(sensitive.value), false);
+  }
 });
 
 test("restore selects the existing immutable version by selection CAS without creating a version", async () => {
@@ -657,6 +779,17 @@ test("completed restore replay reports its original selection after later select
   assert.equal(state.current.get("brief-api-1"), "design-api-2");
   assert.equal(state.selectionRevisions.get("brief-api-1"), 3);
   assert.equal(state.calls.provider, 0);
+
+  const stored = [...state.jobs.values()].find((job) => job.action_id === "action-restore-replay");
+  stored.result.selection.authorization = "SYNTHETIC-NOT-A-REAL-CREDENTIAL";
+  const privateReplay = structuredClone(firstRequest);
+  privateReplay.event_id += ":private";
+  privateReplay.request_id += ":private";
+  privateReplay.correlation_id += ":private";
+  const rejected = await api.invoke(actor(), privateReplay);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error.code, "unavailable");
+  assert.equal(JSON.stringify(rejected).includes("SYNTHETIC-NOT-A-REAL-CREDENTIAL"), false);
 });
 
 test("stale edit and restore versions fail before any provider dispatch", async () => {
@@ -892,6 +1025,76 @@ test("stale metered inspection is reconciled but never published", async () => {
   assert.equal(job.result, undefined);
 });
 
+test("inspection publication fence rejects brief drift after metered observation", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const complete = harness.ports.jobs.completeIfActive.bind(harness.ports.jobs);
+  harness.ports.jobs.completeIfActive = async (input, persist) => {
+    harness.state.brief.facts.verified[0].value = "Changed before inspection publication";
+    return complete(input, persist);
+  };
+  const response = await harness.api.invoke(actor(), request("inspect", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1",
+  }, "inspect-brief-drift-publication"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "stale_version");
+  assert.equal(harness.state.calls.inspection, 1);
+  assert.equal(harness.state.calls.usage.length, 1);
+  const job = [...harness.state.jobs.values()].find((entry) => entry.action_id === "inspect-brief-drift-publication");
+  assert.equal(job.status, "failed");
+  assert.equal(job.result, undefined);
+});
+
+test("brief drift after provider route is rejected before reservation or transport", async () => {
+  await loadPlans();
+  const harness = await setup({ withDesign: false });
+  harness.ports.provider.resolveRoute = () => {
+    harness.state.brief.facts.verified[0].value = "Changed during route resolution";
+    return { retry_mapping_ref: "retry:image-v1", provider: {
+      name: "fixture-provider", model: "fixture-model", endpoint: "test:/image", sdk: { name: "fixture-sdk", version: "1.0" },
+    } };
+  };
+  const response = await harness.api.invoke(actor(), generationRequest("brief-drift-in-route"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "stale_version");
+  assert.equal(harness.state.calls.reserve, 0);
+  assert.equal(harness.state.calls.provider, 0);
+  assert.equal(harness.state.dispatchIntents.length, 0);
+});
+
+test("atomic dispatch authorization rejects context drift immediately before intent insertion", async () => {
+  await loadPlans();
+  const harness = await setup({ withDesign: false });
+  const authorize = harness.ports.jobs.authorizeDispatch.bind(harness.ports.jobs);
+  harness.ports.jobs.authorizeDispatch = async (input) => {
+    harness.state.brief.facts.verified[0].value = "Changed inside authorization transaction";
+    return authorize(input);
+  };
+  const response = await harness.api.invoke(actor(), generationRequest("brief-drift-in-auth"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "stale_version");
+  assert.equal(harness.state.calls.provider, 0);
+  assert.equal(harness.state.dispatchIntents.length, 0);
+  assert.equal(harness.state.calls.usage.length, 0);
+});
+
+test("storage compare-and-set rejects brief drift at design publication", async () => {
+  await loadPlans();
+  const harness = await setup({ withDesign: false });
+  const save = harness.ports.storage.saveDesignVersion.bind(harness.ports.storage);
+  harness.ports.storage.saveDesignVersion = (input) => {
+    harness.state.brief.facts.verified[0].value = "Changed at publication CAS";
+    return save(input);
+  };
+  const response = await harness.api.invoke(actor(), generationRequest("brief-drift-in-storage"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "stale_version");
+  assert.equal(harness.state.calls.provider, 1);
+  assert.equal(harness.state.calls.usage.length, 1);
+  assert.equal(harness.state.designs.size, 0);
+  assert.equal(harness.state.current.has("brief-api-1"), false);
+});
+
 test("handoff requires a scoped approval for the exact immutable version hash", async () => {
   await loadPlans();
   const harness = await setup();
@@ -910,6 +1113,88 @@ test("handoff requires a scoped approval for the exact immutable version hash", 
   }, "action-handoff-forged"));
   assert.equal(denied.error.code, "permission_denied");
   assert.equal(foreign.state.calls.handoff, 0);
+});
+
+test("completed handoff replay remains valid after approval expiry without a second submission", async () => {
+  await loadPlans();
+  const clock = { now: NOW };
+  const harness = await setup({ clock });
+  const body = request("handoff", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", approval_ref: "approval-historical-1", destination_ref: "production-queue-1",
+  }, "action-handoff-historical-replay");
+  const trustedActor = actor({ expires_at: "2026-10-14T00:00:00.000Z" });
+  const first = await harness.api.invoke(trustedActor, body);
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(harness.state.calls.handoff, 1);
+  const stored = [...harness.state.jobs.values()].find((job) => job.action_id === body.action_id);
+  assert.equal(typeof stored.result.handoff_created_at, "string");
+  assert.equal(Object.hasOwn(first.result, "handoff_created_at"), false);
+
+  harness.state.clock.now = Date.parse("2026-10-12T12:30:00.000Z");
+  const replay = structuredClone(body);
+  replay.event_id += ":replay";
+  replay.request_id += ":replay";
+  replay.correlation_id += ":replay";
+  const result = await harness.api.invoke(trustedActor, replay);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.replayed, true);
+  assert.equal(result.result.receipt.status, "consumed_exact_bytes");
+  assert.equal(harness.state.calls.handoff, 1);
+  assert.equal(harness.state.calls.approval, 2);
+});
+
+test("handoff receipt timestamps reject future, pre-issue, pre-creation, and expired values", async () => {
+  await loadPlans();
+  const invalidCases = [
+    { name: "future", consumed_at: "2026-10-11T12:30:00.000Z", now: NOW },
+    { name: "pre-creation", consumed_at: "2026-10-10T12:29:59.000Z", now: NOW },
+  ];
+  for (const [index, invalid] of invalidCases.entries()) {
+    const clock = { now: NOW };
+    const harness = await setup({ clock });
+    const body = request("handoff", {
+      brief_id: "brief-api-1", design_version_id: "design-api-1", approval_ref: `approval-invalid-time-${index}`, destination_ref: "production-queue-1",
+    }, `action-handoff-invalid-time-${index}`);
+    const originalSubmit = harness.ports.handoff.submit;
+    harness.ports.handoff.submit = (input) => {
+      const receipt = originalSubmit(input);
+      receipt.consumed_at = invalid.consumed_at;
+      return receipt;
+    };
+    const response = await harness.api.invoke(actor({ expires_at: "2026-10-14T00:00:00.000Z" }), body);
+    assert.equal(response.ok, false, invalid.name);
+    assert.equal(response.error.code, "failed", invalid.name);
+    assert.equal(harness.state.calls.handoff, 1, invalid.name);
+  }
+
+  const corruptedReplayCases = [
+    { name: "future", now: "2026-10-12T12:30:00.000Z", consumed_at: "2026-10-13T12:30:00.000Z" },
+    { name: "pre-issue", now: "2026-10-12T12:30:00.000Z", consumed_at: "2026-10-10T11:59:59.000Z",
+      handoff_created_at: "2026-10-10T11:30:00.000Z" },
+    { name: "pre-creation", now: "2026-10-12T12:30:00.000Z", consumed_at: "2026-10-10T12:29:59.000Z" },
+    { name: "at-expiry", now: "2026-10-12T12:30:00.000Z", consumed_at: "2026-10-11T12:00:00.000Z" },
+  ];
+  for (const [index, invalid] of corruptedReplayCases.entries()) {
+    const clock = { now: NOW };
+    const replayHarness = await setup({ clock });
+    const replayBody = request("handoff", {
+      brief_id: "brief-api-1", design_version_id: "design-api-1", approval_ref: `approval-corrupt-time-${index}`, destination_ref: "production-queue-1",
+    }, `action-handoff-corrupt-time-${index}`);
+    const completed = await replayHarness.api.invoke(actor({ expires_at: "2026-10-14T00:00:00.000Z" }), replayBody);
+    assert.equal(completed.ok, true, JSON.stringify(completed));
+    const stored = [...replayHarness.state.jobs.values()].find((job) => job.action_id === replayBody.action_id);
+    stored.result = structuredClone(stored.result);
+    stored.result.receipt.consumed_at = invalid.consumed_at;
+    if (invalid.handoff_created_at) stored.result.handoff_created_at = invalid.handoff_created_at;
+    clock.now = Date.parse(invalid.now);
+    const replay = structuredClone(replayBody);
+    replay.event_id += ":replay";
+    replay.request_id += ":replay";
+    replay.correlation_id += ":replay";
+    const rejected = await replayHarness.api.invoke(actor({ expires_at: "2026-10-14T00:00:00.000Z" }), replay);
+    assert.equal(rejected.ok, false, invalid.name);
+    assert.equal(rejected.error.code, "unavailable", invalid.name);
+  }
 });
 
 test("handoff rechecks the exact approval binding after an asynchronous verifier call", async () => {
@@ -935,12 +1220,62 @@ test("handoff rechecks the exact approval binding after an asynchronous verifier
   assert.equal(harness.state.calls.handoff, 0);
 });
 
+test("handoff revalidates approval after dispatch authorization before consumer submission", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const authorize = harness.ports.jobs.authorizeDispatch.bind(harness.ports.jobs);
+  harness.ports.jobs.authorizeDispatch = async (input) => {
+    const result = await authorize(input);
+    harness.ports.approval.verifyApproval = () => ({ status: "rejected" });
+    return result;
+  };
+  const response = await harness.api.invoke(actor(), request("handoff", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", approval_ref: "approval-revoked", destination_ref: "production-queue-1",
+  }, "action-handoff-revoked-after-authorize"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "permission_denied");
+  assert.equal(harness.state.calls.handoff, 0);
+});
+
 test("job status cannot disclose another project's operation", async () => {
   await loadPlans();
   const harness = await setup();
   harness.state.jobs.set("job-foreign", { job_id: "job-foreign", tenant_id: "tenant-api-1", project_id: "other-project", status: "completed" });
   const response = await harness.api.invoke(actor(), request("job.status", { job_id: "job-foreign" }));
   assert.equal(response.error.code, "not_found");
+});
+
+test("typed read-port errors and persisted job diagnostics sanitize field paths and messages", async () => {
+  await loadPlans();
+  const marker = "Bearer unsafe-field-token";
+  const typedErrors = [
+    new ContractError("invalid_type", "CreativeBrief", marker, marker),
+    new ApprovalHandoffContractError("approval_invalid", marker, { field: marker }),
+    new MeteringContractError("invalid_reservation", marker, marker),
+    new CreativeApiError("invalid_request", "list", marker),
+  ];
+  for (const [index, typedError] of typedErrors.entries()) {
+    const harness = await setup();
+    harness.ports.storage.getBrief = () => { throw typedError; };
+    const response = await harness.api.invoke(actor(), request("list", { brief_id: "brief-api-1" }, undefined));
+    assert.equal(response.ok, false, `typed error ${index}`);
+    assert.equal(JSON.stringify(response).includes(marker), false, `typed error ${index}`);
+    assert.notEqual(response.error.field, marker);
+    assert.notEqual(response.error.message, marker);
+  }
+
+  const harness = await setup();
+  harness.state.jobs.set("job-private-error", {
+    job_id: "job-private-error", tenant_id: "tenant-api-1", project_id: "project-api-1",
+    actor_id: "actor-api-1", action_id: "action-private-error", operation: "generate",
+    request_hash: "hash-private-error", status: "failed",
+    error: { code: "invalid_request", field: marker, message: marker, diagnostic_ref: marker },
+  });
+  const status = await harness.api.invoke(actor(), request("job.status", { job_id: "job-private-error" }));
+  assert.equal(status.ok, true, JSON.stringify(status));
+  assert.equal(status.job.error.field, "");
+  assert.equal(status.job.error.message.includes(marker), false);
+  assert.equal(JSON.stringify(status).includes(marker), false);
 });
 
 test("missing provider and decision ports fail closed without reporting a completed job", async () => {
@@ -979,6 +1314,25 @@ test("decision execution binds the exact reserved attempt and uses the pinned JE
   assert.equal(harness.state.calls.reserve, 2);
   assert.equal(harness.state.calls.usage.length, 2);
   assert.equal(harness.state.authority.reservations.has(harness.state.calls.decisionReservationRefs[0]), true);
+});
+
+test("inspection receives a declared initial transport ID and usage can omit it", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const inspect = harness.ports.inspection.inspect;
+  let observedInputId;
+  harness.ports.inspection.inspect = async (input) => {
+    observedInputId = input.transport_attempt_id;
+    const output = await inspect(input);
+    const { transport_attempt_id: _transportAttemptId, ...usage } = output.usage;
+    return { ...output, usage };
+  };
+  const response = await harness.api.invoke(actor(), request("inspect", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1",
+  }, "inspect-initial-transport-id"));
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(typeof observedInputId, "string");
+  assert.equal(harness.state.calls.usage[0].transport_attempt_id, observedInputId);
 });
 
 test("a 256-character reservation ID is passed unchanged and rejected before JEV transport", async () => {
@@ -1038,5 +1392,28 @@ test("asset inputs require the action-specific granted permission", async () => 
     brief_id: "brief-api-1", design_version_id: "design-api-1", plan,
   }, "action-asset-permission"));
   assert.equal(output.error.code, "permission_denied");
+  assert.equal(harness.state.calls.provider, 0);
+});
+
+test("valid deterministic composition updates fail unavailable before image route or reservation", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const plan = boundEditPlan(harness.state);
+  plan.steps[0].action = "composition.update";
+  plan.operation = "composition.update";
+  plan.steps[0].parameters = { design_version_id: "design-api-1", changes: [
+    { field: "layout", value: "centered" },
+  ] };
+  plan.expected_result.parent_version_id = "design-api-1";
+  let routeCalls = 0;
+  harness.ports.provider.resolveRoute = () => { routeCalls += 1; throw new Error("image route must not run"); };
+  const response = await harness.api.invoke(actor(), request("edit", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", plan,
+  }, "composition-update-unavailable"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "unavailable");
+  assert.equal(response.error.field, "composition_executor");
+  assert.equal(routeCalls, 0);
+  assert.equal(harness.state.calls.reserve, 0);
   assert.equal(harness.state.calls.provider, 0);
 });

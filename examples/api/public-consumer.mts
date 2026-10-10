@@ -9,9 +9,13 @@ import type {
   CreativeApiRequest,
   CreativeApiRequestEnvelope,
   CreativeApiResponse,
+  CreativeContextFence,
+  DecisionDispatchInput,
   DispatchAuthorizationInput,
   DispatchAuthorizationResult,
+  InspectionInput,
   TrustedCreativeActor,
+  UsageRecord,
 } from "creative-engine/api/v1";
 import type { EditPlan } from "creative-engine/contracts/creative/v1";
 import type { MeteredDispatchContext } from "creative-engine/contracts/metering";
@@ -102,6 +106,8 @@ const authorizationInput: DispatchAuthorizationInput = {
   operation: "generate",
   billable_attempt_id: "attempt-fixture",
   transport_attempt_id: "transport-fixture",
+  context_fence: { brief_id: "brief-fixture", brief_hash: `sha256:${"a".repeat(64)}`,
+    expected_current_design_version_id: null, expected_current_design_hash: null },
 };
 const authorizationResult: DispatchAuthorizationResult = { status: "authorized", dispatch_intent_ref: "intent-fixture" };
 declare const meteredDispatch: MeteredDispatchContext;
@@ -109,5 +115,18 @@ const immutableReservationReference: string = meteredDispatch.reservation_ref;
 // @ts-expect-error reservation_ref is a read-only authority value.
 meteredDispatch.reservation_ref = "caller-forged-reservation";
 
+declare const decisionDispatch: DecisionDispatchInput;
+const initialDecisionTransportId: string = decisionDispatch.transport_attempt_id;
+const decisionRetryIntent: Promise<string> = decisionDispatch.recordTransportAttempt("transport:jev-retry");
+declare const inspectionDispatch: InspectionInput;
+const initialInspectionTransportId: string = inspectionDispatch.transport_attempt_id;
+const inspectionTransportIntent: Promise<string> = inspectionDispatch.recordTransportAttempt(initialInspectionTransportId);
+const privacyFilteredUsage: UsageRecord = { completeness: "complete", input_tokens: 1, output_tokens: 2,
+  provider_request_id: "provider-request-fixture", transport_attempt_id: initialInspectionTransportId };
+const publicationFence: CreativeContextFence = { brief_id: "brief-fixture", brief_hash: `sha256:${"a".repeat(64)}`,
+  design_version_id: "design-fixture", design_hash: `sha256:${"b".repeat(64)}`,
+  expected_current_design_version_id: "design-fixture", expected_current_design_hash: `sha256:${"b".repeat(64)}` };
+
 void [CREATIVE_API_OPERATIONS, requests, response, aliasResponse, publicError, authorizationInput,
-  authorizationResult, immutableReservationReference];
+  authorizationResult, immutableReservationReference, initialDecisionTransportId, decisionRetryIntent,
+  initialInspectionTransportId, inspectionTransportIntent, privacyFilteredUsage, publicationFence];
