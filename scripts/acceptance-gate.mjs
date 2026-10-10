@@ -16,6 +16,15 @@ const requirements = {
     "harness_decision_port_consumer",
     "harness_jev_transport_owner",
   ],
+  "metering-contract": [
+    "finance_metering_budget_protocol",
+    "shared_contracts_usage_budget_schemas",
+  ],
+  "handoff-contract": [
+    "product_approval_protocol_and_consumer",
+    "production_artwork_handoff",
+    "shared_contracts_approval_handoff_schemas",
+  ],
 };
 
 function rawSha256(bytes) {
@@ -106,7 +115,7 @@ async function verifyAgreement(id, agreement, repoRoot) {
 
 export async function evaluateAcceptanceRecord(record, target, repoRoot) {
   const selected = target === "all"
-    ? [...requirements.contracts, ...requirements["decision-contract"]]
+    ? Object.values(requirements).flat()
     : requirements[target];
   if (!selected) throw new TypeError("Unknown acceptance target " + target + ".");
   const allOwnersAccepted = record?.proposal_state === "accepted";
@@ -121,7 +130,7 @@ export async function evaluateAcceptanceRecord(record, target, repoRoot) {
 async function main() {
   const target = process.argv[2] ?? "all";
   if (!Object.hasOwn(requirements, target) && target !== "all") {
-    process.stderr.write("Unknown acceptance target " + target + ". Use contracts, decision-contract, or all.\n");
+    process.stderr.write("Unknown acceptance target " + target + ". Use contracts, decision-contract, metering-contract, handoff-contract, or all.\n");
     process.exitCode = 2;
     return;
   }

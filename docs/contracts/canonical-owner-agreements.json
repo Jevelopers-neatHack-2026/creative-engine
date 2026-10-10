@@ -106,6 +106,81 @@
         "status": "pending",
         "record": null
       }
+    },
+    "finance_metering_budget_protocol": {
+      "triage": "CE-C03",
+      "owner_role": "Finance and reliability",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/cost-intelligence/issues/1",
+      "required_outcome": "Publish the authoritative metering and budget interface, retry mapping, hold, and reconciliation semantics for creative consumers.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null,
+      "accepted_inputs": [],
+      "independent_verification": {
+        "status": "pending",
+        "record": null
+      }
+    },
+    "shared_contracts_usage_budget_schemas": {
+      "triage": "CE-C03",
+      "owner_role": "Agent and research",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1",
+      "required_outcome": "Publish and accept usage and budget schema fields and compatibility fixtures for the creative consumer proposal.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null,
+      "accepted_inputs": [],
+      "independent_verification": {
+        "status": "pending",
+        "record": null
+      }
+    },
+    "product_approval_protocol_and_consumer": {
+      "triage": "CE-C04",
+      "owner_role": "Product and frontend",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/getticketstub.com/issues/1",
+      "required_outcome": "Accept the external approval verifier and structured-action consumer boundary for exact artwork and composition inputs.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null,
+      "accepted_inputs": [],
+      "independent_verification": {
+        "status": "pending",
+        "record": null
+      }
+    },
+    "production_artwork_handoff": {
+      "triage": "CE-C04",
+      "owner_role": "Creative and fulfillment",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/print-production/issues/1",
+      "required_outcome": "Accept the artwork/layer manifest and composition edit input distinct from ProductionBundle rendering and print preflight.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null,
+      "accepted_inputs": [],
+      "independent_verification": {
+        "status": "pending",
+        "record": null
+      }
+    },
+    "shared_contracts_approval_handoff_schemas": {
+      "triage": "CE-C04",
+      "owner_role": "Agent and research",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1",
+      "required_outcome": "Publish and accept the approval, composition edit plan, and artwork handoff schemas and compatibility fixtures.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null,
+      "accepted_inputs": [],
+      "independent_verification": {
+        "status": "pending",
+        "record": null
+      }
     }
   },
   "acceptance_evidence_rule": {

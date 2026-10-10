@@ -33,6 +33,27 @@ test("canonical owner acceptance gate reports missing C01 and C02 agreements as 
   assert.match(creative.stderr, /shared_contracts_creative_schemas/);
   assert.match(creative.stderr, /event_intelligence_producer/);
   assert.match(creative.stderr, /trusted_project_membership/);
+
+  for (const [target, expectedIds] of [
+    ["metering-contract", ["finance_metering_budget_protocol", "shared_contracts_usage_budget_schemas"]],
+    ["handoff-contract", ["product_approval_protocol_and_consumer", "production_artwork_handoff", "shared_contracts_approval_handoff_schemas"]],
+  ]) {
+    const result = spawnSync(process.execPath, ["scripts/acceptance-gate.mjs", target], {
+      cwd: root,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 2, `${target} must fail while external approvals are absent`);
+    assert.match(result.stderr, /Acceptance blocked: missing or unverified canonical owner agreement evidence/);
+    for (const id of expectedIds) assert.match(result.stderr, new RegExp(id));
+  }
+
+  const all = spawnSync(process.execPath, ["scripts/acceptance-gate.mjs", "all"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  assert.equal(all.status, 2, "all acceptance must stay blocked while any external agreement is pending");
+  assert.match(all.stderr, /finance_metering_budget_protocol/);
+  assert.match(all.stderr, /product_approval_protocol_and_consumer/);
 });
 
 test("acceptance requires an accepted proposal, pinned input bytes, canonical schema hashes, and matching review evidence", async () => {
@@ -53,6 +74,14 @@ test("acceptance requires an accepted proposal, pinned input bytes, canonical sc
       "event_intelligence_producer",
       "trusted_project_membership",
       "creative_controls_consumer",
+      "shared_contracts_decision_port",
+      "harness_decision_port_consumer",
+      "harness_jev_transport_owner",
+      "finance_metering_budget_protocol",
+      "shared_contracts_usage_budget_schemas",
+      "product_approval_protocol_and_consumer",
+      "production_artwork_handoff",
+      "shared_contracts_approval_handoff_schemas",
     ]) {
       const acceptedCommit = "b".repeat(40);
       const ownerRef = "https://example.test/owners/" + id;
@@ -113,14 +142,23 @@ test("acceptance requires an accepted proposal, pinned input bytes, canonical sc
 
     const valid = await evaluateAcceptanceRecord(accepted, "contracts", tempRoot);
     assert.deepEqual(valid.unmet, []);
+    assert.deepEqual((await evaluateAcceptanceRecord(accepted, "metering-contract", tempRoot)).unmet, []);
+    assert.deepEqual((await evaluateAcceptanceRecord(accepted, "handoff-contract", tempRoot)).unmet, []);
+    assert.deepEqual((await evaluateAcceptanceRecord(accepted, "all", tempRoot)).unmet, []);
     const pendingProposal = { ...accepted, proposal_state: "pending_external_owner_agreement" };
     assert.equal((await evaluateAcceptanceRecord(pendingProposal, "contracts", tempRoot)).unmet.length, 4);
+    assert.equal((await evaluateAcceptanceRecord(pendingProposal, "metering-contract", tempRoot)).unmet.length, 2);
+    assert.equal((await evaluateAcceptanceRecord(pendingProposal, "handoff-contract", tempRoot)).unmet.length, 3);
+    assert.equal((await evaluateAcceptanceRecord(pendingProposal, "all", tempRoot)).unmet.length, 12);
 
     const awaitingIndependentReview = structuredClone(accepted);
     for (const agreement of Object.values(awaitingIndependentReview.agreements)) {
       agreement.independent_verification.status = "pending";
     }
     assert.equal((await evaluateAcceptanceRecord(awaitingIndependentReview, "contracts", tempRoot)).unmet.length, 4);
+    assert.equal((await evaluateAcceptanceRecord(awaitingIndependentReview, "metering-contract", tempRoot)).unmet.length, 2);
+    assert.equal((await evaluateAcceptanceRecord(awaitingIndependentReview, "handoff-contract", tempRoot)).unmet.length, 3);
+    assert.equal((await evaluateAcceptanceRecord(awaitingIndependentReview, "all", tempRoot)).unmet.length, 12);
 
     const forged = structuredClone(accepted);
     for (const agreement of Object.values(forged.agreements)) {
@@ -129,6 +167,9 @@ test("acceptance requires an accepted proposal, pinned input bytes, canonical sc
       agreement.review_record = "owner reviewed and accepted";
     }
     assert.equal((await evaluateAcceptanceRecord(forged, "contracts", tempRoot)).unmet.length, 4);
+    assert.equal((await evaluateAcceptanceRecord(forged, "metering-contract", tempRoot)).unmet.length, 2);
+    assert.equal((await evaluateAcceptanceRecord(forged, "handoff-contract", tempRoot)).unmet.length, 3);
+    assert.equal((await evaluateAcceptanceRecord(forged, "all", tempRoot)).unmet.length, 12);
 
     const tampered = structuredClone(accepted);
     tampered.agreements.shared_contracts_creative_schemas.accepted_inputs[0].file_sha256 = "sha256:" + "a".repeat(64);

@@ -9,7 +9,7 @@ import {
   sameMeteringIdentity,
   validateMeteredAttempt,
   validateUsageObservation,
-} from '../../../src/contracts/metering.mjs';
+} from 'creative-engine/contracts/metering';
 import { FakeMeteringAuthority } from '../../../fixtures/contracts/metering/fake-authority.mjs';
 
 const trustedScope = {

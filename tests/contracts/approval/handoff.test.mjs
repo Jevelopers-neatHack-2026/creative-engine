@@ -11,7 +11,7 @@ import {
   validateConsumptionReceipt,
   verifyHandoffApproval,
   verifyHandoffArtifacts,
-} from '../../../src/contracts/approval-handoff.mjs';
+} from 'creative-engine/contracts/approval-handoff';
 import {
   FakeArtifactAccess,
   FakeCompositionConsumer,

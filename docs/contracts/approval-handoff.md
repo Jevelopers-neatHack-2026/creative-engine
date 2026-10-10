@@ -66,4 +66,4 @@ The public `.d.mts` declarations for both boundary modules are exercised by a st
 tsc --noEmit --strict --skipLibCheck false --module NodeNext --moduleResolution NodeNext --target ES2022 tests/contracts/metering/public-consumer.mts
 ```
 
-The repository integration entry point is `make check TARGET=handoff-contract MODE=mock`. This check is independent of the creative runtime and makes no provider calls. The real issuer/verifier, production consumer agreement, and all live or print acceptance remain pending.
+The package exposes this proposal as `creative-engine/contracts/approval-handoff`; the repository integration entry point is `make check TARGET=handoff-contract MODE=mock`. It runs these tests and the strict public type consumer independently of the creative runtime and makes no provider calls. `make acceptance TARGET=handoff-contract` must fail until Product and frontend accepts the approval verifier/consumer boundary, Creative and fulfillment accepts the production handoff, and Agent and research accepts the shared approval/handoff schemas. The real issuer/verifier, production consumer agreement, and all live or print acceptance remain pending.

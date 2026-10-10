@@ -5,7 +5,7 @@ import {
   type MeteringPort,
   type TrustedMeteringScope,
   type UsageObservation,
-} from '../../../src/contracts/metering.mjs';
+} from 'creative-engine/contracts/metering';
 import {
   ApprovalHandoffContractError,
   createArtworkHandoff,
@@ -16,7 +16,7 @@ import {
   type ArtworkHandoff,
   type ConsumptionReceipt,
   type TrustedApprovalScope,
-} from '../../../src/contracts/approval-handoff.mjs';
+} from 'creative-engine/contracts/approval-handoff';
 
 declare const meteringPort: MeteringPort;
 declare const meteringScope: TrustedMeteringScope;

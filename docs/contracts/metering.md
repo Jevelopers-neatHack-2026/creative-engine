@@ -77,4 +77,4 @@ The paired ESM declarations are checked through a strict NodeNext consumer with 
 tsc --noEmit --strict --skipLibCheck false --module NodeNext --moduleResolution NodeNext --target ES2022 tests/contracts/metering/public-consumer.mts
 ```
 
-The repository integration entry point is `make check TARGET=metering-contract MODE=mock`. It must run these tests without depending on the creative runtime, provider credentials, or paid calls. The actual finance agreement, live cost service, and release acceptance remain pending.
+The package exposes this proposal as `creative-engine/contracts/metering`; the repository integration entry point is `make check TARGET=metering-contract MODE=mock`. It runs these tests and the strict public type consumer without depending on the creative runtime, provider credentials, or paid calls. `make acceptance TARGET=metering-contract` must fail until Finance and reliability pins the cost-intelligence protocol and Agent and research accepts the shared usage/budget schemas. The actual finance agreement, live cost service, and release acceptance remain pending.
