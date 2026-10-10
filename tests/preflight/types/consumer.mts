@@ -2,10 +2,13 @@ import {
   AccessPreflightError,
   runAccessPreflight,
   validateAccessPlan,
+  type AccessProviderAdapter,
   type AccessCapabilityVerifierPort,
   type AccessExecutionPorts,
   type AccessPlan,
+  type AuthorizationPort,
   type NormalizedAccessPlanCell,
+  type ReservationVerifierPort,
   type ResolvedOpenAICredential,
   type TrustedAccessScope,
 } from 'creative-engine/preflight';
@@ -35,6 +38,34 @@ const capabilityPort: AccessCapabilityVerifierPort = {
     return { priorEvidence, checkedAt };
   },
 };
+
+const authorizationPort: AuthorizationPort = ports.authorizationPort;
+const authorizationInput: Parameters<AuthorizationPort['verifyGrant']>[0] = {
+  grant_ref: 'test:grant',
+  expected: {},
+  at: '2026-10-10T12:00:00.000Z',
+};
+const reservationInput: Parameters<ReservationVerifierPort['verifyReservation']>[0] = {
+  reservation: {},
+  attempt: ports.meteringRequest,
+  expected: {},
+  grant_ref: 'test:grant',
+  authorization_evidence: {} as Parameters<ReservationVerifierPort['verifyReservation']>[0]['authorization_evidence'],
+  at: '2026-10-10T12:00:00.000Z',
+};
+const adapter: AccessProviderAdapter = {
+  evidence_mode: 'mock',
+  async inspect() { return {}; },
+  async dispatch(input) {
+    const reservationRef: string = input.metering.reservation_ref;
+    await input.metering.authorizeTransport();
+    input.metering.assertTransportReady();
+    return { reservationRef };
+  },
+};
+void authorizationPort.verifyGrant(authorizationInput);
+void ports.reservationVerifier.verifyReservation(reservationInput);
+void adapter;
 
 const report = runAccessPreflight({ ...ports, capabilityVerifier: capabilityPort, plan: validPlan });
 void maybeScope;

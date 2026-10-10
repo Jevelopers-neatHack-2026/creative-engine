@@ -29,7 +29,7 @@ const CURRENCY = /^[A-Z]{3}$/;
 const MAX_CAPABILITY_AGE_MS = 5 * 60_000;
 const SENSITIVE_KEY = /(?:(?:^|[_-])(?:credential|secret|password|authorization|bearer|cookie|api[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|token)(?:$|[_-])|(?<!s)token$|(?:credentials?|secrets?|password|authorization|bearer|cookie|apiKey|privateKey))$/i;
 const RAW_CONTENT_KEY = /^(?:prompt|prompt_text|raw_text|image_bytes|authorization_header|headers?)$/i;
-const SENSITIVE_VALUE = /(?:\bbearer\s+[A-Za-z0-9._~+\/-]{8,}|\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|https?:\/\/[^\s"'<>]+)/i;
+const SENSITIVE_VALUE = /(?:\bbearer\s+[A-Za-z0-9._~+\/-]{1,}={0,2}(?![A-Za-z0-9._~+\/-])|\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\b(?:rk|pk)-[A-Za-z0-9_-]{12,}\b|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|https?:\/\/[^\s"'<>]+)/i;
 const OPAQUE_REF = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$/;
 const SAFE_STOP_CONDITIONS = new Set([
   'one_billable_attempt',
@@ -63,6 +63,7 @@ const SAFE_ERROR_CODES = new Set([
   'transport_attempt_limit_exceeded', 'trusted_account_scope_missing', 'operation_permission_denied', 'adapter_unavailable',
   'invalid_evidence_reference', 'invalid_abort_signal', 'invalid_access_capability', 'capability_scope_mismatch',
   'capability_protocol_changed', 'capability_revoked_before_dispatch', 'capability_expired', 'capability_verification_unavailable',
+  'transport_authorization_fence_missing',
 ]);
 const SAFE_REASON_CODES = new Set([
   ...SAFE_ERROR_CODES,
@@ -1160,12 +1161,159 @@ export async function executeAuthorizedAccessCell(args) {
           throw new AccessPreflightError('reservation_scope_unknown', 'Finance reservation lease expired before transport.');
         }
         let transportCount = 0;
+        let transportFenceCount = 0;
+        let transportAssertionCount = 0;
+        let transportFenceState = 'not_started';
         const boundedContext = {
           ...context,
           recordTransportAttempt: async (transportAttemptId) => {
             transportCount += 1;
             if (transportCount > 1) fail('transport_attempt_limit_exceeded', 'The approved preflight allows one transport attempt.', 'metering.recordTransportAttempt');
             return context.recordTransportAttempt(transportAttemptId);
+          },
+          authorizeTransport: async () => {
+            transportFenceCount += 1;
+            if (transportFenceCount !== 1 || transportCount !== 1 || transportFenceState !== 'not_started') {
+              transportFenceState = 'failed';
+              dispatchRejectCode = 'transport_authorization_fence_missing';
+              throw new AccessPreflightError('transport_authorization_fence_missing', 'Transport authorization must follow the one acknowledged transport identity.');
+            }
+            transportFenceState = 'pending';
+            try {
+              const fenceReservationAt = new Date().toISOString();
+              try {
+                const currentReservation = await reservationVerifier.verifyReservation({
+                  reservation: structuredClone(reservationForDispatch),
+                  attempt: structuredClone(validatedMeterRequest),
+                  expected: expectedGrant,
+                  grant_ref: args.grantRef,
+                  authorization_evidence: grantEvidence.evidence,
+                  at: fenceReservationAt,
+                });
+                const receivedAt = new Date().toISOString();
+                const proof = validateReservationDecision(
+                  currentReservation,
+                  reservationForDispatch,
+                  expectedGrant,
+                  mode,
+                  args.grantRef,
+                  grantEvidence.evidence,
+                  receivedAt,
+                );
+                if (proof.protocol.sha256 !== reservationVerification.protocol.sha256
+                  || proof.finance_owner.sha256 !== reservationVerification.finance_owner.sha256) {
+                  fail('reservation_scope_unknown', 'Finance reservation protocol or owner changed at transport authorization.', 'reservation_verification');
+                }
+                reservationVerification = proof;
+              } catch {
+                dispatchRejectCode = 'reservation_scope_unknown';
+                throw new AccessPreflightError('reservation_scope_unknown', 'Finance reservation lease was not current after the transport identity was acknowledged.');
+              }
+
+              const fenceCapabilityAt = new Date().toISOString();
+              try {
+                const currentCapability = await capabilityVerifier.revalidateCapability({
+                  run_id: runId,
+                  ...capabilityBinding(cell),
+                  scope: cell.scope,
+                  previous_evidence: capabilityProof.evidence,
+                  at: fenceCapabilityAt,
+                });
+                const receivedAt = new Date().toISOString();
+                const proof = validateCapabilityDecision(currentCapability, cell, mode, receivedAt, cell.spend.deadline_at);
+                if (proof.decision !== 'confirmed' || proof.operation_permission !== 'confirmed' || proof.quota !== 'available'
+                  || proof.protocol.sha256 !== capabilityProof.protocol.sha256
+                  || proof.owner_evidence.sha256 !== capabilityProof.owner_evidence.sha256) {
+                  fail('capability_revoked_before_dispatch', 'Provider capability changed at transport authorization.', 'capability_decision');
+                }
+                capabilityProof = proof;
+                accessObservation = {
+                  ...accessObservation,
+                  operation_permission: proof.operation_permission,
+                  quota: proof.quota,
+                  capability_verification: proof,
+                };
+              } catch {
+                dispatchRejectCode = 'capability_revoked_before_dispatch';
+                throw new AccessPreflightError('capability_revoked_before_dispatch', 'Provider capability was not current after the transport identity was acknowledged.');
+              }
+
+              const fenceGrantAt = new Date().toISOString();
+              let grantDecision;
+              try {
+                grantDecision = await authorizationPort.revalidateGrant({
+                  grant_ref: args.grantRef,
+                  expected: expectedGrant,
+                  authorization_evidence: grantEvidence.evidence,
+                  at: fenceGrantAt,
+                });
+              } catch {
+                grantDecision = null;
+              }
+              const grantReceivedAt = new Date().toISOString();
+              let latestGrantProof;
+              try {
+                if (!isRecord(grantDecision) || grantDecision.grant_ref !== args.grantRef) {
+                  fail('authorization_reference_mismatch', 'Current authorization evidence does not match the grant reference.', 'authorization_decision.grant_ref');
+                }
+                latestGrantProof = validateGrant(grantDecision, freezeTree({ ...expectedGrant, now: fenceGrantAt }), mode, grantReceivedAt);
+              } catch {
+                latestGrantProof = null;
+              }
+              if (!latestGrantProof || latestGrantProof.expires_at !== currentProof.expires_at
+                || latestGrantProof.evidence.sha256 !== currentProof.evidence.sha256
+                || latestGrantProof.protocol.sha256 !== currentProof.protocol.sha256
+                || latestGrantProof.account_owner.sha256 !== currentProof.account_owner.sha256
+                || latestGrantProof.finance_owner.sha256 !== currentProof.finance_owner.sha256) {
+                dispatchRejectCode = 'authorization_revoked_before_dispatch';
+                throw new AccessPreflightError('authorization_revoked_before_dispatch', 'Authorization was not current after the transport identity was acknowledged.');
+              }
+              currentProof = latestGrantProof;
+              if (transportFenceState !== 'pending') {
+                dispatchRejectCode = 'transport_authorization_fence_missing';
+                fail('transport_authorization_fence_missing', 'Transport authorization did not remain pending through validation.', 'metering.authorizeTransport');
+              }
+              transportFenceState = 'authorized';
+            } catch (error) {
+              transportFenceState = 'failed';
+              throw error;
+            }
+          },
+          assertTransportReady: () => {
+            transportAssertionCount += 1;
+            if (transportAssertionCount !== 1 || transportFenceCount !== 1 || transportCount !== 1 || transportFenceState !== 'authorized') {
+              transportFenceState = 'failed';
+              dispatchRejectCode = 'transport_authorization_fence_missing';
+              throw new AccessPreflightError('transport_authorization_fence_missing', 'A single final transport authorization fence is required.');
+            }
+            transportFenceState = 'asserted';
+            const at = new Date().toISOString();
+            if (context.signal?.aborted || Date.parse(cell.spend.deadline_at) <= Date.parse(at)) {
+              transportFenceState = 'failed';
+              dispatchRejectCode = 'preflight_deadline_passed';
+              throw new AccessPreflightError('preflight_deadline_passed', 'Cancellation or the approved deadline stopped transport.');
+            }
+            if (Date.parse(capabilityProof.expires_at) <= Date.parse(at)
+              || Date.parse(at) < Date.parse(capabilityProof.checked_at)
+              || Date.parse(at) - Date.parse(capabilityProof.checked_at) > MAX_CAPABILITY_AGE_MS) {
+              transportFenceState = 'failed';
+              dispatchRejectCode = 'capability_revoked_before_dispatch';
+              throw new AccessPreflightError('capability_revoked_before_dispatch', 'Capability evidence is no longer current at transport.');
+            }
+            if (Date.parse(currentProof.expires_at) <= Date.parse(at)
+              || Date.parse(at) < Date.parse(currentProof.checked_at)
+              || Date.parse(at) - Date.parse(currentProof.checked_at) > MAX_CAPABILITY_AGE_MS) {
+              transportFenceState = 'failed';
+              dispatchRejectCode = 'authorization_revoked_before_dispatch';
+              throw new AccessPreflightError('authorization_revoked_before_dispatch', 'Authorization is no longer current at transport.');
+            }
+            if (Date.parse(reservationVerification.lease_expires_at) <= Date.parse(at)
+              || Date.parse(at) < Date.parse(reservationVerification.checked_at)
+              || Date.parse(at) - Date.parse(reservationVerification.checked_at) > MAX_CAPABILITY_AGE_MS) {
+              transportFenceState = 'failed';
+              dispatchRejectCode = 'reservation_scope_unknown';
+              throw new AccessPreflightError('reservation_scope_unknown', 'Finance reservation lease is no longer current at transport.');
+            }
           },
         };
         const providerResult = await adapter.dispatch({
@@ -1181,6 +1329,10 @@ export async function executeAuthorizedAccessCell(args) {
           metering: boundedContext,
         });
         if (transportCount !== 1) fail('transport_attempt_limit_exceeded', 'The approved adapter must report exactly one transport attempt.', 'metering.recordTransportAttempt');
+        if (transportFenceCount !== 1 || transportAssertionCount !== 1 || transportFenceState !== 'asserted') {
+          dispatchRejectCode = 'transport_authorization_fence_missing';
+          fail('transport_authorization_fence_missing', 'The approved adapter must complete and assert authority immediately before transport.', 'metering.authorizeTransport');
+        }
         const cleanEvidence = validateAdapterDispatch(providerResult, cell, mode);
         if (!['succeeded', 'failed', 'partial', 'unknown'].includes(providerResult.provider_outcome)) {
           fail('provider_outcome_invalid', 'Provider adapter returned an unsupported outcome.', 'adapter_dispatch.provider_outcome');

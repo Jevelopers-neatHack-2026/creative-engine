@@ -1,4 +1,4 @@
-import type { MeteredAttemptRequest, MeteringPort, TrustedMeteringScope } from '../contracts/metering.mjs';
+import type { MeteredAttemptRequest, MeteredDispatchContext, MeteringPort, TrustedMeteringScope } from '../contracts/metering.mjs';
 
 export type AccessMode = 'mock' | 'live';
 export type AccessStatus = 'verified' | 'simulated' | 'blocked' | 'denied' | 'failed' | 'unknown';
@@ -170,8 +170,15 @@ export interface AccessProviderAdapter {
     deadline_at: string;
     grant_ref: string;
     authorization_evidence: PinnedAccessEvidence;
-    metering: Readonly<{ attempt: MeteredAttemptRequest; signal?: AbortSignal; recordTransportAttempt(id: string): Promise<unknown> }>;
+    metering: Readonly<AccessProviderMeteringContext>;
   }>): Promise<unknown>;
+}
+
+export interface AccessProviderMeteringContext extends MeteredDispatchContext {
+  /** Revalidate the current grant, provider capability, and Finance lease after transport acknowledgement. */
+  authorizeTransport(): Promise<void>;
+  /** Perform the final synchronous deadline, cancellation, expiry, and freshness fence before network I/O. */
+  assertTransportReady(): void;
 }
 
 export interface PinVerifierPort {
@@ -181,7 +188,7 @@ export interface PinVerifierPort {
 
 export interface AuthorizationPort {
   readonly evidence_mode: AccessMode;
-  verifyGrant(input: Readonly<{ grant_ref: string; expected: Readonly<Record<string, unknown>> }>): Promise<unknown>;
+  verifyGrant(input: Readonly<{ grant_ref: string; expected: Readonly<Record<string, unknown>>; at: string }>): Promise<unknown>;
   revalidateGrant(input: Readonly<{
     grant_ref: string;
     expected: Readonly<Record<string, unknown>>;
@@ -198,6 +205,7 @@ export interface ReservationVerifierPort {
     expected: Readonly<Record<string, unknown>>;
     grant_ref: string;
     authorization_evidence: PinnedAccessEvidence;
+    at: string;
   }>): Promise<unknown>;
 }
 

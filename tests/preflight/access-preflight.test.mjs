@@ -104,14 +104,16 @@ test('exact permission plus model listing still require authorization and reserv
   assert.equal(fixture.calls.reserve, 1);
   assert.equal(fixture.calls.dispatch, 1);
   assert.equal(fixture.calls.verifyCapability, 1);
-  assert.equal(fixture.calls.revalidateCapability, 1);
-  assert.equal(fixture.capabilityInputs.length, 2);
+  assert.equal(fixture.calls.revalidateCapability, 2);
+  assert.equal(fixture.capabilityInputs.length, 3);
   assert.equal(fixture.capabilityInputs[0].cell_id, 'image_generation');
   assert.equal(fixture.capabilityInputs[0].operation_kind, 'image_generation');
   assert.equal(fixture.capabilityInputs[0].target_binding.account_ref, fixtureScope.account_ref);
   assert.equal(fixture.capabilityInputs[0].target_binding.project_ref, fixtureScope.project_ref);
   assert.deepEqual(fixture.capabilityInputs[0].scope, fixtureScope);
   assert.equal(fixture.capabilityInputs[0].deadline_at, fixture.cell.spend.deadline_at);
+  assert.equal(fixture.capabilityInputs[2].previous_evidence.sha256, fixture.capabilityInputs[1].previous_evidence.sha256);
+  assert.match(fixture.capabilityInputs[2].at, /^\d{4}-\d\d-\d\dT/);
 });
 
 test('generation evidence never substitutes for the separately authorized edit cell', async () => {
@@ -368,11 +370,52 @@ test('more than one transport record fails closed and preserves the hold', async
   assert.equal(fixture.authority.reservationFor(fixture.meteringRequest.billable_attempt_id).transport_attempt_ids.length, 1);
 });
 
+test('transport fence must finish successfully before its synchronous assertion can pass', async () => {
+  const fixture = createMockAccessFixture({
+    adapterDispatch: async (input) => {
+      await input.metering.recordTransportAttempt('test:transport-unawaited-fence');
+      const pendingAuthorization = input.metering.authorizeTransport();
+      assert.throws(() => input.metering.assertTransportReady(), (error) => error.code === 'transport_authorization_fence_missing');
+      await assert.rejects(pendingAuthorization, (error) => error.code === 'transport_authorization_fence_missing');
+      return { evidence_mode: 'mock' };
+    },
+  });
+  const result = await executeAuthorizedAccessCell(fixture.args);
+  assert.equal(result.status, 'unknown');
+  assert.equal(result.reason_code, 'transport_authorization_fence_missing');
+  assert.equal(result.financial_hold, 'retained_for_reconciliation');
+  assert.equal(fixture.calls.settle, 0);
+  assert.equal(fixture.authority.reservationFor(fixture.meteringRequest.billable_attempt_id).transport_attempt_ids.length, 1);
+});
+
+test('cancellation after awaited post-ack verification fails the final synchronous transport fence', async () => {
+  const fixture = createMockAccessFixture({
+    adapterDispatch: async (input) => {
+      await input.metering.recordTransportAttempt('test:transport-cancel-at-final-fence');
+      await input.metering.authorizeTransport();
+      controller.abort();
+      input.metering.assertTransportReady();
+      throw new Error('unreachable transport');
+    },
+  });
+  const controller = new AbortController();
+  const result = await executeAuthorizedAccessCell({ ...fixture.args, signal: controller.signal });
+  assert.equal(result.status, 'unknown');
+  assert.equal(result.financial_hold, 'retained_for_reconciliation');
+  assert.equal(result.reason_code, 'preflight_deadline_passed');
+  assert.equal(fixture.calls.revalidateCapability, 2);
+  assert.equal(fixture.calls.revalidateGrant, 2);
+  assert.equal(fixture.calls.settle, 0);
+  assert.equal(fixture.authority.reservationFor(fixture.meteringRequest.billable_attempt_id).transport_attempt_ids.length, 1);
+});
+
 test('unknown provider usage never settles the hold or becomes a verified result', async () => {
   const fixture = createMockAccessFixture({
     adapterDispatch: async (input) => {
       await input.metering.recordTransportAttempt('test:transport-1');
       const attempt = input.metering.attempt;
+      await input.metering.authorizeTransport();
+      input.metering.assertTransportReady();
       return {
         evidence_mode: 'mock',
         provider_outcome: 'succeeded',
@@ -443,7 +486,7 @@ test('public report rejects mutable, foreign-run, foreign-mode, and caller-forge
 });
 
 test('unsafe configuration values and public identifiers are rejected while max_output_tokens is allowed', () => {
-  for (const value of ['Bearer fixture-secret-value', 'person@example.invalid', 'https://files.invalid/a?signature=fixture']) {
+  for (const value of ['Bearer x', 'Bearer abcdefg', `ghp_${'SyntheticCredentialValue'.repeat(2)}`, 'rk-SyntheticCredentialValue1234', 'Bearer fixture-secret-value', 'person@example.invalid', 'https://files.invalid/a?signature=fixture']) {
     const plan = structuredClone(createMockAccessFixture().plan);
     updateCellConfiguration(plan, (configuration) => { configuration.quality = value; });
     assert.equal(validateAccessPlan(plan, fixtureScope).cells[0].input_error_code, 'sensitive_configuration_value');
@@ -496,6 +539,9 @@ test('configuration screening catches canonical Basic credentials without reject
   assert.equal(validateAccessPlan(safeFixture.plan, fixtureScope).cells[0].input_status, 'valid');
 
   const sensitiveKeys = [
+    'Bearer x',
+    `ghp_${'SyntheticCredentialValue'.repeat(2)}`,
+    'rk-SyntheticCredentialValue1234',
     'sk-abcdefghijklmnopqrstuvwxyz1234',
     'owner@example.invalid',
     'Basic dTpw',
@@ -520,6 +566,26 @@ test('configuration screening catches canonical Basic credentials without reject
     assert.equal(fixture.calls.reserve, 0);
     assert.equal(fixture.calls.dispatch, 0);
     assert.equal(JSON.stringify(report).includes(credential), false);
+  }
+
+  for (const marker of ['Bearer x', 'Bearer abcdefg', `ghp_${'SyntheticCredentialValue'.repeat(2)}`, 'rk-SyntheticCredentialValue1234']) {
+    const fixture = createMockAccessFixture();
+    const verify = fixture.pinVerifier.verifyPin.bind(fixture.pinVerifier);
+    fixture.pinVerifier.verifyPin = async (input) => {
+      const decision = await verify(input);
+      decision.evidence.ref = marker;
+      return decision;
+    };
+    const result = await executeAuthorizedAccessCell(fixture.args);
+    const report = createAccessPreflightReport({
+      run_id: fixture.args.runId,
+      generated_at: new Date().toISOString(),
+      mode: 'mock',
+      results: [result],
+    });
+    assert.equal(result.status, 'blocked');
+    assert.equal(result.reason_code, 'invalid_evidence_reference');
+    assert.equal(JSON.stringify(report).includes(marker), false);
   }
 });
 
@@ -720,6 +786,8 @@ test('provider-supplied email receipt identifiers are rejected before public pro
     adapterDispatch: async (input) => {
       await input.metering.recordTransportAttempt('test:transport-email-ref');
       const attempt = input.metering.attempt;
+      await input.metering.authorizeTransport();
+      input.metering.assertTransportReady();
       return {
         evidence_mode: 'mock',
         provider_outcome: 'succeeded',

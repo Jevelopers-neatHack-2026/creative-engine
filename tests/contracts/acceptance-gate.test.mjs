@@ -68,6 +68,7 @@ test("canonical owner acceptance gate reports missing C01 and C02 agreements as 
   const access = spawnSync("make", ["acceptance", "TARGET=access-preflight"], {
     cwd: root,
     encoding: "utf8",
+    env: { ...process.env, MAKEFLAGS: "", MAKELEVEL: "0", MFLAGS: "" },
   });
   assert.equal(access.status, 2, "CE-A01 acceptance must wait for actual owner and access evidence");
   const accessGate = JSON.parse(access.stdout);

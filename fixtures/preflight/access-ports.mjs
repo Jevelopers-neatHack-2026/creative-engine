@@ -257,6 +257,8 @@ export function createMockAccessFixture({
       calls.dispatch += 1;
       if (adapterDispatch) return adapterDispatch(input, { calls, authority });
       await input.metering.recordTransportAttempt('test:transport-1');
+      await input.metering.authorizeTransport();
+      input.metering.assertTransportReady();
       const attempt = input.metering.attempt;
       return {
         evidence_mode: 'mock',

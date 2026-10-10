@@ -142,21 +142,49 @@ function makeUsageObservation(attempt, transportId, requestId, rawUsage) {
   const names = ['input_tokens', 'output_tokens', 'total_tokens'];
   const values = Object.fromEntries(names.map((name) => [name, rawUsage?.[name]]));
   const present = names.filter((name) => Number.isSafeInteger(values[name]) && values[name] >= 0);
-  if (present.length === 0) {
+  const missing = names.filter((name) => !present.includes(name)).map((name) => `usage.${name}`);
+  const detailUnits = [];
+  for (const { field, prefix, parent } of [
+    { field: 'input_tokens_details', prefix: 'input', parent: 'input_tokens' },
+    { field: 'output_tokens_details', prefix: 'output', parent: 'output_tokens' },
+  ]) {
+    if (rawUsage?.[field] === undefined) continue;
+    const details = rawUsage[field];
+    if (details === null || typeof details !== 'object' || Array.isArray(details)
+      || (Object.getPrototypeOf(details) !== Object.prototype && Object.getPrototypeOf(details) !== null)) {
+      missing.push(`usage.${field}.text_tokens`, `usage.${field}.image_tokens`);
+      continue;
+    }
+    for (const detailName of ['text_tokens', 'image_tokens']) {
+      const detailValue = details[detailName];
+      if (Number.isSafeInteger(detailValue) && detailValue >= 0) {
+        detailUnits.push({
+          name: `${prefix}_${detailName}`,
+          quantity: String(detailValue),
+          relation: 'included_subset',
+          included_in: parent,
+        });
+      } else {
+        missing.push(`usage.${field}.${detailName}`);
+      }
+    }
+    const unknownFields = Object.keys(details).filter((key) => !['text_tokens', 'image_tokens'].includes(key));
+    if (unknownFields.length > 0) missing.push(`usage.${field}.unmapped_fields`);
+  }
+  if (present.length === 0 && detailUnits.length === 0) {
     return {
       ...base,
       completeness: 'unknown',
-      missing_fields: names.map((name) => `usage.${name}`),
+      missing_fields: missing,
     };
   }
-  const missing = names.filter((name) => !present.includes(name)).map((name) => `usage.${name}`);
   const hasTotal = present.includes('total_tokens');
   const usageUnits = present.map((name) => ({
     name,
     quantity: String(values[name]),
     relation: name === 'total_tokens' || !hasTotal ? 'standalone' : 'included_subset',
     ...(name === 'total_tokens' || !hasTotal ? {} : { included_in: 'total_tokens' }),
-  }));
+  })).concat(detailUnits);
   return {
     ...base,
     completeness: missing.length === 0 ? 'complete' : 'partial',
@@ -275,10 +303,9 @@ function decodePng(bytes, failureCode) {
         || data[10] !== 0 || data[11] !== 0 || data[12] !== 0) reject();
       const legalDepths = colorType === 0 ? [1, 2, 4, 8, 16]
         : colorType === 2 ? [8, 16]
-          : colorType === 3 ? [1, 2, 4, 8]
-            : colorType === 4 ? [8, 16]
+      : colorType === 4 ? [8, 16]
               : colorType === 6 ? [8, 16] : [];
-      if (!legalDepths.includes(bitDepth)) reject();
+      if (colorType === 3 || !legalDepths.includes(bitDepth)) reject();
       interlace = data[12];
     } else if (type === 'PLTE') {
       if (sawData || sawPalette || colorType === 0 || colorType === 4
@@ -450,11 +477,6 @@ export function createOpenAIImagesAdapter({ credentialPort, promptPort, assetPor
         throw error('credential_unavailable', 'Prepared credentials are not bound to the approved account and project.');
       }
       const transportId = `transport:${randomUUID()}`;
-      try {
-        await metering.recordTransportAttempt(transportId);
-      } catch {
-        throw error('metering_or_dispatch_unknown', 'Finance did not acknowledge the transport identity.');
-      }
       let body;
       const headers = {
         authorization: `Bearer ${prepared[IMAGE_TOKEN]}`,
@@ -486,6 +508,18 @@ export function createOpenAIImagesAdapter({ credentialPort, promptPort, assetPor
         form.append('image', new Blob([prepared.imageBytes], { type: configuration.asset_mime }), 'preflight-source.png');
         body = form;
       }
+      if (typeof metering?.recordTransportAttempt !== 'function'
+        || typeof metering?.authorizeTransport !== 'function'
+        || typeof metering?.assertTransportReady !== 'function') {
+        throw error('transport_authorization_fence_missing', 'A trusted post-acknowledgement transport authorization fence is required.');
+      }
+      try {
+        await metering.recordTransportAttempt(transportId);
+      } catch {
+        throw error('metering_or_dispatch_unknown', 'Finance did not acknowledge the transport identity.');
+      }
+      await metering.authorizeTransport();
+      metering.assertTransportReady();
       let response;
       try {
         response = await fetch(target.endpoint, {
