@@ -51,4 +51,35 @@ jobs:
       - run: make check TARGET=metering-contract MODE=mock
       - run: make check TARGET=handoff-contract MODE=mock
       - run: make check TARGET=versions MODE=mock
+      - name: Run CE-11 API and durable telemetry checks
+        run: |
+          mkdir -p test-results/creative-metering
+          set +e
+          make check TARGET=creative-metering MODE=mock > test-results/creative-metering/check.log 2>&1
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "CE-11 offline checks failed with exit $status" >&2
+            exit "$status"
+          fi
+          node -e 'const fs=require("node:fs");const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(r.schema_version!=="creative-metering-check-evidence/v1"||r.status!=="passed"||r.dependency_mode!=="mock"||r.test_summary.tests<1||r.test_summary.pass!==r.test_summary.tests||r.test_summary.fail!==0||r.test_summary.cancelled!==0||r.test_summary.skipped!==0||r.case_coverage.length!==5||r.case_coverage.some(x=>x.status!=="passed")||r.local_integration.length!==2||r.local_integration.some(x=>x.status!=="implemented_and_offline_tested"||x.full_acceptance_status!=="pending_external_owner_and_live_evidence"))process.exit(1)' build/creative-metering-evidence.json
+      - name: Confirm CE-11 external acceptance remains pending
+        run: |
+          set +e
+          make --no-print-directory --silent acceptance TARGET=creative-metering > test-results/creative-metering/acceptance.txt 2>&1
+          status=$?
+          set -e
+          if [ "$status" -ne 2 ]; then
+            echo "Expected pending CE-11 external acceptance to exit 2, received $status" >&2
+            exit 1
+          fi
+          node -e 'const fs=require("node:fs");const s=fs.readFileSync(process.argv[1],"utf8");if(!s.includes("No authoritative Neatlogs evidence-sink agreement reference is available")||!s.includes("actual ingestion and readback remain unverified"))process.exit(1)' test-results/creative-metering/acceptance.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 tag verified 2026-10-10
+        if: always()
+        with:
+          name: creative-metering-evidence-node-${{ matrix.node-version }}
+          path: |
+            test-results/creative-metering/
+            build/creative-metering-evidence.json
+          if-no-files-found: error
       - run: make check TARGET=all MODE=mock

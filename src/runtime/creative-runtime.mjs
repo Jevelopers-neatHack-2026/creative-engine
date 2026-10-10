@@ -22,11 +22,13 @@ import {
   validateConsumptionReceipt,
   verifyHandoffApproval,
 } from "../contracts/approval-handoff.mjs";
+import { MeteringContractError, METERING_PROPOSAL_VERSION } from "../contracts/metering.mjs";
 import {
-  MeteringContractError,
-  METERING_PROPOSAL_VERSION,
-  executeMeteredAttempt,
-} from "../contracts/metering.mjs";
+  createUsageObservation,
+  executeCreativeMeteredAttempt,
+  TelemetryBoundaryError,
+  USAGE_PROFILE,
+} from "../telemetry/index.mjs";
 import { hashArtifactBytes } from "../storage/content-addressed.mjs";
 
 export const CREATIVE_API_VERSION = "1.0";
@@ -522,61 +524,16 @@ function startDeadline(operation, durationMs, clock = Date.now) {
   });
 }
 
-function exactUsageQuantity(value) {
-  if (Number.isSafeInteger(value) && value >= 0) return String(value);
-  if (typeof value === "string" && /^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/.test(value)) return value;
-  return undefined;
-}
-
-function usageObservation(attempt, rawUsage, idFactory = () => globalThis.crypto.randomUUID()) {
-  const usage = isRecord(rawUsage) ? rawUsage : {};
-  let completeness = ["complete", "partial", "unknown", "incomplete"].includes(usage.completeness)
-    ? usage.completeness : "unknown";
-  if (completeness === "incomplete") completeness = "partial";
-  const missing = new Set(Array.isArray(usage.missing_fields)
-    ? usage.missing_fields.filter((item) => typeof item === "string" && /^[a-zA-Z0-9_.-]{1,120}$/.test(item))
-    : []);
-  const units = [];
-  for (const field of ["input_tokens", "output_tokens"]) {
-    if (!Object.hasOwn(usage, field)) {
-      if (completeness === "complete") missing.add(field);
-      continue;
-    }
-    const quantity = exactUsageQuantity(usage[field]);
-    if (quantity === undefined) {
-      missing.add(field);
-      continue;
-    }
-    units.push({ name: field, quantity, relation: "standalone" });
-  }
-  if (completeness === "unknown") {
-    units.length = 0;
-    if (missing.size === 0) missing.add("provider_usage");
-  } else if (missing.size > 0 || units.length === 0) {
-    completeness = units.length === 0 ? "unknown" : "partial";
-    if (completeness === "unknown" && missing.size === 0) missing.add("provider_usage");
-    if (completeness === "partial" && missing.size === 0) missing.add("provider_usage_completeness");
-  }
-  const observation = {
-    schema_version: METERING_PROPOSAL_VERSION,
-    tenant_id: attempt.tenant_id,
-    project_id: attempt.project_id,
-    budget_scope_id: attempt.budget_scope_id,
-    logical_operation_id: attempt.logical_operation_id,
-    billable_attempt_id: attempt.billable_attempt_id,
-    source_observation_id: "usage:" + idFactory(),
+function usageObservation(attempt, trustedScope, rawUsage, profile, transportAttemptId, idFactory) {
+  return createUsageObservation({
+    attempt,
+    trustedScope,
+    usage: isRecord(rawUsage) ? rawUsage : {},
+    profile,
+    sourceObservationId: `usage:${idFactory()}`,
     source: "provider_response",
-    provider_name: attempt.provider.name,
-    model: attempt.provider.model,
-    environment: attempt.environment,
-    billing_mode: attempt.billing_mode,
-    completeness,
-    missing_fields: [...missing],
-  };
-  if (units.length > 0) observation.usage_units = units;
-  if (typeof usage.provider_request_id === "string") observation.provider_request_id = usage.provider_request_id;
-  if (typeof usage.transport_attempt_id === "string") observation.transport_attempt_id = usage.transport_attempt_id;
-  return observation;
+    transportAttemptId,
+  });
 }
 
 function meteringFailure(outcome, operation) {
@@ -607,6 +564,7 @@ function safeError(error, operation) {
     return new CreativeApiError(code, operation, safeFieldPath(error.field));
   }
   if (error instanceof MeteringContractError) return new CreativeApiError("unavailable", operation, "metering", { retryable: true });
+  if (error instanceof TelemetryBoundaryError) return new CreativeApiError("unavailable", operation, "telemetry", { retryable: true });
   if (error?.module === "creative-engine.versions") {
     const versionCodeMap = Object.freeze({
       invalid_request: "invalid_request",
@@ -894,6 +852,17 @@ export function createCreativeApi(options = {}) {
     contextFence) {
     if (preDispatchGuard) await preDispatchGuard();
     requiredPort(ports, "metering.reserveAttempt", request.operation);
+    const telemetry = ports.telemetry;
+    if (!isRecord(telemetry) || !isRecord(telemetry.modes) || !isRecord(telemetry.outbox) ||
+      typeof telemetry.outbox.append !== "function" ||
+      typeof telemetry.outbox.enqueueUsageObservation !== "function") {
+      throw new CreativeApiError("unavailable", request.operation, "telemetry", { retryable: true });
+    }
+    const usageProfile = isRecord(telemetry.usage_profiles) && Object.hasOwn(telemetry.usage_profiles, operationKind)
+      ? telemetry.usage_profiles[operationKind] : undefined;
+    if (!Object.values(USAGE_PROFILE).includes(usageProfile)) {
+      throw new CreativeApiError("unavailable", request.operation, "telemetry.usage_profile", { retryable: true });
+    }
     const metering = ports.metering;
     const method = requiredPort(ports, portPath, request.operation);
     const checkedRoute = routeFor(route, request.operation);
@@ -931,15 +900,23 @@ export function createCreativeApi(options = {}) {
       return intentRef;
     };
     let outcome;
+    let evidenceRefs = [];
+    let observationRef;
     try {
-      outcome = await executeMeteredAttempt({
-      port: metering,
+      const telemetryResult = await executeCreativeMeteredAttempt({
+      meteringPort: metering,
+      evidencePort: telemetry.outbox,
+      observationOutbox: telemetry.outbox,
       request: attempt,
       trustedScope: meteredTrustedScope(principal),
+      modes: telemetry.modes,
+      idFactory,
+      clock: () => new Date(now()),
       signal: deadline.signal,
+      authorizeTransport: async ({ transport_attempt_id }) => authorizeTransport(transport_attempt_id),
       dispatch: async (dispatchContext) => {
-        const transportAttemptId = boundedString(idFactory(), "transport_attempt_id", 256);
-        const dispatch_intent_ref = await authorizeTransport(transportAttemptId);
+        const transportAttemptId = dispatchContext.transport_attempt_id;
+        const dispatch_intent_ref = dispatchContext.dispatch_intent_ref;
         if (dispatchContext.signal?.aborted) throw new CreativeApiError("cancelled", request.operation, "deadline");
         let dispatched;
         try { dispatched = await invokePort({
@@ -955,9 +932,14 @@ export function createCreativeApi(options = {}) {
           transportAttemptId,
           dispatch_intent_ref,
           async recordTransportAttempt(transportId) {
-            const intentRef = await authorizeTransport(transportId);
-            if (dispatchContext.signal?.aborted) throw new CreativeApiError("cancelled", request.operation, "deadline");
-            await dispatchContext.recordTransportAttempt(transportId);
+            boundedString(transportId, "transport_attempt_id", 256);
+            let intentRef = dispatchIntentRefs.get(transportId);
+            if (!intentRef) {
+              if (dispatchContext.signal?.aborted) throw new CreativeApiError("cancelled", request.operation, "deadline");
+              await dispatchContext.recordTransportAttempt(transportId);
+              intentRef = dispatchIntentRefs.get(transportId);
+              if (!intentRef) throw new CreativeApiError("unavailable", request.operation, "dispatch_authorization");
+            }
             if (dispatchContext.signal?.aborted) throw new CreativeApiError("cancelled", request.operation, "deadline");
             return intentRef;
           },
@@ -965,13 +947,14 @@ export function createCreativeApi(options = {}) {
         }); } catch (error) { throw error; }
         providerValue = dispatched?.value;
         const rawUsage = dispatched?.usage;
-        const usage_observation = usageObservation(dispatchContext.attempt, {
-          ...(isRecord(rawUsage) ? rawUsage : {}),
-          ...(rawUsage?.transport_attempt_id === undefined ? { transport_attempt_id: transportAttemptId } : {}),
-        }, idFactory);
+        const usage_observation = usageObservation(dispatchContext.attempt, meteredTrustedScope(principal),
+          rawUsage, usageProfile, transportAttemptId, idFactory);
         return { provider_outcome: dispatched?.provider_outcome ?? "succeeded", usage_observation };
       },
     });
+      outcome = telemetryResult.outcome;
+      evidenceRefs = telemetryResult.evidence_refs;
+      observationRef = telemetryResult.observation_ref;
     } finally {
       deadline.dispose();
     }
@@ -981,7 +964,8 @@ export function createCreativeApi(options = {}) {
     }
     return { value: providerValue, attempt_id: attemptId, decision_request: validatedDecisionRequest,
       metering: outcome, transport_attempt_ids: Object.freeze([...dispatchIntentRefs.keys()]),
-      usage_ref: outcome.observation_ack?.source_observation_id };
+      usage_ref: observationRef ?? outcome.observation_ack?.source_observation_id,
+      evidence_refs: Object.freeze([...(evidenceRefs ?? [])]) };
   }
 
   function decisionInput(decisionRequest, principal, request, brief, started) {
@@ -1140,10 +1124,10 @@ export function createCreativeApi(options = {}) {
       expectedCurrentDesignVersionId);
     const metered = await runMetered(principal, request, started, operation === "generate" ? "image_generation" : "image_edit", route, method,
       async ({ method: dispatch, scope, actor_id, started: job, route: resolved, attempt, signal, deadline_at,
-        transportAttemptId, dispatch_intent_ref, recordTransportAttempt }) => {
+        reservation_ref, transportAttemptId, dispatch_intent_ref, recordTransportAttempt }) => {
         const value = await dispatch(Object.freeze({ scope: started.scope, actor_id: principal.actor_id,
           job_id: started.job_id, attempt, route: resolved, brief, base_design: baseDesign, plan,
-          decision_result: decisionResult, transport_attempt_id: transportAttemptId, dispatch_intent_ref,
+          decision_result: decisionResult, reservation_ref, transport_attempt_id: transportAttemptId, dispatch_intent_ref,
           recordTransportAttempt,
           signal, deadline_at }));
         return { value, usage: value?.usage, provider_outcome: "succeeded" };
@@ -1213,7 +1197,7 @@ export function createCreativeApi(options = {}) {
       ? [publicIdentifier(metered.usage_ref, "usage_ref", operation, 256)] : [];
     return { design, artifact_bytes: artifactBytes,
       creation_evidence: { transport_attempt_ids: [...metered.transport_attempt_ids], provider_request_ids: providerRequestIds,
-        usage_refs: usageRefs },
+        usage_refs: usageRefs, evidence_refs: [...metered.evidence_refs] },
       usage: { completeness: usage.completeness ?? "unknown" }, attempt_id: metered.attempt_id };
   }
 
@@ -1230,9 +1214,9 @@ export function createCreativeApi(options = {}) {
       const route = routeFor(await resolveRoute(Object.freeze({ scope, actor_id: principal.actor_id, design_version: design })), operation);
       await assertCurrentCreativeContext(scope, brief, design, operation);
       const metered = await runMetered(principal, request, started, "vision_observation", route, "inspection.inspect",
-        async ({ attempt, signal, deadline_at, transportAttemptId, dispatch_intent_ref, recordTransportAttempt }) => {
+        async ({ attempt, reservation_ref, signal, deadline_at, transportAttemptId, dispatch_intent_ref, recordTransportAttempt }) => {
           const value = await inspect(Object.freeze({ scope, actor_id: principal.actor_id, job_id: started.job_id,
-            attempt, brief, design_version: design, transport_attempt_id: transportAttemptId,
+            attempt, brief, design_version: design, reservation_ref, transport_attempt_id: transportAttemptId,
             signal, deadline_at, dispatch_intent_ref, recordTransportAttempt }));
           return { value, usage: value?.usage, provider_outcome: "succeeded" };
         }, () => assertCurrentCreativeContext(scope, brief, design, operation),
@@ -1329,7 +1313,7 @@ export function createCreativeApi(options = {}) {
         transport_attempt_ids: Object.freeze([...(creationEvidence?.transport_attempt_ids ?? [])]),
         provider_request_ids: Object.freeze([...(creationEvidence?.provider_request_ids ?? [])]),
         usage_refs: Object.freeze([...(creationEvidence?.usage_refs ?? [])]),
-        trace_refs: Object.freeze([]),
+        trace_refs: Object.freeze([...(creationEvidence?.evidence_refs ?? [])]),
       });
       const saveInput = Object.freeze({ scope, brief_id: brief.brief_id,
         design_version: output.design,

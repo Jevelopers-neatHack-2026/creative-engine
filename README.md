@@ -1,8 +1,10 @@
 # creative-engine
 
-Creative-engine contains a local controls service, dependency-free contract validators, and a typed non-UI creative API runtime. The controls package validates bounded creative changes and stores a durable local Apply outbox. The API handler implements generate/edit/inspect/list/compare/restore/cancel/handoff and job status around injected jobs, storage, provider, DecisionPort, metering, approval, inspection, handoff, and trace ports. Its public contract and C01/C02/C03/C04 schemas remain local proposals pending external owner agreement; production provider transports, application authentication, finance authority, approval issuance, and rendering are not implemented here.
+Creative-engine contains a local controls service, dependency-free contract validators, and a typed non-UI creative API runtime. The controls package validates bounded creative changes and stores a durable local Apply outbox. The API handler implements generate/edit/inspect/list/compare/restore/cancel/handoff and job status around injected jobs, storage, provider, DecisionPort, metering, approval, inspection, handoff, and telemetry ports. Current generate/edit/inspection/DecisionPort attempts require explicit usage profiles and persist sanitized attempt evidence on the same SQLite connection as the durable API store. Its public contract and C01/C02/C03/C04 schemas remain local proposals pending external owner agreement; production provider transports, application authentication, finance authority, approval issuance, and rendering are not implemented here.
 
 The `creative-engine/versions` subpath exposes a local SQLite-backed version adapter that pairs immutable design records and exact content-addressed artifact bytes with selection CAS and API job completion in one database transaction. Recovery and restore do not dispatch providers. Handoff remains unavailable until durable external-result staging is implemented. Local tests do not certify production-host durability or external acceptance.
+
+The `creative-engine/telemetry` subpath exposes the CE-11 usage/evidence boundary and SQLite outbox. It reuses the C03 metering authority and does not create a budget ledger. The local outbox refuses to append or claim externally deliverable records inside an uncommitted outer transaction. Neatlogs protocol agreement, actual ingestion, and readback remain unresolved; passing local checks does not satisfy those gates.
 
 ## Build and offline checks
 
@@ -21,12 +23,15 @@ make check TARGET=handoff-contract MODE=mock
 make check TARGET=access-preflight MODE=mock
 make check TARGET=access-preflight MODE=live
 make check TARGET=versions MODE=mock
+make check TARGET=creative-metering MODE=mock
 make check TARGET=all MODE=mock
 ```
 
 The API, contract, control, evaluation-policy, access-preflight, and versions checks use synthetic fixtures and make no paid provider calls. `make check TARGET=api MODE=mock` writes a sanitized, versioned summary to `build/api-check-evidence.json`. `make check TARGET=access-preflight MODE=mock` exercises the fixed eight-cell access matrix, writes sanitized mock evidence to `build/access-preflight-evidence.json`, and keeps acceptance pending. `make check TARGET=access-preflight MODE=live` writes `build/access-preflight-live-gate.json`, prints the blocked per-cell reasons, and exits 2 with zero provider dispatches when trusted live adapters and external owner evidence are absent. A user-supplied JSON claim cannot enable live access. The exported `runAccessPreflight` API can be composed by a trusted host with real owner adapters; this repository does not install that host or read credentials. `make acceptance TARGET=access-preflight` reports the same missing live owner evidence and exits 2. `make check TARGET=versions MODE=mock` runs the paired durable API/store and process-restart cases, plus strict public-subpath typechecking. `make check TARGET=eval-policy MODE=mock` runs the policy, corpus, register, report, and acceptance-gate fixtures; local checks may pass while owner evidence remains pending. `make acceptance TARGET=api`, `make acceptance TARGET=contracts`, `make acceptance TARGET=decision-contract`, `make acceptance TARGET=metering-contract`, `make acceptance TARGET=handoff-contract`, and `make acceptance TARGET=versions` intentionally fail while canonical owner agreements remain pending. `make acceptance TARGET=eval-policy` separately emits machine-readable evidence and exits 2 until accountable owners publish and independently verify the required corpus, question inventory, rubric, telemetry, budget, and policy approvals. `make acceptance TARGET=all` includes those agreements, CE-Q01 policy/corpus evidence, and the CE-A01 live access gate.
 
-The standalone workflows check the public API, contract, metering, approval-handoff, preflight, and versions package imports with TypeScript 5.9.3 in strict NodeNext mode. `make bootstrap` installs the locked TypeScript consumer tools used by those checks. Run `make typecheck-api`, `make typecheck-preflight`, or `make typecheck-versions` to check the public consumers directly. The supported runtime checks use Node.js 22.23.3 and Node.js 24.15.0.
+The standalone workflows check the public API, contract, metering, approval-handoff, preflight, versions, and telemetry package imports with TypeScript 5.9.3 in strict NodeNext mode. `make bootstrap` installs the locked TypeScript consumer tools used by those checks. Run `make typecheck-api`, `make typecheck-preflight`, `make typecheck-versions`, or `make typecheck-telemetry` to check the public consumers directly. The supported runtime checks use Node.js 22.23.3 and Node.js 24.15.0.
+
+`make check TARGET=creative-metering MODE=mock` exercises the current generate, edit, inspection, and DecisionPort attempt paths against injected fixture ports. It checks usage profiles, durable outbox identity, replay, and rejection before reservation when evidence cannot be committed. Planning, repair, and Responses orchestration are not implemented API operations yet and remain local follow-up work. `make acceptance TARGET=creative-metering` exits 2 because no authoritative Neatlogs evidence-sink agreement reference or verified ingestion/readback is available; the Finance and usage-schema agreement checks do not override this gate.
 
 ```sh
 make typecheck-api
@@ -42,6 +47,7 @@ The controls browser example has its own lockfile and dependency install. Its No
 - [Canonical owner agreement status](docs/contracts/canonical-owner-agreements.json)
 - [Creative API v1, injected ports, and dispatch fencing](docs/api/creative-api.md)
 - [Durable creative versions, exact bytes, branches, restore, and local durability limits](docs/creative/version-state-machine.md)
+- [Creative usage evidence, local outbox, mode tags, privacy, and pending external sink gates](docs/usage-trace-evidence.md)
 - [Controls local integration and API boundary](docs/controls-integration.md)
 - [Architecture reference](https://github.com/Jevelopers-neatHack-2026/getticketstub.com/blob/main/docs/architecture-kit/v1.0/README.md) · [implementation plan](https://github.com/Jevelopers-neatHack-2026/getticketstub.com/blob/main/docs/planning/implementation-plan.md)
 

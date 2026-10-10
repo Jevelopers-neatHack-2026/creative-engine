@@ -12,6 +12,8 @@ const SENSITIVE_PUBLIC_TEXT = [
 ];
 const BASIC_AUTH_CANDIDATE = /\bBasic[\t ]+([A-Za-z0-9+/]+={0,2})(?![A-Za-z0-9+/=])/gi;
 const MAX_BASIC_AUTH_TOKEN_CHARS = 8192;
+const MAX_PERCENT_DECODE_PASSES = 4;
+const MAX_PUBLIC_TEXT_SCAN_CHARS = 1024 * 1024;
 const DEFAULT_LIMITS = Object.freeze({ maxDepth: 24, maxNodes: 8192, maxBytes: 64 * 1024 });
 const ORDINARY_BEARER_WORDS = new Set([
   "a", "an", "and", "are", "as", "at", "be", "been", "by", "for", "from", "in",
@@ -27,10 +29,59 @@ export class TelemetryPrivacyError extends Error {
   }
 }
 
+function isHexDigitCode(code) {
+  return (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x46) || (code >= 0x61 && code <= 0x66);
+}
+
+function isPercentByteEscape(value, index) {
+  return value.charCodeAt(index) === 0x25 && index + 2 < value.length &&
+    isHexDigitCode(value.charCodeAt(index + 1)) && isHexDigitCode(value.charCodeAt(index + 2));
+}
+
+function decodePercentEscapedRuns(value) {
+  const pieces = [];
+  let cursor = 0;
+  while (cursor < value.length) {
+    if (!isPercentByteEscape(value, cursor)) {
+      const start = cursor;
+      cursor += 1;
+      while (cursor < value.length && !isPercentByteEscape(value, cursor)) cursor += 1;
+      pieces.push(value.slice(start, cursor));
+      continue;
+    }
+
+    const bytes = [];
+    while (isPercentByteEscape(value, cursor)) {
+      bytes.push(Number.parseInt(value.slice(cursor + 1, cursor + 3), 16));
+      cursor += 3;
+    }
+    // Buffer's replacement decoding preserves valid ASCII/UTF-8 bytes around
+    // malformed neighbors such as %FF, instead of abandoning the whole scan.
+    pieces.push(Buffer.from(bytes).toString("utf8"));
+  }
+  return pieces.join("");
+}
+
+function percentDecodedVariants(value) {
+  const variants = [];
+  let candidate = value;
+  for (let pass = 0; pass <= MAX_PERCENT_DECODE_PASSES; pass += 1) {
+    variants.push(candidate);
+    if (pass === MAX_PERCENT_DECODE_PASSES) break;
+    const decoded = decodePercentEscapedRuns(candidate);
+    if (decoded === candidate) break;
+    candidate = decoded;
+  }
+  return variants;
+}
+
 function hasBasicAuthMaterial(value) {
+  // A query/form-encoded separator may be '+'. Normalize only the scheme
+  // separator so '+' bytes in the base64 token remain unchanged.
+  const candidate = value.replace(/\bbasic\+(?=[A-Za-z0-9+/])/gi, "Basic ");
   BASIC_AUTH_CANDIDATE.lastIndex = 0;
   let match;
-  while ((match = BASIC_AUTH_CANDIDATE.exec(value)) !== null) {
+  while ((match = BASIC_AUTH_CANDIDATE.exec(candidate)) !== null) {
     const token = match[1];
     const unpadded = token.replace(/=+$/, "");
     if (unpadded.length % 4 === 1 || token.length > MAX_BASIC_AUTH_TOKEN_CHARS) continue;
@@ -44,22 +95,35 @@ function hasBasicAuthMaterial(value) {
   return false;
 }
 
-export function containsSensitivePublicText(value) {
-  if (typeof value !== "string") return false;
-  if (hasBasicAuthMaterial(value)) return true;
+function hasBearerAuthMaterial(value) {
+  const candidate = value.replace(/\bbearer\+(?=[A-Za-z0-9._~+/-])/gi, "Bearer ");
   const bearer = /\bbearer\s+([A-Za-z0-9._~+/-]+={0,2})(?![A-Za-z0-9._~+/-=])/gi;
   let match;
-  while ((match = bearer.exec(value)) !== null) {
-    const candidate = match[1].replace(/=+$/, "");
+  while ((match = bearer.exec(candidate)) !== null) {
+    const token = match[1].replace(/=+$/, "");
     const hasPadding = match[1].includes("=");
-    const hasFollowingText = value.slice(bearer.lastIndex).trim().length > 0;
-    if (hasPadding || candidate.length >= 8 || !ORDINARY_BEARER_WORDS.has(candidate.toLowerCase()) || !hasFollowingText) return true;
+    const hasFollowingText = candidate.slice(bearer.lastIndex).trim().length > 0;
+    if (hasPadding || token.length >= 8 || !ORDINARY_BEARER_WORDS.has(token.toLowerCase()) || !hasFollowingText) return true;
   }
-  return SENSITIVE_PUBLIC_TEXT.slice(1).some((pattern) => pattern.test(value));
+  return false;
+}
+
+export function containsSensitivePublicText(value) {
+  if (typeof value !== "string") return false;
+  if (value.length > MAX_PUBLIC_TEXT_SCAN_CHARS) return true;
+  const variants = percentDecodedVariants(value);
+  for (const candidate of variants) {
+    if (hasBasicAuthMaterial(candidate) || hasBearerAuthMaterial(candidate) ||
+      SENSITIVE_PUBLIC_TEXT.slice(1).some((pattern) => pattern.test(candidate))) return true;
+  }
+  if (variants.length > MAX_PERCENT_DECODE_PASSES && /%[0-9a-f]{2}/i.test(variants.at(-1))) return true;
+  return false;
 }
 
 export function isSensitivePublicField(value) {
-  return typeof value === "string" && (SENSITIVE_PUBLIC_FIELD.test(value) || containsSensitivePublicText(value));
+  if (typeof value !== "string") return false;
+  if (percentDecodedVariants(value).some((candidate) => SENSITIVE_PUBLIC_FIELD.test(candidate))) return true;
+  return containsSensitivePublicText(value);
 }
 
 export function assertSafePublicIdentifier(value, { maxLength = 256 } = {}) {

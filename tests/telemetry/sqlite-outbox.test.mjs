@@ -9,6 +9,7 @@ import {
   createSqliteTelemetryOutbox,
   createTelemetryEvidence,
   createUsageObservation,
+  deliverPendingTelemetryEvidence,
   deliverPendingUsageObservations,
   TelemetryBoundaryError,
   USAGE_PROFILE,
@@ -238,15 +239,18 @@ test("a process crash after claim leaves durable work recoverable after lease ex
   reopenedDb.close();
 });
 
-test("SQLite outbox composes with an existing caller transaction without committing it", async (t) => {
+test("SQLite outbox refuses preflight evidence inside an uncommitted caller transaction", async (t) => {
   const path = await temporaryDatabase(t);
   const database = openDatabase(path);
   const outbox = createSqliteTelemetryOutbox({ database });
   const event = makeEvent("event:outer-transaction");
   database.exec("BEGIN IMMEDIATE");
   assert.equal(database.isTransaction, true);
-  await outbox.append(event);
-  assert.equal(database.isTransaction, true, "the adapter releases only its savepoint");
+  await assert.rejects(() => outbox.append(event), (error) =>
+    error instanceof TelemetryBoundaryError && error.code === "telemetry_outer_transaction_active");
+  await assert.rejects(() => outbox.claimPendingEvidence({ limit: 1 }), (error) =>
+    error instanceof TelemetryBoundaryError && error.code === "telemetry_outer_transaction_active");
+  assert.equal(database.isTransaction, true, "the adapter does not treat a SAVEPOINT as a durable commit");
   database.exec("ROLLBACK");
   assert.equal(database.isTransaction, false);
   database.close();
@@ -254,6 +258,74 @@ test("SQLite outbox composes with an existing caller transaction without committ
   const reopenedDb = openDatabase(path);
   const reopened = createSqliteTelemetryOutbox({ database: reopenedDb });
   assert.equal(await reopened.status("evidence", event.event_id), undefined);
+  reopenedDb.close();
+});
+
+test("a direct C03 acknowledgement durably settles only the exact queued observation", async (t) => {
+  const path = await temporaryDatabase(t);
+  const database = openDatabase(path);
+  const outbox = createSqliteTelemetryOutbox({ database, clock: () => 15_000 });
+  const source = makeObservation({ sourceObservationId: "usage:direct-ack" });
+  const queued = await outbox.enqueueUsageObservation({ ...source, trustedScope });
+  assert.deepEqual(await outbox.acknowledgeEnqueuedObservation({
+    record_ref: queued.record_ref,
+    source_observation_id: "usage:direct-ack",
+    effective_billable_attempt_id: "attempt:fixture-001",
+    authority_status: "accepted",
+  }), { status: "acknowledged", source_observation_id: "usage:direct-ack", authority_status: "accepted" });
+  assert.deepEqual(await outbox.status("observation", queued.record_ref), {
+    status: "delivered", claim_count: 0, created_at: 15_000, delivered_at: 15_000,
+  });
+  const pending = await outbox.claimPending({ limit: 1 });
+  assert.equal(pending.records.length, 0);
+  assert.deepEqual(await outbox.acknowledgeEnqueuedObservation({
+    record_ref: queued.record_ref,
+    source_observation_id: "usage:direct-ack",
+    effective_billable_attempt_id: "attempt:other",
+    authority_status: "duplicate",
+  }), { status: "mismatch", source_observation_id: "usage:direct-ack" });
+  database.close();
+});
+
+test("evidence delivery requires an event-level acknowledgement and recovers after acknowledgement loss", async (t) => {
+  const path = await temporaryDatabase(t);
+  let now = 25_000;
+  const database = openDatabase(path);
+  const initial = createSqliteTelemetryOutbox({ database, clock: () => now, claimLeaseMs: 100 });
+  await initial.append(makeEvent("event:evidence-ack-loss"));
+  const lostClaim = (await initial.claimPendingEvidence({ limit: 1 })).records[0];
+  let remoteAccepted = 1; // The remote sink accepted before the worker lost its acknowledgement.
+  database.close();
+
+  now += 101;
+  const reopenedDb = openDatabase(path);
+  const reopened = createSqliteTelemetryOutbox({ database: reopenedDb, clock: () => now, claimLeaseMs: 100 });
+  let sinkCalls = 0;
+  const delivery = await deliverPendingTelemetryEvidence({ outbox: reopened, limit: 1, sink: {
+    async record(event) {
+      sinkCalls += 1;
+      assert.equal(event.event_id, lostClaim.event.event_id);
+      remoteAccepted += 1;
+      return { status: "duplicate", event_id: event.event_id };
+    },
+  } });
+  assert.deepEqual(delivery, { status: "complete", attempted: 1, acknowledged: 1, retained: 0 });
+  assert.equal(remoteAccepted, 2, "delivery retries the same durable event after an ambiguous prior result");
+  assert.equal(sinkCalls, 1);
+  assert.deepEqual(await reopened.status("evidence", lostClaim.event.event_id), {
+    status: "delivered", claim_count: 2, created_at: 25_000, delivered_at: now,
+  });
+
+  let nestedSinkCalls = 0;
+  const stillPending = await reopened.append(makeEvent("event:evidence-transaction-refusal"));
+  assert.equal(stillPending.status, "recorded");
+  reopenedDb.exec("BEGIN IMMEDIATE");
+  const refused = await deliverPendingTelemetryEvidence({ outbox: reopened, limit: 1, sink: {
+    async record() { nestedSinkCalls += 1; return { status: "accepted", event_id: "event:evidence-transaction-refusal" }; },
+  } });
+  assert.deepEqual(refused, { status: "outbox_unavailable", attempted: 0, acknowledged: 0, retained: 0 });
+  assert.equal(nestedSinkCalls, 0, "an uncommitted SAVEPOINT cannot authorize an external sink call");
+  reopenedDb.exec("ROLLBACK");
   reopenedDb.close();
 });
 

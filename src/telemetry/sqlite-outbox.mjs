@@ -178,6 +178,10 @@ function validateDatabase(database) {
   }
 }
 
+function assertOutermostCommitBoundary(database) {
+  if (database.isTransaction === true) throw boundary("telemetry_outer_transaction_active");
+}
+
 function normalizeEvent(event) {
   if (!isRecord(event)) throw boundary("invalid_evidence_event");
   const snapshot = makeSnapshot(event, "unsafe_evidence_event");
@@ -343,6 +347,7 @@ export function createSqliteTelemetryOutbox({
   return Object.freeze({
     /** Persist an event before the caller treats the local evidence append as durable. */
     async append(rawEvent) {
+      assertOutermostCommitBoundary(database);
       const event = normalizeEvent(rawEvent).payloadValue;
       const now = nowMilliseconds(clock);
       return withTransaction(database, () => {
@@ -368,6 +373,7 @@ export function createSqliteTelemetryOutbox({
 
     /** Persist one exact C03 pair; same source identity and payload is idempotent. */
     async enqueueUsageObservation(input) {
+      assertOutermostCommitBoundary(database);
       const record = normalizeObservation(input);
       const now = nowMilliseconds(clock);
       return withTransaction(database, () => {
@@ -404,8 +410,37 @@ export function createSqliteTelemetryOutbox({
       });
     },
 
+    /** Record a synchronous C03 acceptance against its already durable row. */
+    async acknowledgeEnqueuedObservation({ record_ref, source_observation_id, effective_billable_attempt_id, authority_status }) {
+      assertOutermostCommitBoundary(database);
+      const recordRef = safeIdentifier(record_ref, "invalid_observation_reference");
+      const observationId = safeIdentifier(source_observation_id, "invalid_observation_identity");
+      const billableAttemptId = safeIdentifier(effective_billable_attempt_id, "invalid_observation_identity");
+      if (!["accepted", "duplicate"].includes(authority_status)) throw boundary("invalid_metering_acknowledgement");
+      const now = nowMilliseconds(clock);
+      return withTransaction(database, () => {
+        const row = database.prepare(`SELECT source_observation_id, billable_attempt_id, status, metering_ack_status
+          FROM ${OBSERVATION_TABLE} WHERE record_ref = ?`).get(recordRef);
+        if (!row || row.source_observation_id !== observationId || row.billable_attempt_id !== billableAttemptId) {
+          return Object.freeze({ status: "mismatch", source_observation_id: observationId });
+        }
+        if (row.status === "delivered") {
+          return Object.freeze({ status: "acknowledged", source_observation_id: observationId,
+            authority_status: row.metering_ack_status });
+        }
+        const changed = database.prepare(`UPDATE ${OBSERVATION_TABLE}
+          SET status = 'delivered', claim_token_sha256 = NULL, lease_expires_at = NULL,
+              delivered_at = ?, metering_ack_status = ?, last_defer_reason = NULL
+          WHERE record_ref = ? AND source_observation_id = ? AND billable_attempt_id = ? AND status <> 'delivered'`)
+          .run(now, authority_status, recordRef, observationId, billableAttemptId).changes;
+        return Object.freeze({ status: changed === 1 ? "acknowledged" : "mismatch",
+          source_observation_id: observationId, authority_status });
+      });
+    },
+
     /** Port consumed by deliverPendingUsageObservations; each claim has a lease fence. */
     async claimPending({ limit }) {
+      assertOutermostCommitBoundary(database);
       const now = nowMilliseconds(clock);
       const { leaseUntil } = claimLeaseArgs(limit, claimLeaseMs, now);
       const records = withTransaction(database, () => selectClaimable(
@@ -426,6 +461,7 @@ export function createSqliteTelemetryOutbox({
     },
 
     async acknowledge({ record_ref, claim_token, source_observation_id, effective_billable_attempt_id, authority_status }) {
+      assertOutermostCommitBoundary(database);
       const recordRef = safeIdentifier(record_ref, "invalid_observation_reference");
       const observationId = safeIdentifier(source_observation_id, "invalid_observation_identity");
       safeIdentifier(effective_billable_attempt_id, "invalid_observation_identity");
@@ -451,6 +487,7 @@ export function createSqliteTelemetryOutbox({
     },
 
     async defer({ record_ref, claim_token, reason }) {
+      assertOutermostCommitBoundary(database);
       const recordRef = safeIdentifier(record_ref, "invalid_observation_reference");
       const tokenHash = hashClaimToken(claim_token);
       if (!OBSERVATION_DEFER_REASONS.has(reason)) throw boundary("invalid_observation_defer_reason");
@@ -468,6 +505,7 @@ export function createSqliteTelemetryOutbox({
 
     /** Evidence delivery claim API; a sink acknowledgement is owned by the host. */
     async claimPendingEvidence({ limit, leaseMs = claimLeaseMs }) {
+      assertOutermostCommitBoundary(database);
       const now = nowMilliseconds(clock);
       const { leaseUntil } = claimLeaseArgs(limit, leaseMs, now);
       const records = withTransaction(database, () => selectClaimable(
@@ -485,6 +523,7 @@ export function createSqliteTelemetryOutbox({
     },
 
     async acknowledgeEvidence({ event_id, claim_token }) {
+      assertOutermostCommitBoundary(database);
       const eventId = safeIdentifier(event_id, "invalid_evidence_identity");
       const tokenHash = hashClaimToken(claim_token);
       const now = nowMilliseconds(clock);
@@ -500,6 +539,7 @@ export function createSqliteTelemetryOutbox({
     },
 
     async deferEvidence({ event_id, claim_token, reason }) {
+      assertOutermostCommitBoundary(database);
       const eventId = safeIdentifier(event_id, "invalid_evidence_identity");
       const tokenHash = hashClaimToken(claim_token);
       if (!EVIDENCE_DEFER_REASONS.has(reason)) throw boundary("invalid_evidence_defer_reason");

@@ -58,6 +58,16 @@ test("canonical owner acceptance gate reports missing C01 and C02 agreements as 
     for (const id of expectedIds) assert.match(result.stderr, new RegExp(id));
   }
 
+  const telemetry = spawnSync(process.execPath, ["scripts/acceptance-gate.mjs", "creative-metering"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  assert.equal(telemetry.status, 2, "local tests cannot establish external evidence-sink acceptance");
+  assert.match(telemetry.stderr, /No authoritative Neatlogs evidence-sink agreement reference is available/);
+  assert.match(telemetry.stderr, /actual ingestion and readback remain unverified/);
+  assert.match(telemetry.stderr, /finance_metering_budget_protocol/);
+  assert.match(telemetry.stderr, /shared_contracts_usage_budget_schemas/);
+
   const all = spawnSync(process.execPath, ["scripts/acceptance-gate.mjs", "all"], {
     cwd: root,
     encoding: "utf8",
@@ -66,6 +76,7 @@ test("canonical owner acceptance gate reports missing C01 and C02 agreements as 
   assert.match(all.stderr, /finance_metering_budget_protocol/);
   assert.match(all.stderr, /product_approval_protocol_and_consumer/);
   assert.match(all.stderr, /CE-A01 live access remains pending/);
+  assert.match(all.stderr, /No authoritative Neatlogs evidence-sink agreement reference is available/);
 
   const access = spawnSync("make", ["acceptance", "TARGET=access-preflight"], {
     cwd: root,
@@ -169,12 +180,21 @@ test("acceptance requires an accepted proposal, pinned input bytes, canonical sc
     const valid = await evaluateAcceptanceRecord(accepted, "contracts", tempRoot);
     assert.deepEqual(valid.unmet, []);
     assert.deepEqual((await evaluateAcceptanceRecord(accepted, "metering-contract", tempRoot)).unmet, []);
+    const telemetryAcceptedInputs = await evaluateAcceptanceRecord(accepted, "creative-metering", tempRoot);
+    assert.deepEqual(telemetryAcceptedInputs.unmet, [], "Finance and usage agreement evidence is checked independently");
+    assert.equal(telemetryAcceptedInputs.unresolved.length, 1,
+      "even individually accepted Finance and usage schemas cannot imply an evidence sink or readback agreement");
+    assert.match(telemetryAcceptedInputs.unresolved[0], /No authoritative Neatlogs evidence-sink agreement reference/);
     assert.deepEqual((await evaluateAcceptanceRecord(accepted, "handoff-contract", tempRoot)).unmet, []);
     assert.deepEqual((await evaluateAcceptanceRecord(accepted, "versions", tempRoot)).unmet, []);
-    assert.deepEqual((await evaluateAcceptanceRecord(accepted, "all", tempRoot)).unmet, []);
+    const allAcceptedInputs = await evaluateAcceptanceRecord(accepted, "all", tempRoot);
+    assert.deepEqual(allAcceptedInputs.unmet, []);
+    assert.equal(allAcceptedInputs.unresolved.length, 1);
     const pendingProposal = { ...accepted, proposal_state: "pending_external_owner_agreement" };
     assert.equal((await evaluateAcceptanceRecord(pendingProposal, "contracts", tempRoot)).unmet.length, 4);
     assert.equal((await evaluateAcceptanceRecord(pendingProposal, "metering-contract", tempRoot)).unmet.length, 2);
+    assert.equal((await evaluateAcceptanceRecord(pendingProposal, "creative-metering", tempRoot)).unmet.length, 2);
+    assert.equal((await evaluateAcceptanceRecord(pendingProposal, "creative-metering", tempRoot)).unresolved.length, 1);
     assert.equal((await evaluateAcceptanceRecord(pendingProposal, "handoff-contract", tempRoot)).unmet.length, 3);
     assert.equal((await evaluateAcceptanceRecord(pendingProposal, "versions", tempRoot)).unmet.length, 5);
     assert.equal((await evaluateAcceptanceRecord(pendingProposal, "all", tempRoot)).unmet.length, 12);

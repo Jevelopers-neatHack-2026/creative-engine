@@ -11,6 +11,7 @@ import {
   createUsageObservation,
   deduplicateUsageObservations,
   deliverPendingUsageObservations,
+  deliverPendingTelemetryEvidence,
   executeCreativeMeteredAttempt,
   projectPublicTelemetry,
   type CreativeTelemetryEvidence,
@@ -18,8 +19,10 @@ import {
   type TelemetryModeContext,
   type SqliteTelemetryOutbox,
   type UsageObservationOutboxPort,
-} from "../../src/telemetry/index.mjs";
-import { METERING_PROPOSAL_VERSION, type MeteredAttemptRequest, type TrustedMeteringScope, type UsageObservation } from "../../src/contracts/metering.mjs";
+} from "creative-engine/telemetry";
+import { METERING_PROPOSAL_VERSION, type MeteredAttemptRequest, type TrustedMeteringScope, type UsageObservation } from "creative-engine/contracts/metering";
+import { createCreativeApi } from "creative-engine/api/v1";
+import type { CreativeTelemetryConfiguration } from "creative-engine/telemetry";
 
 const scope: TrustedMeteringScope = {
   tenant_id: "tenant:typecheck",
@@ -73,9 +76,24 @@ const sqliteOutbox: SqliteTelemetryOutbox = createSqliteTelemetryOutbox({
   clock: () => 1_000,
   claimLeaseMs: 1_000,
 });
+const apiTelemetry: CreativeTelemetryConfiguration = {
+  outbox: sqliteOutbox,
+  modes,
+  usage_profiles: {
+    image_generation: USAGE_PROFILE.NORMALIZED,
+    image_edit: USAGE_PROFILE.NORMALIZED,
+    vision_observation: USAGE_PROFILE.NORMALIZED,
+    jev_decision: USAGE_PROFILE.TYPESAFE_DECISION,
+  },
+};
+const publicApi = createCreativeApi({ ports: { telemetry: apiTelemetry } });
+void publicApi;
 void sqliteOutbox.enqueueUsageObservation({ attempt, trustedScope: scope, observation: usage });
 void sqliteOutbox.append(evidence);
 void sqliteOutbox.claimPendingEvidence({ limit: 4, leaseMs: 500 });
+void deliverPendingTelemetryEvidence({ outbox: sqliteOutbox, sink: {
+  async record(event) { return { status: "accepted", event_id: event.event_id }; },
+} });
 
 void executeCreativeMeteredAttempt({
   meteringPort: {
@@ -85,12 +103,15 @@ void executeCreativeMeteredAttempt({
     async settleReservation() { return { reservation_id: "reservation:typecheck", status: "held_for_reconciliation" }; }, async markOutcomeUnknown() {},
   },
   evidencePort: sink,
+  observationOutbox: sqliteOutbox,
   request: attempt,
   trustedScope: scope,
   modes,
+  authorizeTransport: ({ transport_attempt_id }) => `dispatch:${transport_attempt_id}`,
   dispatch: async (context) => {
     context.reservation_ref satisfies string;
     context.transport_attempt_id satisfies string;
+    context.dispatch_intent_ref satisfies string;
     return { provider_outcome: "unknown", usage_observation: usage };
   },
 });

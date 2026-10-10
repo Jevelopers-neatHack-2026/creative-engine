@@ -111,15 +111,38 @@ export interface MeteredDispatchWithEvidenceContext {
   readonly attempt: DeepReadonly<MeteredAttemptRequest>;
   readonly reservation_ref: string;
   readonly transport_attempt_id: string;
+  readonly dispatch_intent_ref: string;
   readonly signal?: AbortSignal;
   recordTransportAttempt(transportAttemptId: string): Promise<string>;
+}
+export interface UsageObservationPersistencePort {
+  enqueueUsageObservation(args: {
+    attempt: MeteredAttemptRequest;
+    trustedScope: TrustedMeteringScope;
+    observation: UsageObservation;
+  }): Promise<{ status: "recorded" | "duplicate"; record_ref: string; source_observation_id: string; payload_hash: string }>;
+  acknowledgeEnqueuedObservation?(args: {
+    record_ref: string;
+    source_observation_id: string;
+    effective_billable_attempt_id: string;
+    authority_status: "accepted" | "duplicate";
+  }): Promise<{ status: "acknowledged" | "mismatch"; source_observation_id: string }>;
 }
 export declare function executeCreativeMeteredAttempt(args: {
   meteringPort: MeteringPort;
   evidencePort: TelemetryEvidencePort;
+  observationOutbox: UsageObservationPersistencePort;
   request: MeteredAttemptRequest;
   trustedScope: TrustedMeteringScope;
   modes: TelemetryModeContext;
+  authorizeTransport(input: Readonly<{
+    attempt: DeepReadonly<MeteredAttemptRequest>;
+    logical_operation_id: string;
+    billable_attempt_id: string;
+    reservation_ref: string;
+    transport_attempt_id: string;
+    signal?: AbortSignal;
+  }>): Promise<string> | string;
   dispatch(context: MeteredDispatchWithEvidenceContext): Promise<{
     provider_outcome?: "succeeded" | "failed" | "partial" | "unknown";
     usage_observation?: UsageObservation;
@@ -133,6 +156,8 @@ export declare function executeCreativeMeteredAttempt(args: {
 }): Promise<Readonly<{
   outcome: MeteredAttemptOutcome;
   evidence_delivery: "recorded" | "duplicate" | "pending";
+  evidence_refs: readonly string[];
+  observation_ref?: string;
   pending_evidence?: CreativeTelemetryEvidence;
 }>>;
 
@@ -169,6 +194,24 @@ export declare function deliverPendingUsageObservations(args: {
   retained: number;
 }>>;
 
+export interface TelemetryEvidenceSinkPort {
+  /** Explicit event-level acknowledgement; transport success or flush is not sufficient. */
+  record(event: CreativeTelemetryEvidence): Promise<{
+    status: "accepted" | "duplicate";
+    event_id: string;
+  }>;
+}
+export declare function deliverPendingTelemetryEvidence(args: {
+  outbox: Pick<SqliteTelemetryOutbox, "claimPendingEvidence" | "acknowledgeEvidence" | "deferEvidence">;
+  sink: TelemetryEvidenceSinkPort;
+  limit?: number;
+}): Promise<Readonly<{
+  status: "complete" | "pending" | "outbox_unavailable";
+  attempted: number;
+  acknowledged: number;
+  retained: number;
+}>>;
+
 export interface SqliteTelemetryEvidenceClaim {
   readonly event: CreativeTelemetryEvidence;
   readonly record_ref: string;
@@ -190,6 +233,13 @@ export interface SqliteTelemetryOutbox {
     readonly source_observation_id: string;
     readonly payload_hash: string;
   }>;
+  acknowledgeEnqueuedObservation(args: {
+    record_ref: string;
+    source_observation_id: string;
+    effective_billable_attempt_id: string;
+    authority_status: "accepted" | "duplicate";
+  }): Promise<{ readonly status: "acknowledged" | "mismatch"; readonly source_observation_id: string;
+    readonly authority_status?: "accepted" | "duplicate" }>;
   claimPending(args: { limit: number }): Promise<{
     readonly status: "claimed";
     readonly records: readonly PendingUsageObservationRecord[];
@@ -237,3 +287,11 @@ export declare function createSqliteTelemetryOutbox(args: {
   clock?: () => number | Date;
   claimLeaseMs?: number;
 }): SqliteTelemetryOutbox;
+
+/** Trusted host configuration. The outbox must share the durable API's SQLite connection. */
+export interface CreativeTelemetryConfiguration {
+  readonly outbox: SqliteTelemetryOutbox;
+  readonly modes: TelemetryModeContext;
+  readonly usage_profiles: Readonly<Partial<Record<MeteredAttemptRequest["operation_kind"],
+    typeof USAGE_PROFILE[keyof typeof USAGE_PROFILE]>>>;
+}

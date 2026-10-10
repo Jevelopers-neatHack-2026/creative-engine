@@ -1,0 +1,90 @@
+{
+  "schema_version": "creative-metering-coverage/v1",
+  "dependency_mode": "mock",
+  "cases": [
+    {
+      "case_id": "CE11-1",
+      "purpose": "Nested usage, subset accounting, and duplicate observation identity.",
+      "tests": [
+        { "file": "tests/telemetry/usage.test.mjs", "name": "nested image usage retains aggregate and included-subset relationships" },
+        { "file": "tests/telemetry/usage.test.mjs", "name": "direct and trace observations for one provider request remain one effective attempt charge" },
+        { "file": "tests/versions/api-integration.test.mjs", "name": "actual API usage profile persists nested provider counts as included subsets without double counting" }
+      ]
+    },
+    {
+      "case_id": "CE11-2",
+      "purpose": "Distinct billable retries retain attempt, transport, and provider identities without assuming every transport was billed.",
+      "tests": [
+        { "file": "tests/telemetry/evidence.test.mjs", "name": "two billable retries for one logical operation retain separate attempt and transport IDs" },
+        { "file": "tests/telemetry/usage.test.mjs", "name": "separate genuinely billed retries keep distinct attempt and transport identities" }
+      ]
+    },
+    {
+      "case_id": "CE11-3",
+      "purpose": "Unknown completion, cancellation, late usage, lease expiry, and observation replay retain conservative holds without redispatch.",
+      "tests": [
+        { "file": "tests/telemetry/evidence.test.mjs", "name": "missing usage, lost response, cancellation and lease expiry retain C03 holds" },
+        { "file": "tests/telemetry/sqlite-outbox.test.mjs", "name": "late usage for a cancelled in-flight attempt is durably replayed as C03 observation only" },
+        { "file": "tests/telemetry/retry.test.mjs", "name": "observation acknowledgement can retry after restart without redispatching a paid operation" }
+      ]
+    },
+    {
+      "case_id": "CE11-4",
+      "purpose": "Required telemetry failures and C03 authorization stop dispatch; the API rejects uncommitted shared-store evidence.",
+      "tests": [
+        { "file": "tests/telemetry/evidence.test.mjs", "name": "failed preflight evidence prevents reservation and provider dispatch" },
+        { "file": "tests/telemetry/evidence.test.mjs", "name": "transport evidence failure blocks the call and C03 retains the uncertain hold" },
+        { "file": "tests/telemetry/evidence.test.mjs", "name": "C03 authoritative atomic reservation prevents the losing concurrent attempt from dispatching" },
+        { "file": "tests/versions/api-integration.test.mjs", "name": "actual API refuses telemetry append inside an uncommitted shared-store transaction before reservation" }
+      ]
+    },
+    {
+      "case_id": "CE11-5",
+      "purpose": "Failed outcomes remain attributable, modes are independent, and public telemetry and Finance references are sanitized.",
+      "tests": [
+        { "file": "tests/telemetry/evidence.test.mjs", "name": "every C03 billable operation family can carry an attempt-bound observation" },
+        { "file": "tests/telemetry/evidence.test.mjs", "name": "telemetry mode tags remain independent of simulated commerce and unknown is explicit" },
+        { "file": "tests/telemetry/evidence.test.mjs", "name": "public metering outcome redacts unsafe settlement references without changing Finance outcome" },
+        { "file": "tests/telemetry/privacy.test.mjs", "name": "Basic credentials, signed URLs, email and phone canaries are detected; ordinary prose survives" },
+        { "file": "tests/telemetry/privacy.test.mjs", "name": "plus-bearing Basic credentials stay private across encoded spellings and public record placements" },
+        { "file": "tests/telemetry/privacy.test.mjs", "name": "percent-encoded credentials, PII, and signed URLs remain screened beside malformed escapes" },
+        { "file": "tests/api/creative-api.test.mjs", "name": "port failure messages and malformed provider usage never leak or become zero usage" },
+        { "file": "tests/api/creative-api.test.mjs", "name": "inspection public text rejects credential, signed URL, and personal data values on fresh and replay paths" }
+      ]
+    }
+  ],
+  "fixture_hash_inputs": [
+    "fixtures/metering/provider-usage.json",
+    "fixtures/privacy/unsafe-public-values.json",
+    "fixtures/api/generate-plan.json",
+    "fixtures/api/edit-plan.json",
+    "fixtures/api/brief.json"
+  ],
+  "local_integration": [
+    {
+      "requirement_id": "CE-01",
+      "local_status": "implemented_and_offline_tested",
+      "full_acceptance_status": "pending_external_owner_and_live_evidence",
+      "tests": [
+        { "file": "tests/api/creative-api.test.mjs", "name": "fixture scenario manifest covers every API operation and negative boundary" },
+        { "file": "tests/api/creative-api.test.mjs", "name": "valid generation is metered before dispatch and publishes a validated immutable version" },
+        { "file": "tests/versions/api-integration.test.mjs", "name": "real API invocation commits job, exact artifact bytes, version and selection through one durable adapter" }
+      ]
+    },
+    {
+      "requirement_id": "CE-08",
+      "local_status": "implemented_and_offline_tested",
+      "full_acceptance_status": "pending_external_owner_and_live_evidence",
+      "tests": [
+        { "file": "tests/versions/api-integration.test.mjs", "name": "real API invocation commits job, exact artifact bytes, version and selection through one durable adapter" },
+        { "file": "tests/versions/api-integration.test.mjs", "name": "paired API persists explicit A/B/C branches and restore-by-selection without creating versions" },
+        { "file": "tests/versions/api-integration.test.mjs", "name": "actual API process crashes preserve attempt evidence and recover without provider redispatch" }
+      ]
+    }
+  ],
+  "external_gates": {
+    "finance_authority": "pending_external_owner_agreement",
+    "canonical_shared_usage_schema": "pending_external_owner_agreement",
+    "neatlogs_sink_protocol_ingestion_readback": "unresolved_no_authoritative_agreement_reference"
+  }
+}

@@ -43,6 +43,50 @@ function evidencePort(events, { failAt = -1 } = {}) {
   };
 }
 
+function testObservationOutbox() {
+  const records = new Map();
+  return {
+    records,
+    async enqueueUsageObservation({ observation }) {
+      const record_ref = `observation:${observation.source_observation_id}`;
+      records.set(observation.source_observation_id, { record_ref, observation: structuredClone(observation), status: "pending" });
+      return { status: "recorded", record_ref, source_observation_id: observation.source_observation_id, payload_hash: "sha256:test" };
+    },
+    async acknowledgeEnqueuedObservation(input) {
+      const record = records.get(input.source_observation_id);
+      if (!record || record.record_ref !== input.record_ref) return { status: "mismatch", source_observation_id: input.source_observation_id };
+      record.status = "delivered";
+      return { status: "acknowledged", source_observation_id: input.source_observation_id };
+    },
+  };
+}
+
+function runWithTelemetry(args) {
+  return executeCreativeMeteredAttempt({
+    observationOutbox: testObservationOutbox(),
+    authorizeTransport: async ({ transport_attempt_id }) => `dispatch:${transport_attempt_id}`,
+    ...args,
+  });
+}
+
+function eventOutbox(events) {
+  const records = new Map();
+  return {
+    records,
+    async enqueueUsageObservation({ observation }) {
+      events.push("observation.persist");
+      const record_ref = `observation:${observation.source_observation_id}`;
+      records.set(observation.source_observation_id, { record_ref, observation: structuredClone(observation) });
+      return { status: "recorded", record_ref, source_observation_id: observation.source_observation_id, payload_hash: "sha256:test" };
+    },
+    async acknowledgeEnqueuedObservation(input) {
+      events.push("observation.local_ack");
+      assert.equal(records.get(input.source_observation_id)?.record_ref, input.record_ref);
+      return { status: "acknowledged", source_observation_id: input.source_observation_id };
+    },
+  };
+}
+
 function successfulDispatch(events) {
   return async (context) => {
     events.push("provider.dispatch");
@@ -63,12 +107,17 @@ test("sanitized evidence is recorded before the C03 reservation, each transport,
   const events = [];
   const authority = new FakeMeteringAuthority();
   const evidence = evidencePort(events);
-  const result = await executeCreativeMeteredAttempt({
+  const result = await runWithTelemetry({
     meteringPort: observeMetering(authority, events),
     evidencePort: evidence,
+    observationOutbox: eventOutbox(events),
     request: fixtureAttempt({ billing_mode: "live" }),
     trustedScope,
     modes,
+    authorizeTransport: async ({ transport_attempt_id }) => {
+      events.push("jobs.authorizeDispatch");
+      return `dispatch:${transport_attempt_id}`;
+    },
     dispatch: successfulDispatch(events),
     idFactory: idFactory(),
     clock: () => new Date("2026-10-10T12:00:00.000Z"),
@@ -83,8 +132,11 @@ test("sanitized evidence is recorded before the C03 reservation, each transport,
   assert.equal(evidence.stored[1].transport_attempt_id, "transport:2");
   assert.equal(evidence.stored[2].provider_request_id, "req:attempt:fixture-001");
   assert.ok(events.indexOf("evidence.attempt_intent") < events.indexOf("metering.reserveAttempt"));
-  assert.ok(events.indexOf("evidence.transport_intent") < events.indexOf("metering.recordTransportAttempt"));
+  assert.ok(events.indexOf("evidence.transport_intent") < events.indexOf("jobs.authorizeDispatch"));
+  assert.ok(events.indexOf("jobs.authorizeDispatch") < events.indexOf("metering.recordTransportAttempt"));
   assert.ok(events.indexOf("metering.recordTransportAttempt") < events.indexOf("provider.dispatch"));
+  assert.ok(events.indexOf("observation.persist") < events.indexOf("metering.recordUsageObservation"));
+  assert.ok(events.indexOf("metering.recordUsageObservation") < events.indexOf("metering.settleReservation"));
 });
 
 test("failed preflight evidence prevents reservation and provider dispatch", async () => {
@@ -92,7 +144,7 @@ test("failed preflight evidence prevents reservation and provider dispatch", asy
   const authority = new FakeMeteringAuthority();
   const evidence = evidencePort(events, { failAt: 0 });
   let dispatches = 0;
-  await assert.rejects(() => executeCreativeMeteredAttempt({
+  await assert.rejects(() => runWithTelemetry({
     meteringPort: observeMetering(authority, events),
     evidencePort: evidence,
     request: fixtureAttempt(),
@@ -109,7 +161,7 @@ test("failed preflight evidence prevents reservation and provider dispatch", asy
 test("invalid request keys never escape through telemetry validation diagnostics", async () => {
   const credentialKey = "ghp_SyntheticCredentialValueSyntheticCredentialValue";
   const request = { ...fixtureAttempt(), [credentialKey]: "synthetic" };
-  await assert.rejects(() => executeCreativeMeteredAttempt({
+  await assert.rejects(() => runWithTelemetry({
     meteringPort: new FakeMeteringAuthority(),
     evidencePort: evidencePort([]),
     request,
@@ -146,7 +198,7 @@ test("transport evidence failure blocks the call and C03 retains the uncertain h
   const authority = new FakeMeteringAuthority();
   const evidence = evidencePort(events, { failAt: 1 });
   let dispatches = 0;
-  const result = await executeCreativeMeteredAttempt({
+  const result = await runWithTelemetry({
     meteringPort: observeMetering(authority, events),
     evidencePort: evidence,
     request: fixtureAttempt(),
@@ -186,7 +238,7 @@ test("abort during transport-intent append fences the provider call and retains 
     },
   };
   let dispatches = 0;
-  const pending = executeCreativeMeteredAttempt({
+  const pending = runWithTelemetry({
     meteringPort: authority, evidencePort: evidence,
     request: fixtureAttempt({ billable_attempt_id: "attempt:abort-evidence-append" }),
     trustedScope, modes, signal: controller.signal, idFactory: idFactory(),
@@ -224,7 +276,7 @@ test("abort during C03 transport acknowledgement fences the provider call and re
     },
   });
   let dispatches = 0;
-  const pending = executeCreativeMeteredAttempt({
+  const pending = runWithTelemetry({
     meteringPort, evidencePort: evidencePort([]),
     request: fixtureAttempt({ billable_attempt_id: "attempt:abort-transport-ack" }),
     trustedScope, modes, signal: controller.signal, idFactory: idFactory(),
@@ -246,7 +298,7 @@ test("post-settlement evidence outage is reported as pending without converting 
   const events = [];
   const authority = new FakeMeteringAuthority();
   const evidence = evidencePort(events, { failAt: 2 });
-  const result = await executeCreativeMeteredAttempt({
+  const result = await runWithTelemetry({
     meteringPort: observeMetering(authority, events),
     evidencePort: evidence,
     request: fixtureAttempt(),
@@ -272,7 +324,7 @@ test("public metering outcome redacts unsafe settlement references without chang
       "posting:fixture-safe-1",
     ],
   });
-  const result = await executeCreativeMeteredAttempt({
+  const result = await runWithTelemetry({
     meteringPort: authority,
     evidencePort: evidencePort([]),
     request: fixtureAttempt({ billable_attempt_id: "attempt:privacy-posting-refs" }),
@@ -299,7 +351,7 @@ test("oversized Finance metadata cannot turn a completed settlement into an exec
     ...await settle(command),
     posting_refs: Array.from({ length: 600 }, (_, index) => `posting:fixture:${index}`),
   });
-  const result = await executeCreativeMeteredAttempt({
+  const result = await runWithTelemetry({
     meteringPort: authority,
     evidencePort: evidencePort([]),
     request: fixtureAttempt({ billable_attempt_id: "attempt:oversized-settlement-metadata" }),
@@ -319,7 +371,7 @@ test("C03 authoritative atomic reservation prevents the losing concurrent attemp
   const evidence = evidencePort([]);
   const sharedIdFactory = idFactory();
   let dispatches = 0;
-  const run = (attempt) => executeCreativeMeteredAttempt({
+  const run = (attempt) => runWithTelemetry({
     meteringPort: authority,
     evidencePort: evidence,
     request: attempt,
@@ -343,7 +395,7 @@ test("C03 authoritative atomic reservation prevents the losing concurrent attemp
 test("telemetry mode tags remain independent of simulated commerce and unknown is explicit", async () => {
   const unknownModes = { provider_execution_mode: "unknown", commerce_mode: "unknown" };
   const evidence = evidencePort([]);
-  const result = await executeCreativeMeteredAttempt({
+  const result = await runWithTelemetry({
     meteringPort: new FakeMeteringAuthority(),
     evidencePort: evidence,
     request: fixtureAttempt({ billing_mode: "sandbox" }),
@@ -373,7 +425,7 @@ test("every C03 billable operation family can carry an attempt-bound observation
       billable_attempt_id: `attempt:family-${operationKind}`,
       operation_kind: operationKind,
     });
-    const result = await executeCreativeMeteredAttempt({
+    const result = await runWithTelemetry({
       meteringPort: authority,
       evidencePort: evidence,
       request: attempt,
@@ -405,7 +457,7 @@ test("two billable retries for one logical operation retain separate attempt and
   const evidence = evidencePort([]);
   const sharedIdFactory = idFactory();
   for (const [index, attemptId] of ["attempt:retry-1", "attempt:retry-2"].entries()) {
-    const result = await executeCreativeMeteredAttempt({
+    const result = await runWithTelemetry({
       meteringPort: authority,
       evidencePort: evidence,
       request: fixtureAttempt({ logical_operation_id: "logical:retry-series", billable_attempt_id: attemptId }),
@@ -445,7 +497,7 @@ test("missing usage, lost response, cancellation and lease expiry retain C03 hol
   const authority = new FakeMeteringAuthority({ budget: "1.00", defaultHold: "0.08" });
   const evidence = evidencePort([]);
   const ids = idFactory();
-  const missing = await executeCreativeMeteredAttempt({
+  const missing = await runWithTelemetry({
     meteringPort: authority,
     evidencePort: evidence,
     request: fixtureAttempt({ billable_attempt_id: "attempt:unknown-usage" }),
@@ -457,7 +509,7 @@ test("missing usage, lost response, cancellation and lease expiry retain C03 hol
   assert.equal(missing.outcome.status, "usage_unknown");
   assert.equal(authority.reservationFor("attempt:unknown-usage").state, "held_for_reconciliation");
 
-  const lost = await executeCreativeMeteredAttempt({
+  const lost = await runWithTelemetry({
     meteringPort: authority,
     evidencePort: evidence,
     request: fixtureAttempt({ billable_attempt_id: "attempt:lost-response" }),
@@ -470,7 +522,7 @@ test("missing usage, lost response, cancellation and lease expiry retain C03 hol
   assert.equal(authority.reservationFor("attempt:lost-response").state, "held_for_reconciliation");
 
   const controller = new AbortController();
-  const cancelled = await executeCreativeMeteredAttempt({
+  const cancelled = await runWithTelemetry({
     meteringPort: authority,
     evidencePort: evidence,
     request: fixtureAttempt({ billable_attempt_id: "attempt:cancelled" }),
@@ -497,7 +549,7 @@ test("missing usage, lost response, cancellation and lease expiry retain C03 hol
   assert.equal(authority.reservationFor("attempt:cancelled").state, "held_for_reconciliation");
 
   const leaseAttempt = fixtureAttempt({ billable_attempt_id: "attempt:lease-expired" });
-  const leased = await executeCreativeMeteredAttempt({
+  const leased = await runWithTelemetry({
     meteringPort: authority,
     evidencePort: evidence,
     request: leaseAttempt,

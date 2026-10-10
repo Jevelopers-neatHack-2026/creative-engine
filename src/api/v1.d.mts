@@ -21,6 +21,7 @@ import type {
   MeteredDispatchContext,
   MeteringPort,
 } from "../contracts/metering.mjs";
+import type { CreativeTelemetryConfiguration } from "../telemetry/index.mjs";
 
 export type CreativeOperation =
   | "generate" | "edit" | "inspect" | "list" | "compare" | "restore" | "cancel" | "handoff" | "job.status";
@@ -187,6 +188,20 @@ export interface UsageRecord {
   reason?: "usage_unavailable" | "usage_malformed";
 }
 
+/** Raw provider counters supplied to the runtime before profile-based normalization. */
+export interface ProviderUsageRecord {
+  completeness?: "complete" | "partial" | "incomplete" | "unknown";
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  input_tokens_details?: Readonly<Record<string, number>>;
+  output_tokens_details?: Readonly<Record<string, number>>;
+  provider_request_id?: string;
+  transport_attempt_id?: string;
+  missing_fields?: readonly string[];
+  readonly [providerField: string]: unknown;
+}
+
 export interface CreativeRuntimePorts {
   storage?: {
     getBrief(input: { scope: TrustedScope; brief_id: string }): Promise<CreativeBrief | null> | CreativeBrief | null;
@@ -254,6 +269,8 @@ export interface CreativeRuntimePorts {
     edit(input: ProviderInput): Promise<ProviderOutput>;
   };
   metering?: MeteringPort;
+  /** Required by generate/edit/inspect and JEV-backed operations. The outbox shares durable API SQLite state. */
+  telemetry?: CreativeTelemetryConfiguration;
   decisionPort?: {
     resolveRoute(input: { scope: TrustedScope; actor_id: string; decision: Pick<DecisionPortRequest, "execution_mode" | "state" | "questions"> }):
       Promise<CreativeProviderRoute> | CreativeProviderRoute;
@@ -294,6 +311,8 @@ export interface ProviderInput {
   base_design: DesignVersion | null;
   plan: EditPlan;
   decision_result?: DecisionPortResult;
+  /** Exact reservation reference validated and returned by the trusted C03 authority. */
+  readonly reservation_ref: string;
   transport_attempt_id: string;
   dispatch_intent_ref: string;
   recordTransportAttempt(transport_attempt_id: string): Promise<string>;
@@ -323,7 +342,7 @@ export interface ProviderOutput {
   artifact_bytes: Uint8Array;
   provider: string;
   model: string;
-  usage?: UsageRecord;
+  usage?: ProviderUsageRecord;
 }
 
 export interface InspectionInput {
@@ -333,6 +352,8 @@ export interface InspectionInput {
   attempt: MeteredAttemptRequest;
   brief: CreativeBrief;
   design_version: DesignVersion;
+  /** Exact reservation reference validated and returned by the trusted C03 authority. */
+  readonly reservation_ref: string;
   transport_attempt_id: string;
   dispatch_intent_ref: string;
   recordTransportAttempt(transport_attempt_id: string): Promise<string>;
@@ -358,7 +379,7 @@ export interface InspectionOutput {
   design_hash: string;
   inspection_id: string;
   observations: StructuredObservation[];
-  usage?: UsageRecord;
+  usage?: ProviderUsageRecord;
 }
 
 export type CreativeApiResult =

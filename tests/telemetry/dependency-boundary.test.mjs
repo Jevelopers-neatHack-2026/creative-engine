@@ -24,4 +24,9 @@ test("telemetry depends on C03 contracts and local helpers only, never on API/ru
   const retry = await readFile(new URL("../../src/telemetry/retry.mjs", import.meta.url), "utf8");
   assert.match(retry, /recordUsageObservation/);
   assert.doesNotMatch(retry, /executeMeteredAttempt|provider\.dispatch|image_generation/);
+  const runtime = await readFile(new URL("../../src/runtime/creative-runtime.mjs", import.meta.url), "utf8");
+  assert.match(runtime, /executeCreativeMeteredAttempt/);
+  assert.match(runtime, /usage_profiles/);
+  assert.doesNotMatch(runtime, /\bexecuteMeteredAttempt\s*\(/,
+    "API provider work must pass through the CE-11 wrapper and existing C03 executor");
 });

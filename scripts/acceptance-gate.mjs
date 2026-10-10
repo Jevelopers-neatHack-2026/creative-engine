@@ -41,7 +41,14 @@ const requirements = {
     "finance_metering_budget_protocol",
     "shared_contracts_usage_budget_schemas",
   ],
+  "creative-metering": [
+    "finance_metering_budget_protocol",
+    "shared_contracts_usage_budget_schemas",
+  ],
 };
+
+const creativeMeteringExternalGate =
+  "No authoritative Neatlogs evidence-sink agreement reference is available; actual ingestion and readback remain unverified.";
 
 function rawSha256(bytes) {
   return "sha256:" + createHash("sha256").update(bytes).digest("hex");
@@ -140,7 +147,10 @@ export async function evaluateAcceptanceRecord(record, target, repoRoot) {
     const agreement = record?.agreements?.[id];
     if (!allOwnersAccepted || !(await verifyAgreement(id, agreement, repoRoot))) unmet.push(id);
   }
-  return { selected, unmet, proposalState: record?.proposal_state ?? "missing" };
+  const unresolved = target === "creative-metering" || target === "all"
+    ? [creativeMeteringExternalGate]
+    : [];
+  return { selected, unmet, unresolved, proposalState: record?.proposal_state ?? "missing" };
 }
 
 function evaluateCreativePolicy(repoRoot) {
@@ -188,7 +198,7 @@ async function main() {
     return;
   }
   if (!Object.hasOwn(requirements, target) && target !== "all") {
-    process.stderr.write("Unknown acceptance target " + target + ". Use api, controls, contracts, decision-contract, eval-policy, metering-contract, handoff-contract, versions, access-preflight, or all.\n");
+    process.stderr.write("Unknown acceptance target " + target + ". Use api, controls, contracts, decision-contract, eval-policy, metering-contract, handoff-contract, versions, creative-metering, access-preflight, or all.\n");
     process.exitCode = 2;
     return;
   }
@@ -196,15 +206,16 @@ async function main() {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const recordPath = path.join(repoRoot, "docs/contracts/canonical-owner-agreements.json");
   const record = JSON.parse(await readFile(recordPath, "utf8"));
-  const { unmet, proposalState } = await evaluateAcceptanceRecord(record, target, repoRoot);
+  const { unmet, unresolved, proposalState } = await evaluateAcceptanceRecord(record, target, repoRoot);
   const creativePolicy = target === "all" ? evaluateCreativePolicy(repoRoot) : null;
   const accessPreflight = target === "all" ? createAccessPreflightGateReport() : null;
-  if (unmet.length > 0 || creativePolicy && !creativePolicy.accepted || accessPreflight) {
-    process.stderr.write("Acceptance blocked: missing or unverified canonical owner agreement evidence for " + target + " (proposal_state=" + proposalState + ").\n");
+  if (unmet.length > 0 || unresolved.length > 0 || creativePolicy && !creativePolicy.accepted || accessPreflight) {
+    process.stderr.write("Acceptance blocked: missing or unverified canonical owner agreement evidence or required integration evidence for " + target + " (proposal_state=" + proposalState + ").\n");
     for (const id of unmet) {
       const agreement = record.agreements?.[id];
       process.stderr.write("- " + id + " (" + (agreement?.owner_role ?? "owner unknown") + "; status=" + (agreement?.status ?? "missing") + ")\n");
     }
+    for (const gate of unresolved) process.stderr.write("- " + gate + "\n");
     if (creativePolicy && !creativePolicy.accepted) {
       process.stderr.write("Acceptance blocked: CE-Q01 policy and corpus evidence remain pending.\n");
       for (const finding of creativePolicy.findings) {

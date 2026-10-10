@@ -15,6 +15,13 @@ function validateOutbox(outbox) {
   }
 }
 
+function validateEvidenceOutbox(outbox) {
+  if (!isRecord(outbox) || typeof outbox.claimPendingEvidence !== "function" ||
+    typeof outbox.acknowledgeEvidence !== "function" || typeof outbox.deferEvidence !== "function") {
+    throw new TelemetryBoundaryError("evidence_outbox_unavailable");
+  }
+}
+
 function validateBatch(value, limit) {
   if (!isRecord(value) || value.status !== "claimed" || !Array.isArray(value.records) || value.records.length > limit) {
     throw new TelemetryBoundaryError("invalid_observation_batch");
@@ -75,6 +82,82 @@ async function defer(outbox, recordRef, claimToken, reason) {
   } catch {
     return false;
   }
+}
+
+async function deferEvidence(outbox, eventId, claimToken, reason) {
+  try {
+    const result = await outbox.deferEvidence({ event_id: eventId, claim_token: claimToken, reason });
+    return isRecord(result) && ["retained", "lease_lost"].includes(result.status);
+  } catch {
+    return false;
+  }
+}
+
+/** Deliver already committed evidence through an explicit record/ack port.
+ * Generic SDK flush/HTTP success is not an acknowledgement for this boundary. */
+export async function deliverPendingTelemetryEvidence({ outbox, sink, limit = 16 }) {
+  validateEvidenceOutbox(outbox);
+  if (!isRecord(sink) || typeof sink.record !== "function" ||
+    !Number.isSafeInteger(limit) || limit < 1 || limit > MAX_BATCH) {
+    throw new TelemetryBoundaryError("invalid_evidence_retry_request");
+  }
+  let claimed;
+  try {
+    claimed = await outbox.claimPendingEvidence({ limit });
+  } catch {
+    return Object.freeze({ status: "outbox_unavailable", attempted: 0, acknowledged: 0, retained: 0 });
+  }
+  if (!isRecord(claimed) || claimed.status !== "claimed" || !Array.isArray(claimed.records) || claimed.records.length > limit) {
+    throw new TelemetryBoundaryError("invalid_evidence_batch");
+  }
+  let acknowledged = 0;
+  let retained = 0;
+  const seen = new Set();
+  for (const claimedRecord of claimed.records) {
+    if (!isRecord(claimedRecord) || !isRecord(claimedRecord.event) ||
+      typeof claimedRecord.record_ref !== "string" || typeof claimedRecord.claim_token !== "string") {
+      throw new TelemetryBoundaryError("invalid_evidence_record");
+    }
+    let eventId;
+    let claimToken;
+    try {
+      eventId = assertSafePublicIdentifier(claimedRecord.event.event_id, { maxLength: 256 });
+      claimToken = assertSafePublicIdentifier(claimedRecord.claim_token, { maxLength: 256 });
+      assertSafePublicIdentifier(claimedRecord.record_ref, { maxLength: 256 });
+    } catch {
+      throw new TelemetryBoundaryError("invalid_evidence_record");
+    }
+    if (seen.has(eventId)) throw new TelemetryBoundaryError("duplicate_evidence_record");
+    seen.add(eventId);
+    let response;
+    try {
+      response = await sink.record(structuredClone(claimedRecord.event));
+    } catch {
+      await deferEvidence(outbox, eventId, claimToken, "sink_unavailable");
+      retained += 1;
+      continue;
+    }
+    if (!isRecord(response) || !["accepted", "duplicate"].includes(response.status) || response.event_id !== eventId) {
+      await deferEvidence(outbox, eventId, claimToken,
+        response === undefined ? "acknowledgement_unknown" : "sink_acknowledgement_invalid");
+      retained += 1;
+      continue;
+    }
+    try {
+      const persisted = await outbox.acknowledgeEvidence({ event_id: eventId, claim_token: claimToken });
+      if (!isRecord(persisted) || persisted.status !== "acknowledged" || persisted.event_id !== eventId) {
+        await deferEvidence(outbox, eventId, claimToken, "acknowledgement_unknown");
+        retained += 1;
+        continue;
+      }
+      acknowledged += 1;
+    } catch {
+      await deferEvidence(outbox, eventId, claimToken, "acknowledgement_unknown");
+      retained += 1;
+    }
+  }
+  return Object.freeze({ status: retained === 0 ? "complete" : "pending",
+    attempted: claimed.records.length, acknowledged, retained });
 }
 
 /**

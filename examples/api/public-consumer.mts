@@ -14,6 +14,8 @@ import type {
   DispatchAuthorizationInput,
   DispatchAuthorizationResult,
   InspectionInput,
+  ProviderInput,
+  ProviderUsageRecord,
   TrustedCreativeActor,
   UsageRecord,
 } from "creative-engine/api/v1";
@@ -121,6 +123,23 @@ const decisionRetryIntent: Promise<string> = decisionDispatch.recordTransportAtt
 declare const inspectionDispatch: InspectionInput;
 const initialInspectionTransportId: string = inspectionDispatch.transport_attempt_id;
 const inspectionTransportIntent: Promise<string> = inspectionDispatch.recordTransportAttempt(initialInspectionTransportId);
+const inspectionReservationReference: string = inspectionDispatch.reservation_ref;
+// @ts-expect-error reservation_ref is a read-only authority value.
+inspectionDispatch.reservation_ref = "caller-forged-reservation";
+declare const providerDispatch: ProviderInput;
+const providerReservationReference: string = providerDispatch.reservation_ref;
+// @ts-expect-error reservation_ref is a read-only authority value.
+providerDispatch.reservation_ref = "caller-forged-reservation";
+const rawProviderUsage: ProviderUsageRecord = {
+  input_tokens: 12,
+  output_tokens: 24,
+  total_tokens: 36,
+  input_tokens_details: { cached_tokens: 3 },
+  output_tokens_details: { reasoning_tokens: 4 },
+  provider_request_id: "provider-request-fixture",
+  transport_attempt_id: initialInspectionTransportId,
+  completeness: "complete",
+};
 const privacyFilteredUsage: UsageRecord = { completeness: "complete", input_tokens: 1, output_tokens: 2,
   provider_request_id: "provider-request-fixture", transport_attempt_id: initialInspectionTransportId };
 const publicationFence: CreativeContextFence = { brief_id: "brief-fixture", brief_hash: `sha256:${"a".repeat(64)}`,
@@ -129,4 +148,5 @@ const publicationFence: CreativeContextFence = { brief_id: "brief-fixture", brie
 
 void [CREATIVE_API_OPERATIONS, requests, response, aliasResponse, publicError, authorizationInput,
   authorizationResult, immutableReservationReference, initialDecisionTransportId, decisionRetryIntent,
-  initialInspectionTransportId, inspectionTransportIntent, privacyFilteredUsage, publicationFence];
+  initialInspectionTransportId, inspectionTransportIntent, inspectionReservationReference, providerReservationReference,
+  rawProviderUsage, privacyFilteredUsage, publicationFence];

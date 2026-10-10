@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { createCreativeApi } from "../../src/api/v1.mjs";
 import { createCreativeVersionApiPorts } from "../../src/versions/api-ports.mjs";
 import { CreativeVersionStore } from "../../src/versions/store.mjs";
+import { createSqliteTelemetryOutbox } from "../../src/telemetry/index.mjs";
 
 const databasePath = process.env.CREATIVE_API_DATABASE;
 const objectRoot = process.env.CREATIVE_API_OBJECTS;
@@ -56,7 +57,11 @@ const adapter = createCreativeVersionApiPorts({
   },
 });
 
-const api = createCreativeApi({ ports: adapter.ports, now: () => now,
+const api = createCreativeApi({ ports: { ...adapter.ports, telemetry: {
+  outbox: createSqliteTelemetryOutbox({ database: store.db, clock: () => now }),
+  modes: { provider_execution_mode: "mock", commerce_mode: "simulated" },
+  usage_profiles: { image_generation: "creative.normalized-token-usage/1" },
+} }, now: () => now,
   idFactory: (() => { let next = 0; return () => `api-crash-id-${++next}`; })() });
 const request = { contract: "CreativeApiRequest", schema_version: "1.0", event_id: `event-${actionId}`,
   request_id: `request-${actionId}`, tenant_id: scope.tenant_id, project_id: scope.project_id,

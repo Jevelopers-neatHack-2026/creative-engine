@@ -115,7 +115,8 @@ function unsupportedProfileReason(profile, attempt) {
 function buildUnits(raw, profile, fields) {
   if (!isRecord(raw)) return { units: [], missing: ["provider_usage"], contradictory: false };
   const keys = Object.keys(raw);
-  const allowedRoot = new Set([...fields.root, "input_tokens_details", "output_tokens_details", "provider_request_id", "transport_attempt_id"]);
+  const allowedRoot = new Set([...fields.root, "input_tokens_details", "output_tokens_details", "provider_request_id",
+    "transport_attempt_id", "completeness", "missing_fields"]);
   const unexpected = keys.filter((key) => !allowedRoot.has(key));
   const missing = [];
   const values = Object.create(null);
@@ -245,10 +246,39 @@ export function createUsageObservation({
     identityMissing.push("transport_attempt_id_not_authorized");
   }
   const unsupported = unsupportedProfileReason(profile, attempt);
-  const rawCounters = isRecord(usage) && Object.hasOwn(usage, "usage") ? usage.usage : usage;
+  const rawCounters = isRecord(usage) && Object.hasOwn(usage, "usage")
+    ? {
+      ...usage.usage,
+      ...(usage.completeness !== undefined && usage.usage?.completeness === undefined
+        ? { completeness: usage.completeness } : {}),
+      ...(usage.missing_fields !== undefined && usage.usage?.missing_fields === undefined
+        ? { missing_fields: usage.missing_fields } : {}),
+    }
+    : usage;
   const built = unsupported
     ? { units: [], missing: [unsupported], contradictory: false }
     : buildUnits(rawCounters, profile, PROFILE_FIELDS[profile]);
+  const reportedCompleteness = isRecord(rawCounters) ? rawCounters.completeness : undefined;
+  if (["partial", "incomplete"].includes(reportedCompleteness)) {
+    const reportedMissing = Array.isArray(rawCounters.missing_fields) ? rawCounters.missing_fields : [];
+    for (const field of reportedMissing) {
+      if (typeof field === "string" && /^[A-Za-z0-9_.-]{1,120}$/.test(field) &&
+        !containsSensitivePublicText(field) && !isSensitivePublicField(field)) built.missing.push(field);
+      else built.missing.push("usage.unmapped_missing_field");
+    }
+    if (built.missing.length === 0) built.missing.push("usage.reported_partial");
+  } else if (reportedCompleteness === "unknown") {
+    built.units = [];
+    const reportedMissing = Array.isArray(rawCounters.missing_fields) ? rawCounters.missing_fields : [];
+    for (const field of reportedMissing) {
+      if (typeof field === "string" && /^[A-Za-z0-9_.-]{1,120}$/.test(field) &&
+        !containsSensitivePublicText(field) && !isSensitivePublicField(field)) built.missing.push(field);
+      else built.missing.push("usage.unmapped_missing_field");
+    }
+    if (built.missing.length === 0) built.missing.push("provider_usage");
+  } else if (reportedCompleteness !== undefined && reportedCompleteness !== "complete") {
+    built.missing.push("usage.completeness_unrecognized");
+  }
   const missing = [...new Set([...built.missing, ...identityMissing])];
   let completeness;
   let usageUnits = built.units;

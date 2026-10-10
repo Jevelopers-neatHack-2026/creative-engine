@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import {
   assertSafePublicIdentifier,
   containsSensitivePublicText,
+  isSensitivePublicField,
   projectPublicTelemetry,
   TelemetryPrivacyError,
 } from "../../src/telemetry/index.mjs";
@@ -81,6 +82,110 @@ test("Basic credentials, signed URLs, email and phone canaries are detected; ord
   for (const value of fixtureCases) {
     const projection = projectPublicTelemetry(value);
     assert.equal(JSON.stringify(projection.value).includes("SYNTHETIC-NOT-A-REAL"), false);
+  }
+});
+
+test("plus-bearing Basic credentials stay private across encoded spellings and public record placements", () => {
+  const credentialInputs = [];
+  for (const credentials of ["~~~:p", "???:p", "~~~???:p"]) {
+    for (const unpadded of [false, true]) {
+      const token = Buffer.from(credentials).toString("base64").replace(unpadded ? /=+$/g : /$^/g, "");
+      for (const [encoding, value] of [
+        ["raw", `Basic ${token}`],
+        ["scheme", `%42asic ${token}`],
+        ["space", `Basic%20${token}`],
+        ["both", `%42asic%20${token}`],
+        ["scheme-space", `${[...Buffer.from("Basic ")].map((byte) => `%${byte.toString(16).padStart(2, "0")}`).join("")}${token}`],
+        ["nested", `%2542asic%2520${token}`],
+        ["twice-space", `Basic%2520${token}`],
+        ["plus-encoded", `Basic%20${token.replace(/\+/g, "%2B")}`],
+        ["form-space", `Basic+${token}`],
+        ["full", encodeURIComponent(`Basic ${token}`)],
+        ["full-nested", encodeURIComponent(encodeURIComponent(`Basic ${token}`))],
+      ]) {
+        for (const placement of ["customer", "artistic", "source-uri", "key"]) {
+          credentialInputs.push({ alphabet: credentials, unpadded, encoding, placement, value });
+        }
+      }
+    }
+  }
+
+  for (const item of credentialInputs) {
+    let record;
+    if (item.placement === "customer") {
+      record = { customer_preferences: [{ preference_id: "pref-1", value: item.value }] };
+    } else if (item.placement === "artistic") {
+      record = { artistic_intent: [{ interpretation_id: "intent-1", text: item.value }] };
+    } else if (item.placement === "source-uri") {
+      record = { source_identity: [{ source_id: "source-1", uri: item.value }] };
+    } else {
+      record = { preferences: { items: [{ [item.value]: "safe" }] } };
+    }
+
+    assert.equal(containsSensitivePublicText(item.value), true,
+      `${item.alphabet} ${item.unpadded ? "unpadded" : "padded"} ${item.encoding} ${item.placement}`);
+    const projected = projectPublicTelemetry(record);
+    assert.equal(JSON.stringify(projected.value).includes(item.value), false,
+      `${item.alphabet} ${item.unpadded ? "unpadded" : "padded"} ${item.encoding} ${item.placement}`);
+    assert.equal(JSON.stringify(projected.redactions).includes(item.value), false);
+    assert.throws(() => assertSafePublicIdentifier(item.value), TelemetryPrivacyError);
+  }
+
+  const benign = [
+    "Warm + cool colors",
+    "Basic shapes + circles",
+    "Use 20% warm and 80% cool colors",
+    "https://example.test/a+b",
+    "https://example.test/caf%C3%A9",
+    "Basic%20illustrations support the main headline.",
+    "%42asic shapes and calm colors.",
+  ];
+  for (const value of benign) {
+    assert.equal(containsSensitivePublicText(value), false, value);
+    assert.equal(projectPublicTelemetry({ detail: value }).value.detail, value, value);
+  }
+});
+
+test("percent-encoded credentials, PII, and signed URLs remain screened beside malformed escapes", () => {
+  let deeplyEncodedEmail = "person@example.test";
+  for (let layer = 0; layer < 5; layer += 1) deeplyEncodedEmail = encodeURIComponent(deeplyEncodedEmail);
+  const unsafe = [
+    "%FF%42%61%73%69%63%20dXNlcjpwYXNz",
+    "prefix%FF%42asic%20fn5+OnA=",
+    "person%40example.test",
+    "%FFperson%40example.test",
+    deeplyEncodedEmail,
+    encodeURIComponent("https://example.test/a?X-Amz-Signature=synthetic-signature"),
+    "%FFhttps%3A%2F%2Fexample.test%2Fa%3FX-Amz-Signature%3Dsynthetic-signature",
+  ];
+
+  for (const value of unsafe) {
+    assert.equal(containsSensitivePublicText(value), true, value);
+    assert.equal(projectPublicTelemetry({ detail: value }).value.detail, "[REDACTED]", value);
+    const projectedKey = projectPublicTelemetry({ [value]: "safe" });
+    assert.deepEqual(Object.keys(projectedKey.value), []);
+    assert.equal(JSON.stringify(projectedKey.redactions).includes(value), false);
+  }
+
+  for (const key of ["api%5Fkey", "admission%5Ftoken", "qr%5Fpayload"]) {
+    assert.equal(isSensitivePublicField(key), true, key);
+    const projectedKey = projectPublicTelemetry({ [key]: "synthetic-sensitive-value" });
+    assert.deepEqual(Object.keys(projectedKey.value), []);
+    assert.equal(JSON.stringify(projectedKey.redactions).includes(key), false);
+  }
+  assert.equal(isSensitivePublicField("display%5Fname"), false);
+
+  const benign = [
+    "Warm%20+%20cool colors",
+    "Basic%20illustrations support the main headline.",
+    "https://example.test/caf%C3%A9?a+b",
+    "ordinary malformed escape %FF remains descriptive",
+    "Basic+shapes and calm colors",
+    "Bearer+the note has a simple layout",
+  ];
+  for (const value of benign) {
+    assert.equal(containsSensitivePublicText(value), false, value);
+    assert.equal(projectPublicTelemetry({ detail: value }).value.detail, value, value);
   }
 });
 

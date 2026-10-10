@@ -10,6 +10,7 @@ import { createCreativeApi } from "../../src/api/v1.mjs";
 import { canonicalHash, canonicalSerialize } from "../../src/contracts/index.mjs";
 import { createCreativeVersionApiPorts } from "../../src/versions/api-ports.mjs";
 import { CreativeVersionStore, VersionStoreError } from "../../src/versions/store.mjs";
+import { createSqliteTelemetryOutbox, USAGE_PROFILE } from "../../src/telemetry/index.mjs";
 
 const NOW = Date.parse("2026-10-10T12:30:00.000Z");
 const SCOPE = Object.freeze({ tenant_id: "tenant-api-1", project_id: "project-api-1", brief_id: "brief-api-1" });
@@ -52,6 +53,7 @@ function portsFor(store, counters, idFactory) {
     } }),
     async generate(input) {
       counters.provider += 1;
+      (counters.providerTransportIds ??= []).push(input.transport_attempt_id);
       await input.recordTransportAttempt(input.transport_attempt_id);
       return { design_version_id: "design-durable-api-1",
         artifact: { artifact_id: "artifact-durable-api-1", content_hash: hash, media_type: "image/png" },
@@ -60,6 +62,7 @@ function portsFor(store, counters, idFactory) {
     },
     async edit(input) {
       counters.provider += 1;
+      (counters.providerTransportIds ??= []).push(input.transport_attempt_id);
       await input.recordTransportAttempt(input.transport_attempt_id);
       return { design_version_id: `design-durable-edit-${counters.provider}`,
         artifact: { artifact_id: `artifact-durable-edit-${counters.provider}`, content_hash: hash, media_type: "image/png" },
@@ -73,7 +76,10 @@ function portsFor(store, counters, idFactory) {
       held_amount: { amount: "1.00", currency: "USD" }, lease_id: `finance-lease:${attempt.billable_attempt_id}` }; },
     async releaseBeforeDispatch() { return { status: "released" }; },
     async markAttemptInFlight(input) { return { status: "in_flight", reservation_id: input.reservation_id }; },
-    async recordTransportAttempt() { return { status: "recorded" }; },
+    async recordTransportAttempt(input) {
+      (counters.financeTransportIds ??= []).push(input.transport_attempt_id);
+      return { status: "recorded" };
+    },
     async recordUsageObservation(input) { return { status: "accepted",
       source_observation_id: input.observation.source_observation_id,
       effective_billable_attempt_id: input.observation.billable_attempt_id }; },
@@ -83,7 +89,19 @@ function portsFor(store, counters, idFactory) {
     async markOutcomeUnknown() { return { status: "held_for_reconciliation" }; },
   };
   const adapted = createCreativeVersionApiPorts({ store, otherPorts: { provider, metering }, idFactory });
-  return adapted.ports;
+  return {
+    ...adapted.ports,
+    telemetry: {
+      outbox: createSqliteTelemetryOutbox({ database: store.db, clock: () => NOW }),
+      modes: { provider_execution_mode: "mock", commerce_mode: "simulated" },
+      usage_profiles: {
+        image_generation: "creative.normalized-token-usage/1",
+        image_edit: "creative.normalized-token-usage/1",
+        vision_observation: "creative.normalized-token-usage/1",
+        jev_decision: "typesafe.systemone-usage/2026-10-10",
+      },
+    },
+  };
 }
 
 test("real API invocation commits job, exact artifact bytes, version and selection through one durable adapter", async (t) => {
@@ -118,7 +136,25 @@ test("real API invocation commits job, exact artifact bytes, version and selecti
   assert.equal(attemptEvidence.billable_attempt_id, design.billable_attempt_id);
   assert.equal(attemptEvidence.transport_attempt_ids.length, 1);
   assert.equal(typeof attemptEvidence.transport_attempt_ids[0], "string");
+  assert.deepEqual(counters.providerTransportIds, attemptEvidence.transport_attempt_ids);
+  assert.deepEqual(counters.financeTransportIds, attemptEvidence.transport_attempt_ids);
   assert.equal(attemptEvidence.usage_refs.length, 1);
+  assert.equal(attemptEvidence.trace_refs.length, 3);
+  assert.equal(new Set(attemptEvidence.trace_refs).size, 3);
+  assert.ok(attemptEvidence.trace_refs.every((eventId) => store.db.prepare(
+    "SELECT 1 AS found FROM creative_telemetry_evidence_outbox_v1 WHERE event_id=?").get(eventId)));
+  const telemetryRows = store.db.prepare("SELECT event_type,status FROM creative_telemetry_evidence_outbox_v1 ORDER BY rowid").all();
+  assert.deepEqual(telemetryRows.map((row) => row.event_type), ["attempt_intent", "transport_intent", "attempt_outcome"]);
+  assert.ok(telemetryRows.every((row) => row.status === "pending"));
+  const transportEvent = store.db.prepare("SELECT payload_json FROM creative_telemetry_evidence_outbox_v1 WHERE event_type='transport_intent'").get();
+  assert.deepEqual(JSON.parse(transportEvent.payload_json).transport_attempt_id, attemptEvidence.transport_attempt_ids[0]);
+  const dispatchIntent = store.db.prepare("SELECT transport_attempt_id FROM creative_dispatch_intents WHERE job_id=?")
+    .get(attemptEvidence.job_id);
+  assert.equal(dispatchIntent.transport_attempt_id, attemptEvidence.transport_attempt_ids[0]);
+  const observationRows = store.db.prepare("SELECT status,source_observation_id FROM creative_telemetry_observations_v1").all();
+  assert.equal(observationRows.length, 1);
+  assert.equal(observationRows[0].status, "delivered");
+  assert.match(observationRows[0].source_observation_id, /^usage:/);
   const action = store.db.prepare("SELECT state FROM creation_actions WHERE action_id=?")
     .get("durable-api-generation-1");
   assert.equal(action.state, "committed");
@@ -141,6 +177,92 @@ test("real API invocation commits job, exact artifact bytes, version and selecti
   assert.equal(conflict.ok, false);
   assert.equal(conflict.error.code, "conflict");
   assert.equal(counters.provider, 1, "conflicting action replay must not dispatch again");
+});
+
+test("actual API usage profile persists nested provider counts as included subsets without double counting", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-version-api-nested-usage-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const store = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now: () => NOW });
+  t.after(() => store.close());
+  const brief = await fixture("brief");
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief });
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const ports = portsFor(store, counters, () => `nested-usage-port-${++id}`);
+  ports.telemetry.usage_profiles.image_generation = USAGE_PROFILE.OPENAI_RESPONSES;
+  const artifactBytes = Buffer.from("durable exact artwork bytes");
+  const artifactHash = `sha256:${createHash("sha256").update(artifactBytes).digest("hex")}`;
+  ports.provider.generate = async (input) => {
+    counters.provider += 1;
+    (counters.providerTransportIds ??= []).push(input.transport_attempt_id);
+    await input.recordTransportAttempt(input.transport_attempt_id);
+    return { design_version_id: "design-nested-usage-1",
+      artifact: { artifact_id: "artifact-nested-usage-1", content_hash: artifactHash, media_type: "image/png" },
+      artifact_bytes: Uint8Array.from(artifactBytes), provider: "fixture-provider", model: "fixture-model",
+      usage: { completeness: "complete", input_tokens: 10, output_tokens: 6, total_tokens: 16,
+        input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 3 },
+        provider_request_id: "provider:req-nested-usage" } };
+  };
+  const api = createCreativeApi({ ports, now: () => NOW, idFactory: () => `nested-usage-api-${++id}` });
+  const result = await api.invoke(actor(), request("nested-usage-api", await fixture("generate-plan")));
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(counters.provider, 1);
+  assert.equal(counters.reserved, 1);
+  const row = store.db.prepare("SELECT payload_json,status FROM creative_telemetry_observations_v1").get();
+  assert.equal(row.status, "delivered");
+  const observation = JSON.parse(row.payload_json).observation;
+  assert.equal(observation.completeness, "complete");
+  assert.equal(observation.provider_request_id, "provider:req-nested-usage");
+  assert.equal(observation.transport_attempt_id, counters.providerTransportIds[0]);
+  const units = new Map(observation.usage_units.map((unit) => [unit.name, unit]));
+  assert.equal(units.get("total_tokens").relation, "standalone");
+  assert.equal(units.get("input_tokens").relation, "included_subset");
+  assert.equal(units.get("input_tokens").included_in, "total_tokens");
+  assert.equal(units.get("output_tokens").included_in, "total_tokens");
+  assert.equal(units.get("input_tokens_details.cached_tokens").included_in, "input_tokens");
+  assert.equal(units.get("output_tokens_details.reasoning_tokens").included_in, "output_tokens");
+  assert.equal(observation.usage_units.filter((unit) => unit.relation === "standalone").length, 1);
+});
+
+test("actual API refuses telemetry append inside an uncommitted shared-store transaction before reservation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-version-api-telemetry-tx-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const store = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now: () => NOW });
+  t.after(() => store.close());
+  const brief = await fixture("brief");
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief });
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const ports = portsFor(store, counters, () => `outer-transaction-port-${++id}`);
+  const durableOutbox = ports.telemetry.outbox;
+  let guardedAttemptIntent = false;
+  ports.telemetry.outbox = Object.freeze({
+    ...durableOutbox,
+    async append(event) {
+      if (event.event_type !== "attempt_intent") return durableOutbox.append(event);
+      guardedAttemptIntent = true;
+      store.db.exec("BEGIN IMMEDIATE");
+      try {
+        return await durableOutbox.append(event);
+      } finally {
+        if (store.db.isTransaction) store.db.exec("ROLLBACK");
+      }
+    },
+  });
+  const api = createCreativeApi({ ports, now: () => NOW, idFactory: () => `outer-transaction-api-${++id}` });
+  const result = await api.invoke(actor(), request("api-telemetry-outer-transaction", await fixture("generate-plan")));
+  assert.equal(guardedAttemptIntent, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "unavailable");
+  assert.equal(counters.reserved, 0, "an outbox row in an uncommitted outer transaction cannot authorize reservation");
+  assert.equal(counters.provider, 0, "an outbox row in an uncommitted outer transaction cannot authorize provider dispatch");
+  assert.equal(store.db.isTransaction, false);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM creative_telemetry_evidence_outbox_v1").get().count, 0);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM creative_telemetry_observations_v1").get().count, 0);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM design_versions").get().count, 0);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM version_selections").get().count, 0);
 });
 
 test("dispatch authorization rechecks lease expiry after the intent timestamp and retains the metering hold", async (t) => {
