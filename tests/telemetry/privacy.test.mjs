@@ -232,3 +232,50 @@ test("unbounded, cyclic, accessor and non-finite evidence fails with a fixed dia
   assert.throws(() => assertSafePublicIdentifier("Bearer synthetic-private-id"), TelemetryPrivacyError);
   assert.equal(assertSafePublicIdentifier("attempt:fixture-1"), "attempt:fixture-1");
 });
+
+test("array projection reads only own data indexes and never dispatches caller array methods", () => {
+  let mapCalls = 0;
+  const withOwnMap = ["ordinary metadata"];
+  Object.defineProperty(withOwnMap, "map", {
+    enumerable: true,
+    value() {
+      mapCalls += 1;
+      return ["Bearer synthetic-private-value"];
+    },
+  });
+  const projected = projectPublicTelemetry({ details: withOwnMap });
+  assert.equal(mapCalls, 0);
+  assert.deepEqual([...projected.value.details], ["ordinary metadata"]);
+  assert.equal(JSON.stringify(projected).includes("synthetic-private-value"), false);
+
+  let getterCalls = 0;
+  const indexedAccessor = [];
+  indexedAccessor.length = 1;
+  Object.defineProperty(indexedAccessor, "0", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterCalls += 1;
+      return "Bearer synthetic-private-value";
+    },
+  });
+  assert.throws(() => projectPublicTelemetry({ details: indexedAccessor }), TelemetryPrivacyError);
+  assert.equal(getterCalls, 0);
+
+  const sparse = new Array(1);
+  assert.throws(() => projectPublicTelemetry({ details: sparse }), TelemetryPrivacyError);
+
+  let inheritedGetterCalls = 0;
+  const inheritedIndex = ["safe"];
+  delete inheritedIndex[0];
+  Object.setPrototypeOf(inheritedIndex, Object.create(Array.prototype, {
+    0: {
+      get() {
+        inheritedGetterCalls += 1;
+        return "Bearer synthetic-private-value";
+      },
+    },
+  }));
+  assert.throws(() => projectPublicTelemetry({ details: inheritedIndex }), TelemetryPrivacyError);
+  assert.equal(inheritedGetterCalls, 0);
+});

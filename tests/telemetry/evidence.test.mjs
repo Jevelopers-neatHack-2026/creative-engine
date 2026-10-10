@@ -358,6 +358,39 @@ test("public metering outcome redacts unsafe settlement references without chang
   assert.equal(publicJson.includes("synthetic-pass"), false);
 });
 
+test("public C03 settlement never invokes Finance-owned array methods", async () => {
+  const authority = new FakeMeteringAuthority();
+  const settle = authority.settleReservation.bind(authority);
+  const postingRefs = ["posting:fixture-safe-1"];
+  let mapCalls = 0;
+  Object.defineProperty(postingRefs, "map", {
+    enumerable: true,
+    value() {
+      mapCalls += 1;
+      return ["Bearer synthetic-private-value"];
+    },
+  });
+  authority.settleReservation = async (command) => ({
+    ...await settle(command),
+    posting_refs: postingRefs,
+  });
+
+  const result = await runWithTelemetry({
+    meteringPort: authority,
+    evidencePort: evidencePort([]),
+    request: fixtureAttempt({ billable_attempt_id: "attempt:own-map-settlement" }),
+    trustedScope,
+    modes,
+    dispatch: successfulDispatch([]),
+    idFactory: idFactory(),
+  });
+  assert.equal(result.outcome.status, "settled");
+  assert.deepEqual([...result.outcome.settlement.posting_refs], ["posting:fixture-safe-1"]);
+  assert.equal(mapCalls, 0);
+  assert.equal(JSON.stringify(result).includes("synthetic-private-value"), false);
+  assert.equal(authority.reservationFor("attempt:own-map-settlement").state, "settled");
+});
+
 test("oversized Finance metadata cannot turn a completed settlement into an execution failure", async () => {
   const authority = new FakeMeteringAuthority();
   const settle = authority.settleReservation.bind(authority);

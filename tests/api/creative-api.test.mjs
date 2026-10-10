@@ -1916,6 +1916,54 @@ test("port failure messages and malformed provider usage never leak or become ze
   assert.ok(malformed.state.calls.usage[0].missing_fields.includes("usage.input_tokens.invalid"));
 });
 
+test("provider error usage snapshots data descriptors without invoking missing-field getters", async () => {
+  await loadPlans();
+  let missingFieldsGetterCalls = 0;
+  let missingFieldsMapCalls = 0;
+  const missingFields = [];
+  missingFields.length = 1;
+  Object.defineProperty(missingFields, "0", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      missingFieldsGetterCalls += 1;
+      return "output_tokens";
+    },
+  });
+  Object.defineProperty(missingFields, "map", {
+    enumerable: true,
+    value() {
+      missingFieldsMapCalls += 1;
+      return ["Bearer synthetic-private-value"];
+    },
+  });
+  const rawUsage = { completeness: "partial", input_tokens: 17, output_tokens: 4 };
+  rawUsage.missing_fields = missingFields;
+  const providerError = new Error("provider returned a partial result");
+  Object.defineProperty(providerError, "usage", { value: rawUsage, enumerable: true });
+  Object.defineProperty(providerError, "provider_outcome", { value: "failed", enumerable: true });
+
+  const harness = await setup({
+    withDesign: false,
+    providerImpl: async () => { throw providerError; },
+  });
+  const response = await harness.api.invoke(actor(), generationRequest("action-error-usage-accessor"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "unavailable");
+  assert.equal(missingFieldsGetterCalls, 0);
+  assert.equal(missingFieldsMapCalls, 0);
+  assert.equal(harness.state.calls.usage.length, 1);
+  const observed = harness.state.calls.usage[0];
+  assert.equal(observed.completeness, "partial");
+  assert.ok(observed.usage_units.some((unit) => unit.name === "input_tokens" && unit.quantity === "17"));
+  assert.ok(observed.missing_fields.includes("usage.unmapped_extension"));
+  const reservation = [...harness.state.authority.reservations.values()][0];
+  assert.ok(reservation);
+  assert.equal(reservation.state, "held_for_reconciliation");
+  assert.equal(JSON.stringify(response).includes("output_tokens"), false);
+  assert.equal(JSON.stringify(harness.state.calls.usage).includes("synthetic-private-value"), false);
+});
+
 test("asset inputs require the action-specific granted permission", async () => {
   await loadPlans();
   const harness = await setup();

@@ -472,6 +472,75 @@ test('an operation failure with complete usage is still sent for authoritative s
   assert.equal(authority.reservationFor(request.billable_attempt_id).consumed_cents, 3n);
 });
 
+test('settlement reference arrays are copied from own data indexes without calling methods or getters', async () => {
+  const authority = new FakeMeteringAuthority();
+  const settle = authority.settleReservation.bind(authority);
+  const references = ['posting:fixture-safe-1'];
+  let mapCalls = 0;
+  Object.defineProperty(references, 'map', {
+    enumerable: true,
+    value() {
+      mapCalls += 1;
+      return ['Bearer synthetic-private-value'];
+    },
+  });
+  authority.settleReservation = async (command) => ({
+    ...await settle(command),
+    posting_refs: references,
+  });
+
+  const request = attempt({ billable_attempt_id: 'test:own-map-settlement' });
+  const outcome = await executeMeteredAttempt({
+    port: authority,
+    request,
+    trustedScope,
+    dispatch: async ({ recordTransportAttempt }) => {
+      await recordTransportAttempt('test:transport-own-map');
+      return { usage_observation: observation(request, {
+        source_observation_id: 'test:usage-own-map',
+        transport_attempt_id: 'test:transport-own-map',
+      }) };
+    },
+  });
+  assert.equal(outcome.status, 'settled');
+  assert.deepEqual(outcome.settlement.posting_refs, ['posting:fixture-safe-1']);
+  assert.equal(mapCalls, 0);
+
+  const accessorAuthority = new FakeMeteringAuthority();
+  const accessorSettle = accessorAuthority.settleReservation.bind(accessorAuthority);
+  const accessorRefs = [];
+  accessorRefs.length = 1;
+  let getterCalls = 0;
+  Object.defineProperty(accessorRefs, '0', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterCalls += 1;
+      return 'Bearer synthetic-private-value';
+    },
+  });
+  accessorAuthority.settleReservation = async (command) => ({
+    ...await accessorSettle(command),
+    posting_refs: accessorRefs,
+  });
+  const accessorRequest = attempt({ billable_attempt_id: 'test:accessor-settlement' });
+  const accessorOutcome = await executeMeteredAttempt({
+    port: accessorAuthority,
+    request: accessorRequest,
+    trustedScope,
+    dispatch: async ({ recordTransportAttempt }) => {
+      await recordTransportAttempt('test:transport-accessor');
+      return { usage_observation: observation(accessorRequest, {
+        source_observation_id: 'test:usage-accessor',
+        transport_attempt_id: 'test:transport-accessor',
+      }) };
+    },
+  });
+  assert.equal(accessorOutcome.status, 'settled');
+  assert.equal(Object.hasOwn(accessorOutcome.settlement, 'posting_refs'), false);
+  assert.equal(getterCalls, 0);
+});
+
 test('missing owner agreement and unpinned references cannot pass the metering gate', () => {
   const absent = evaluateMeteringAgreementGate(undefined);
   assert.equal(absent.status, 'blocked');

@@ -609,6 +609,157 @@ function usageObservation(attempt, trustedScope, rawUsage, profile, transportAtt
   });
 }
 
+const OMIT_FAILURE_USAGE_VALUE = Symbol("omit_failure_usage_value");
+
+function snapshotFailureUsage(value) {
+  const state = { nodes: 0, bytes: 0, incomplete: false, seen: new WeakSet() };
+
+  function copy(current, depth) {
+    state.nodes += 1;
+    if (state.nodes > 512 || depth > 12) {
+      state.incomplete = true;
+      return OMIT_FAILURE_USAGE_VALUE;
+    }
+    if (current === null || typeof current === "boolean") return current;
+    if (typeof current === "string") {
+      if (current.length > 16 * 1024 || state.bytes + current.length > 16 * 1024) {
+        state.incomplete = true;
+        return OMIT_FAILURE_USAGE_VALUE;
+      }
+      state.bytes += current.length;
+      return current;
+    }
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) {
+        state.incomplete = true;
+        return OMIT_FAILURE_USAGE_VALUE;
+      }
+      return current;
+    }
+    if (typeof current !== "object") {
+      state.incomplete = true;
+      return OMIT_FAILURE_USAGE_VALUE;
+    }
+    if (state.seen.has(current)) {
+      state.incomplete = true;
+      return OMIT_FAILURE_USAGE_VALUE;
+    }
+    state.seen.add(current);
+    try {
+      if (Array.isArray(current)) {
+        if (Object.getPrototypeOf(current) !== Array.prototype) {
+          state.incomplete = true;
+          return OMIT_FAILURE_USAGE_VALUE;
+        }
+        const lengthDescriptor = Object.getOwnPropertyDescriptor(current, "length");
+        const length = lengthDescriptor && Object.hasOwn(lengthDescriptor, "value")
+          ? lengthDescriptor.value
+          : undefined;
+        if (!Number.isSafeInteger(length) || length < 0 || length > 256) {
+          state.incomplete = true;
+          return OMIT_FAILURE_USAGE_VALUE;
+        }
+        const result = [];
+        let outputIndex = 0;
+        for (let index = 0; index < length; index += 1) {
+          const descriptor = Object.getOwnPropertyDescriptor(current, String(index));
+          if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+            state.incomplete = true;
+            continue;
+          }
+          const child = copy(descriptor.value, depth + 1);
+          if (child === OMIT_FAILURE_USAGE_VALUE) continue;
+          Object.defineProperty(result, String(outputIndex), {
+            value: child,
+            enumerable: true,
+            configurable: true,
+            writable: true,
+          });
+          outputIndex += 1;
+        }
+        return result;
+      }
+
+      const prototype = Object.getPrototypeOf(current);
+      if (prototype !== Object.prototype && prototype !== null) {
+        state.incomplete = true;
+        return OMIT_FAILURE_USAGE_VALUE;
+      }
+      const keys = Reflect.ownKeys(current);
+      const result = Object.create(null);
+      for (const key of keys) {
+        if (state.nodes >= 512) {
+          state.incomplete = true;
+          break;
+        }
+        if (typeof key !== "string") {
+          state.incomplete = true;
+          continue;
+        }
+        if (key.length > 1024 || state.bytes + key.length > 16 * 1024) {
+          state.incomplete = true;
+          continue;
+        }
+        state.bytes += key.length;
+        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+          state.incomplete = true;
+          continue;
+        }
+        const child = copy(descriptor.value, depth + 1);
+        if (child === OMIT_FAILURE_USAGE_VALUE) continue;
+        Object.defineProperty(result, key, {
+          value: child,
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      }
+      return result;
+    } catch {
+      state.incomplete = true;
+      return OMIT_FAILURE_USAGE_VALUE;
+    } finally {
+      state.seen.delete(current);
+    }
+  }
+
+  const snapshot = copy(value, 0);
+  if (snapshot === OMIT_FAILURE_USAGE_VALUE || !isRecord(snapshot)) return undefined;
+  if (!state.incomplete) return snapshot;
+
+  function markIncomplete(counters) {
+    if (!isRecord(counters)) return;
+    if (counters.completeness !== "unknown") {
+      Object.defineProperty(counters, "completeness", {
+        value: "partial", enumerable: true, configurable: true, writable: true,
+      });
+    }
+    const existing = Array.isArray(counters.missing_fields) ? counters.missing_fields : [];
+    const missing = [];
+    for (let index = 0; index < existing.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(existing, String(index));
+      if (descriptor && Object.hasOwn(descriptor, "value") && typeof descriptor.value === "string") {
+        Object.defineProperty(missing, String(missing.length), {
+          value: descriptor.value, enumerable: true, configurable: true, writable: true,
+        });
+      }
+    }
+    if (!missing.some((field) => field === "usage.unmapped_extension")) {
+      Object.defineProperty(missing, String(missing.length), {
+        value: "usage.unmapped_extension", enumerable: true, configurable: true, writable: true,
+      });
+    }
+    Object.defineProperty(counters, "missing_fields", {
+      value: missing, enumerable: true, configurable: true, writable: true,
+    });
+  }
+
+  markIncomplete(snapshot);
+  if (Object.hasOwn(snapshot, "usage")) markIncomplete(snapshot.usage);
+  return snapshot;
+}
+
 function providerFailureUsage(error) {
   if (error === null || (typeof error !== "object" && typeof error !== "function")) return undefined;
   let usageDescriptor;
@@ -616,20 +767,17 @@ function providerFailureUsage(error) {
   try {
     usageDescriptor = Object.getOwnPropertyDescriptor(error, "usage");
     outcomeDescriptor = Object.getOwnPropertyDescriptor(error, "provider_outcome");
+    if (!usageDescriptor || !Object.hasOwn(usageDescriptor, "value") || !isRecord(usageDescriptor.value)) return undefined;
+    const snapshot = snapshotFailureUsage(usageDescriptor.value);
+    if (!snapshot) return undefined;
+    const projected = projectPublicTelemetry(snapshot, { maxDepth: 8, maxNodes: 256, maxBytes: 16 * 1024 });
+    const reportedOutcome = outcomeDescriptor && Object.hasOwn(outcomeDescriptor, "value")
+      ? outcomeDescriptor.value : undefined;
+    const providerOutcome = ["failed", "partial", "unknown"].includes(reportedOutcome) ? reportedOutcome : "unknown";
+    return Object.freeze({ usage: projected.value, provider_outcome: providerOutcome });
   } catch {
     return undefined;
   }
-  if (!usageDescriptor || !Object.hasOwn(usageDescriptor, "value") || !isRecord(usageDescriptor.value)) return undefined;
-  let projected;
-  try {
-    projected = projectPublicTelemetry(usageDescriptor.value, { maxDepth: 8, maxNodes: 256, maxBytes: 16 * 1024 });
-  } catch {
-    return undefined;
-  }
-  const reportedOutcome = outcomeDescriptor && Object.hasOwn(outcomeDescriptor, "value")
-    ? outcomeDescriptor.value : undefined;
-  const providerOutcome = ["failed", "partial", "unknown"].includes(reportedOutcome) ? reportedOutcome : "unknown";
-  return Object.freeze({ usage: projected.value, provider_outcome: providerOutcome });
 }
 
 function meteringFailure(outcome, operation) {

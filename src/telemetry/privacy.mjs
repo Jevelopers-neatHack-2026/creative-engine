@@ -191,8 +191,33 @@ export function projectPublicTelemetry(value, limits = {}) {
     seen.add(current);
     try {
       if (Array.isArray(current)) {
-        if (current.length > maxNodes) throw new TelemetryPrivacyError("public_evidence_too_complex");
-        const result = current.map((item, index) => copy(item, depth + 1, `${path}/item[${index}]`));
+        // Do not dispatch through an input array's own `map`, indexed getters,
+        // or inherited numeric properties. Arrays cross provider and Finance
+        // boundaries, so read only bounded own data descriptors and build a
+        // fresh dense array from those values.
+        if (Object.getPrototypeOf(current) !== Array.prototype) {
+          throw new TelemetryPrivacyError("unsupported_public_array");
+        }
+        const lengthDescriptor = Object.getOwnPropertyDescriptor(current, "length");
+        const length = lengthDescriptor && Object.hasOwn(lengthDescriptor, "value")
+          ? lengthDescriptor.value
+          : undefined;
+        if (!Number.isSafeInteger(length) || length < 0 || length > maxNodes) {
+          throw new TelemetryPrivacyError("public_evidence_too_complex");
+        }
+        const result = new Array(length);
+        for (let index = 0; index < length; index += 1) {
+          const descriptor = Object.getOwnPropertyDescriptor(current, String(index));
+          if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+            throw new TelemetryPrivacyError("accessor_public_array_item");
+          }
+          Object.defineProperty(result, String(index), {
+            value: copy(descriptor.value, depth + 1, `${path}/item[${index}]`),
+            enumerable: true,
+            configurable: false,
+            writable: false,
+          });
+        }
         return Object.freeze(result);
       }
       const prototype = Object.getPrototypeOf(current);

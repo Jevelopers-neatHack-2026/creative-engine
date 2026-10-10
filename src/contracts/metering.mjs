@@ -57,6 +57,40 @@ function id(value, field) {
   return value;
 }
 
+function safeSettlementPostingRefs(settlement) {
+  // posting_refs is optional reconciliation metadata. Read it without invoking
+  // a producer-defined property getter or Array#map, and omit the metadata if
+  // the producer supplied a sparse/accessor-backed or otherwise malformed
+  // array. The authoritative settled amount/status remain intact.
+  let property;
+  try { property = Object.getOwnPropertyDescriptor(settlement, 'posting_refs'); }
+  catch { return undefined; }
+  if (!property || !Object.hasOwn(property, 'value') || property.value === undefined) return undefined;
+
+  const source = property.value;
+  try {
+    if (!Array.isArray(source) || Object.getPrototypeOf(source) !== Array.prototype) return undefined;
+    const lengthProperty = Object.getOwnPropertyDescriptor(source, 'length');
+    const length = lengthProperty && Object.hasOwn(lengthProperty, 'value') ? lengthProperty.value : undefined;
+    if (!Number.isSafeInteger(length) || length < 0 || length > 8192) return undefined;
+    const refs = new Array(length);
+    for (let index = 0; index < length; index += 1) {
+      const entry = Object.getOwnPropertyDescriptor(source, String(index));
+      if (!entry || !entry.enumerable || !Object.hasOwn(entry, 'value') ||
+        typeof entry.value !== 'string' || !ID.test(entry.value)) return undefined;
+      Object.defineProperty(refs, String(index), {
+        value: entry.value,
+        enumerable: true,
+        configurable: false,
+        writable: false,
+      });
+    }
+    return refs;
+  } catch {
+    return undefined;
+  }
+}
+
 function exactDecimal(value, field, { positive = false } = {}) {
   if (typeof value !== 'string' || !DECIMAL.test(value)) {
     fail('invalid_exact_amount', `${field} must be a non-negative exact decimal string`, field);
@@ -496,10 +530,8 @@ export async function executeMeteredAttempt({ port, request, trustedScope, dispa
     consumed_amount: { amount: settlement.consumed_amount.amount, currency: settlement.consumed_amount.currency },
     released_unused_amount: { amount: settlement.released_unused_amount.amount, currency: settlement.released_unused_amount.currency },
   };
-  if (settlement.posting_refs !== undefined) {
-    if (!Array.isArray(settlement.posting_refs)) fail('invalid_posting_refs', 'posting_refs must be an array', 'settlement.posting_refs');
-    safeSettlement.posting_refs = settlement.posting_refs.map((ref, index) => id(ref, `settlement.posting_refs[${index}]`));
-  }
+  const postingRefs = safeSettlementPostingRefs(settlement);
+  if (postingRefs !== undefined) safeSettlement.posting_refs = postingRefs;
   return { status: 'settled', published: false, ...safeOutcome, observation_ack: observationAck, settlement: safeSettlement };
 }
 
