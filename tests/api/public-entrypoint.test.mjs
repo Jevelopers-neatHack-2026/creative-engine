@@ -22,7 +22,7 @@ test("public API subpath exports the typed runtime symbols and errors", async ()
 });
 
 test("missing required runtime ports fail with a bounded versioned error and no fake success", async () => {
-  const api = apiModule.createCreativeApi();
+  const api = apiModule.createCreativeApi({ now: () => Date.parse("2026-10-10T12:00:00.000Z") });
   const actor = {
     actor_id: "actor-fixture",
     tenant_id: "tenant-fixture",

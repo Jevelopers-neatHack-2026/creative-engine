@@ -1,6 +1,6 @@
 import { createCreativeApi } from "creative-engine/api/v1";
 
-const api = createCreativeApi();
+const api = createCreativeApi({ now: () => Date.parse("2026-10-10T12:00:00.000Z") });
 const response = await api.invoke({
   actor_id: "actor-fixture",
   tenant_id: "tenant-fixture",

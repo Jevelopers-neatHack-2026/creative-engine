@@ -8,7 +8,7 @@
     { "id": "inspect-valid", "operation": "inspect", "expect": "scoped-design" },
     { "id": "list-order-cursor", "operation": "list", "expect": "stable-keyset-page" },
     { "id": "compare-valid", "operation": "compare", "expect": "two-scoped-versions" },
-    { "id": "restore-valid", "operation": "restore", "expect": "new-version-with-parent" },
+    { "id": "restore-valid", "operation": "restore", "expect": "existing-version-selected-by-cas" },
     { "id": "cancel-fence", "operation": "cancel", "expect": "cancelled-result-never-published" },
     { "id": "handoff-approval", "operation": "handoff", "expect": "exact-version-approval" },
     { "id": "job-status-scoped", "operation": "job.status", "expect": "tenant-project-filtered-status" },

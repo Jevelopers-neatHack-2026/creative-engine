@@ -86,6 +86,18 @@ function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function immutableRequestSnapshot(value) {
+  const snapshot = JSON.parse(canonicalSerialize(value));
+  const freeze = (current) => {
+    if (current !== null && typeof current === "object") {
+      for (const child of Object.values(current)) freeze(child);
+      Object.freeze(current);
+    }
+    return current;
+  };
+  return freeze(snapshot);
+}
+
 function boundedString(value, field, max = 200) {
   if (typeof value !== "string" || value.trim() === "" || value.length > max) {
     throw new CreativeApiError("invalid_request", "unknown", field);
@@ -106,6 +118,33 @@ const SENSITIVE_PUBLIC_TEXT = [
 
 function hasSensitivePublicText(value) {
   return SENSITIVE_PUBLIC_TEXT.some((pattern) => pattern.test(value));
+}
+
+function publicReference(value, field, operation, max = 512) {
+  if (typeof value !== "string" || value.trim() === "" || value.length > max ||
+    !/^[A-Za-z0-9_.:-]+$/.test(value) || hasSensitivePublicText(value)) {
+    throw new CreativeApiError("unavailable", operation, field);
+  }
+  return value;
+}
+
+function traceReference(value) {
+  return typeof value === "string" && value.length <= 200 &&
+    /^[A-Za-z0-9_.:-]+$/.test(value) && !hasSensitivePublicText(value) ? value : undefined;
+}
+
+function safeTraceEvent(event) {
+  const safe = {
+    event: ["creative_api.request", "creative_api.completed", "creative_api.rejected"].includes(event.event)
+      ? event.event : "creative_api.rejected",
+    operation: CREATIVE_API_OPERATIONS.includes(event.operation) ? event.operation : "unknown",
+  };
+  for (const field of ["request_id", "operation_id", "tenant_id", "project_id", "actor_id"]) {
+    const value = traceReference(event[field]);
+    if (value !== undefined) safe[field] = value;
+  }
+  if (Object.hasOwn(ERROR_MESSAGES, event.code)) safe.code = event.code;
+  return Object.freeze(safe);
 }
 
 function inspectionText(value, field, max, operation, stored = false) {
@@ -298,9 +337,10 @@ function publicJob(job, operation_id) {
   if (!isRecord(job) || !["queued", "running", "completed", "cancelled", "failed"].includes(job.status)) {
     throw new CreativeApiError("unavailable", "unknown");
   }
-  const job_id = boundedString(job.job_id, "job_id", 256);
-  if (operation_id !== undefined) boundedString(operation_id, "operation_id", 256);
-  const result_ref = job.result_ref === undefined ? undefined : boundedString(job.result_ref, "result_ref", 512);
+  const job_id = publicReference(job.job_id, "job_id", job.operation, 256);
+  if (operation_id !== undefined) publicReference(operation_id, "operation_id", job.operation, 256);
+  const result_ref = job.result_ref === undefined ? undefined
+    : publicReference(job.result_ref, "result_ref", job.operation, 512);
   return Object.freeze({
     contract: "CreativeJob",
     schema_version: "1.0",
@@ -313,7 +353,8 @@ function publicJob(job, operation_id) {
 }
 
 function safeDiagnosticRef(value, fallback) {
-  return typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,200}$/.test(value) ? value : fallback;
+  return typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,200}$/.test(value) &&
+    !hasSensitivePublicText(value) ? value : fallback;
 }
 
 function safeFieldPath(value) {
@@ -562,7 +603,7 @@ export function createCreativeApi(options = {}) {
   const idFactory = options.idFactory ?? (() => globalThis.crypto.randomUUID());
   const emitTrace = async (event) => {
     if (typeof ports.trace?.record === "function") {
-      try { await ports.trace.record(Object.freeze(event)); } catch { /* trace failure must not expose details */ }
+      try { await ports.trace.record(safeTraceEvent(event)); } catch { /* trace failure must not expose details */ }
     }
   };
   const failResponse = (error, operation = "unknown") => {
@@ -974,6 +1015,13 @@ export function createCreativeApi(options = {}) {
     if (operation === "edit" && plan.operation === "composition.update") {
       throw new CreativeApiError("unavailable", operation, "composition_executor");
     }
+    // Corrections change the authoritative research facts and require a
+    // research-owner handoff plus invalidation of dependent creative state.
+    // Until that capability is injected, do not reinterpret the correction
+    // as an image edit or let optional DecisionPort work run first.
+    if (operation === "edit" && plan.operation === "correction.apply") {
+      throw new CreativeApiError("unavailable", operation, "correction_handoff");
+    }
     const expectedCurrentDesignVersionId = baseDesign?.design_version_id ?? null;
     await assertCurrentCreativeContext(started.scope, brief, baseDesign, operation,
       expectedCurrentDesignVersionId);
@@ -1271,9 +1319,12 @@ export function createCreativeApi(options = {}) {
           job_id: started.job_id, destination_ref: payload.destination_ref, handoff,
           transport_attempt_id: transportAttemptId, dispatch_intent_ref: dispatchIntentRef }));
         const receiptNow = new Date(now());
-        validatedReceiptTime(receipt, receiptNow, operation);
+        const consumedAt = validatedReceiptTime(receipt, receiptNow, operation);
         assertReceiptWindow(receipt, handoff, handoffCreatedAt, receiptNow, operation);
-        result.receipt = validateConsumptionReceipt(receipt, handoff, { trustedScope: handoffScope, now: receiptNow });
+        // A consumer may return a valid receipt after the approval expires.
+        // The receipt is accepted only if its trusted consumption timestamp is
+        // within the original approval window and no later than trusted now.
+        result.receipt = validateConsumptionReceipt(receipt, handoff, { trustedScope: handoffScope, now: consumedAt });
       }, creativeContextFence(brief, design));
       assertScopedRecord(job, handoffScope, operation);
       return Object.freeze({ ok: true, contract: "CreativeApiResponse", schema_version: CREATIVE_API_VERSION,
@@ -1404,11 +1455,13 @@ export function createCreativeApi(options = {}) {
   }
 
   async function invoke(principalInput, requestInput) {
-    let operation = typeof requestInput?.operation === "string" ? requestInput.operation : "unknown";
+    let operation = "unknown";
     let request;
     let principal;
     try {
-      request = validateRequest(requestInput);
+      const snapshot = immutableRequestSnapshot(requestInput);
+      operation = CREATIVE_API_OPERATIONS.includes(snapshot?.operation) ? snapshot.operation : "unknown";
+      request = validateRequest(snapshot);
       operation = request.operation;
       principal = validatePrincipal(principalInput, now());
       assertRequestScope(principal, request);

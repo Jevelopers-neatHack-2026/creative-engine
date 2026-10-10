@@ -535,6 +535,53 @@ test("valid generation is metered before dispatch and publishes a validated immu
   assert.equal(state.designs.has(response.result.design_version.design_version_id), true);
 });
 
+test("caller mutation after invoke cannot elevate a generate request into an edit", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const principal = actor({ permissions: ["creative.generate"] });
+  const body = generationRequest("action-request-snapshot");
+  const callerOwnedPayload = body.payload;
+  const pending = harness.api.invoke(principal, body);
+  const forgedEditPlan = boundEditPlan(harness.state);
+  body.operation = "edit";
+  body.action_id = "action-request-mutated";
+  callerOwnedPayload.design_version_id = "design-api-1";
+  callerOwnedPayload.plan = forgedEditPlan;
+  body.payload = callerOwnedPayload;
+  const response = await pending;
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "stale_version");
+  assert.equal(harness.state.calls.provider, 0);
+  assert.equal(harness.state.calls.reserve, 0);
+  const job = [...harness.state.jobs.values()][0];
+  assert.equal(job.operation, "generate");
+  assert.equal(job.action_id, "action-request-snapshot");
+  assert.equal(job.tenant_id, "tenant-api-1");
+});
+
+test("caller mutation of a nested edit plan after invoke cannot alter dispatch content", async () => {
+  await loadPlans();
+  const dispatchedInstructions = [];
+  const harness = await setup({ providerImpl: async (_operation, input) => {
+    dispatchedInstructions.push(input.plan.steps[0].parameters.instruction);
+    return {
+      design_version_id: "design-nested-snapshot",
+      artifact: { artifact_id: "artifact-nested-snapshot", content_hash: `sha256:${"c".repeat(64)}`, media_type: "image/png" },
+      provider: input.route.provider.name, model: input.route.provider.model,
+      usage: { completeness: "complete", input_tokens: 1, output_tokens: 1 },
+    };
+  } });
+  const plan = boundEditPlan(harness.state);
+  const originalInstruction = plan.steps[0].parameters.instruction;
+  const body = request("edit", { brief_id: "brief-api-1", design_version_id: "design-api-1", plan }, "action-nested-snapshot");
+  const pending = harness.api.invoke(actor(), body);
+  plan.steps[0].parameters.instruction = "Caller changed the plan after validation began.";
+  const response = await pending;
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.deepEqual(dispatchedInstructions, [originalInstruction]);
+  assert.notEqual(dispatchedInstructions[0], "Caller changed the plan after validation began.");
+});
+
 test("edit checks current version, known source/artifact references, and parent linkage", async () => {
   await loadPlans();
   const { api, state } = await setup();
@@ -1008,6 +1055,25 @@ test("trace failures do not turn a committed operation into an API failure", asy
   assert.equal(JSON.stringify(response).includes("trace transport token"), false);
 });
 
+test("trace projection drops sensitive references and maps unknown operations to unknown", async () => {
+  await loadPlans();
+  const harness = await setup({ withDesign: false });
+  const body = generationRequest("action-trace-private-reference");
+  body.request_id = "Bearer synthetic-private-request-token";
+  const completed = await harness.api.invoke(actor(), body);
+  assert.equal(completed.ok, true, JSON.stringify(completed));
+  assert.equal(JSON.stringify(harness.state.calls.traces).includes("synthetic-private-request-token"), false);
+  for (const event of harness.state.calls.traces) assert.equal(Object.hasOwn(event, "request_id"), false);
+
+  harness.state.calls.traces.length = 0;
+  const malformed = generationRequest("action-trace-private-operation");
+  malformed.operation = "Bearer synthetic-private-operation-token";
+  const rejected = await harness.api.invoke(actor(), malformed);
+  assert.equal(rejected.ok, false);
+  assert.equal(JSON.stringify(harness.state.calls.traces).includes("synthetic-private-operation-token"), false);
+  assert.ok(harness.state.calls.traces.every((event) => event.operation === "unknown"));
+});
+
 test("stale metered inspection is reconciled but never published", async () => {
   await loadPlans();
   const harness = await setup();
@@ -1143,6 +1209,27 @@ test("completed handoff replay remains valid after approval expiry without a sec
   assert.equal(harness.state.calls.approval, 2);
 });
 
+test("receipt consumed before approval expiry remains valid when its response arrives later", async () => {
+  await loadPlans();
+  const clock = { now: NOW };
+  const harness = await setup({ clock });
+  const submit = harness.ports.handoff.submit;
+  harness.ports.handoff.submit = async (input) => {
+    const receipt = await submit(input);
+    clock.now = Date.parse("2026-10-12T12:30:00.000Z");
+    return receipt;
+  };
+  const body = request("handoff", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", approval_ref: "approval-late-receipt-1", destination_ref: "production-queue-1",
+  }, "action-handoff-late-receipt");
+  const response = await harness.api.invoke(actor({ expires_at: "2026-10-14T00:00:00.000Z" }), body);
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(response.result.receipt.consumed_at, "2026-10-10T12:30:00.000Z");
+  assert.equal(harness.state.calls.handoff, 1);
+  const job = [...harness.state.jobs.values()].find((entry) => entry.action_id === body.action_id);
+  assert.equal(job.status, "completed");
+});
+
 test("handoff receipt timestamps reject future, pre-issue, pre-creation, and expired values", async () => {
   await loadPlans();
   const invalidCases = [
@@ -1243,6 +1330,21 @@ test("job status cannot disclose another project's operation", async () => {
   harness.state.jobs.set("job-foreign", { job_id: "job-foreign", tenant_id: "tenant-api-1", project_id: "other-project", status: "completed" });
   const response = await harness.api.invoke(actor(), request("job.status", { job_id: "job-foreign" }));
   assert.equal(response.error.code, "not_found");
+});
+
+test("job status rejects sensitive stored public references", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const signedReference = "https://private.invalid/artifact?signature=synthetic-private-value";
+  harness.state.jobs.set("job-signed-result", {
+    job_id: "job-signed-result", tenant_id: "tenant-api-1", project_id: "project-api-1",
+    actor_id: "actor-api-1", action_id: "action-signed-result", operation: "generate",
+    request_hash: "hash-signed-result", status: "completed", result_ref: signedReference,
+  });
+  const response = await harness.api.invoke(actor(), request("job.status", { job_id: "job-signed-result" }));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "unavailable");
+  assert.equal(JSON.stringify(response).includes(signedReference), false);
 });
 
 test("typed read-port errors and persisted job diagnostics sanitize field paths and messages", async () => {
@@ -1416,4 +1518,59 @@ test("valid deterministic composition updates fail unavailable before image rout
   assert.equal(routeCalls, 0);
   assert.equal(harness.state.calls.reserve, 0);
   assert.equal(harness.state.calls.provider, 0);
+});
+
+test("valid research corrections fail unavailable before decision, route, reservation, or image transport", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const plan = boundEditPlan(harness.state);
+  plan.steps[0].action = "correction.apply";
+  plan.operation = "correction.apply";
+  plan.steps[0].parameters = {
+    design_version_id: "design-api-1",
+    fact_id: "fact-api-1",
+    replacement_value: "Unverified replacement event name",
+    evidence_refs: ["source-api-1"],
+  };
+  plan.expected_result.parent_version_id = "design-api-1";
+  let routeCalls = 0;
+  harness.ports.provider.resolveRoute = () => { routeCalls += 1; throw new Error("image route must not run"); };
+  const body = request("edit", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", plan,
+    decision_request: validDecisionInput(),
+  }, "correction-apply-unavailable");
+  const response = await harness.api.invoke(actor(), body);
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "unavailable");
+  assert.equal(response.error.field, "correction_handoff");
+  assert.equal(harness.state.calls.decision, 0);
+  assert.equal(routeCalls, 0);
+  assert.equal(harness.state.calls.reserve, 0);
+  assert.equal(harness.state.calls.provider, 0);
+});
+
+test("nested correction and composition steps cannot pass as an image edit", async () => {
+  await loadPlans();
+  for (const [action, parameters] of [
+    ["composition.update", { design_version_id: "design-api-1", changes: [{ field: "layout", value: "centered" }] }],
+    ["correction.apply", { design_version_id: "design-api-1", fact_id: "fact-api-1",
+      replacement_value: "Unverified replacement", evidence_refs: ["source-api-1"] }],
+  ]) {
+    const harness = await setup();
+    const plan = boundEditPlan(harness.state);
+    plan.operation = "image.edit";
+    plan.steps[0].action = action;
+    plan.steps[0].parameters = parameters;
+    let routeCalls = 0;
+    harness.ports.provider.resolveRoute = () => { routeCalls += 1; throw new Error("nested action must not route"); };
+    const response = await harness.api.invoke(actor(), request("edit", {
+      brief_id: "brief-api-1", design_version_id: "design-api-1", plan,
+      decision_request: validDecisionInput(),
+    }, `nested-${action}`));
+    assert.equal(response.ok, false, action);
+    assert.equal(harness.state.calls.decision, 0, action);
+    assert.equal(routeCalls, 0, action);
+    assert.equal(harness.state.calls.reserve, 0, action);
+    assert.equal(harness.state.calls.provider, 0, action);
+  }
 });
