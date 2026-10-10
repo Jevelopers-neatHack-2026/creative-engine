@@ -11,7 +11,7 @@ import {
   normalizeOpenAIImageUsage,
 } from "../../src/models/openai-images.mjs";
 import { readPrivateOpenAIImageRequestId } from "../../src/models/openai-images.mjs";
-import { corruptPngCrc, makeInvalidIndexedPng, makePng } from "../../fixtures/models/png.mjs";
+import { corruptPngCrc, makeInvalidIndexedPng, makePng, makePng16Rgba } from "../../fixtures/models/png.mjs";
 
 const MODEL = "gpt-image-2.5-sunburst-2026-09-08";
 const NOW = Date.parse("2026-10-10T18:00:00.000Z");
@@ -418,6 +418,21 @@ test("decoded image fixtures validate dimensions and reject CRC, truncated, inde
   }
 });
 
+test("16-bit PNG alpha transparency is checked before 8-bit quantization", async () => {
+  for (const [alpha, hasTransparency] of [[0xffff, false], [0xfffe, true], [0xffdc, true], [0xfde8, true], [0, true]]) {
+    const bytes = makePng16Rgba({ alpha });
+    assert.deepEqual(await inspectOpenAIImageBytes(bytes), {
+      format: "png", width: 16, height: 16, has_alpha: true, has_transparency: hasTransparency,
+    }, `unexpected decoded transparency for 16-bit alpha ${alpha}`);
+  }
+  const partiallyTransparent = makePng16Rgba({ alpha: 0xfffe });
+  const harness = providerHarness({ outputBytes: partiallyTransparent });
+  const output = await harness.provider.generate(harness.ctx);
+  assert.equal(harness.fetchCount, 1);
+  assert.equal(output.artifact.content_hash, HASH(partiallyTransparent));
+  assert.deepEqual(Buffer.from(output.artifact_bytes), partiallyTransparent);
+});
+
 test("WebP artifacts require bounded pixel decoding, not a RIFF/frame header", async (t) => {
   const corruptPayload = Buffer.from(WEBP);
   corruptPayload[25] = 0;
@@ -681,6 +696,11 @@ test("partial and missing provider usage remains raw, identity-bound, and unknow
     "usage.output_tokens_details", "usage.unmapped_fields"]);
   assert.equal(raw.usage_units, undefined);
   assert.deepEqual(normalizeOpenAIImageUsage(null).missing_fields, ["usage"]);
+  const missingUsage = normalizeOpenAIImageUsage(null, {
+    transport_attempt_id: "transport-image-001", provider_request_id: "req-private-fixture-id",
+  });
+  assert.deepEqual(missingUsage.missing_fields, ["usage"]);
+  assert.equal(readPrivateOpenAIImageRequestId(missingUsage), "req-private-fixture-id");
 });
 
 test("public usage references preserve safe transport identity and screen sensitive identity values", async (t) => {
@@ -720,6 +740,16 @@ test("public usage references preserve safe transport identity and screen sensit
   assert.doesNotMatch(JSON.stringify(response), /person@example\.invalid/);
   assert.match(response.usage.provider_request_id, /^provider-request-[a-f0-9]{64}$/);
   assert.equal(readPrivateOpenAIImageRequestId(response.usage), sensitiveRequestId);
+
+  const missingUsageId = "req-private-missing-usage-fixture";
+  const missingUsageHarness = providerHarness({ fetchImpl: async () => new Response(JSON.stringify({
+    data: [{ b64_json: makePng().toString("base64") }],
+  }), { status: 200, headers: { "content-type": "application/json", "x-request-id": missingUsageId } }) });
+  const missingUsageResponse = await missingUsageHarness.provider.generate(missingUsageHarness.ctx);
+  assert.deepEqual(missingUsageResponse.usage.missing_fields, ["usage"]);
+  assert.match(missingUsageResponse.usage.provider_request_id, /^provider-request-[a-f0-9]{64}$/);
+  assert.equal(readPrivateOpenAIImageRequestId(missingUsageResponse.usage), missingUsageId);
+  assert.doesNotMatch(JSON.stringify(missingUsageResponse), /req-private-missing-usage-fixture/);
 });
 
 test("observed raw usage accompanies failed outcomes without publishing artifacts or implying settlement", async (t) => {

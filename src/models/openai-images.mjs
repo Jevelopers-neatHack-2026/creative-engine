@@ -693,6 +693,15 @@ function exactUsage(value) {
   return Number.isSafeInteger(value) && value >= 0 ? String(value) : undefined;
 }
 
+function freezeUsageObservation(result) {
+  const privateProviderRequestId = PRIVATE_PROVIDER_REQUEST_IDS.get(result);
+  const frozen = Object.freeze(result);
+  if (typeof privateProviderRequestId === "string") {
+    PRIVATE_PROVIDER_REQUEST_IDS.set(frozen, privateProviderRequestId);
+  }
+  return frozen;
+}
+
 /** Preserve allowlisted provider counters; only a reviewed owner profile may map them for settlement. */
 export function normalizeOpenAIImageUsage(raw, { transport_attempt_id, provider_request_id } = {}) {
   const result = { completeness: "unknown", missing_fields: ["usage.profile_mapping_pending"] };
@@ -700,7 +709,10 @@ export function normalizeOpenAIImageUsage(raw, { transport_attempt_id, provider_
   const safeRequestRef = safeProviderRequestRef(provider_request_id);
   if (safeRequestRef) result.provider_request_id = safeRequestRef;
   if (typeof provider_request_id === "string") PRIVATE_PROVIDER_REQUEST_IDS.set(result, provider_request_id);
-  if (!isRecord(raw)) return Object.freeze({ ...result, missing_fields: Object.freeze(["usage"]) });
+  if (!isRecord(raw)) {
+    result.missing_fields = Object.freeze(["usage"]);
+    return freezeUsageObservation(result);
+  }
 
   const missing = new Set(result.missing_fields);
   for (const name of ["input_tokens", "output_tokens", "total_tokens"]) {
@@ -730,7 +742,7 @@ export function normalizeOpenAIImageUsage(raw, { transport_attempt_id, provider_
     "input_tokens", "output_tokens", "total_tokens", "input_tokens_details", "output_tokens_details",
   ].includes(key))) missing.add("usage.unmapped_fields");
   result.missing_fields = Object.freeze([...missing]);
-  return Object.freeze(result);
+  return freezeUsageObservation(result);
 }
 
 function usageFromPayload(payload, transportAttemptId, rawProviderRequestId) {

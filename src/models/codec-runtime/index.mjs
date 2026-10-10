@@ -1,6 +1,7 @@
 const MAX_PIXELS = 16_777_216;
 const MAX_DECODED_BYTES = 64 * 1024 * 1024;
 const DECODE_TIMEOUT_SECONDS = 30;
+const NATIVE_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
 let sharpModule;
 
@@ -48,21 +49,34 @@ export async function decodeOpenAIImageRgba(bytes) {
         (metadata.pages !== undefined && metadata.pages !== 1) || typeof metadata.hasAlpha !== "boolean") {
       throw new Error("unsupported decoded metadata");
     }
-    const decoded = await sharp(bytes, options)
+    const preserveUshort = metadata.depth === "ushort";
+    const expectedBytes = metadata.width * metadata.height * 4 * (preserveUshort ? 2 : 1);
+    if (expectedBytes > MAX_DECODED_BYTES) throw new Error("decoded pixels exceed bounded buffer size");
+    let pipeline = sharp(bytes, options);
+    if (preserveUshort) pipeline = pipeline.toColourspace("rgb16");
+    const decoded = await pipeline
       .ensureAlpha()
-      .raw()
+      .raw(preserveUshort ? { depth: "ushort" } : undefined)
       .timeout({ seconds: DECODE_TIMEOUT_SECONDS })
       .toBuffer({ resolveWithObject: true });
     const { data, info } = decoded;
     try {
-      const expectedBytes = metadata.width * metadata.height * 4;
       if (info.format !== "raw" || info.width !== metadata.width || info.height !== metadata.height ||
-          info.channels !== 4 || expectedBytes > MAX_DECODED_BYTES || data.byteLength !== expectedBytes) {
+          info.channels !== 4 || info.depth !== (preserveUshort ? "ushort" : "uchar") || data.byteLength !== expectedBytes) {
         throw new Error("decoded pixels did not match bounded metadata");
       }
       let hasTransparency = false;
-      for (let offset = 3; offset < data.length; offset += 4) {
-        if (data[offset] !== 0xff) { hasTransparency = true; break; }
+      if (preserveUshort) {
+        const readSample = NATIVE_LITTLE_ENDIAN
+          ? (offset) => data.readUInt16LE(offset)
+          : (offset) => data.readUInt16BE(offset);
+        for (let offset = 6; offset < data.length; offset += 8) {
+          if (readSample(offset) !== 0xffff) { hasTransparency = true; break; }
+        }
+      } else {
+        for (let offset = 3; offset < data.length; offset += 4) {
+          if (data[offset] !== 0xff) { hasTransparency = true; break; }
+        }
       }
       return Object.freeze({
         format: metadata.format,

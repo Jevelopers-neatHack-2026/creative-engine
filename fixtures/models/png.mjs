@@ -49,6 +49,37 @@ export function makePng({ width = 16, height = 16, transparent = false } = {}) {
   ]);
 }
 
+export function makePng16Rgba({ width = 16, height = 16, alpha = 0xffff } = {}) {
+  if (!Number.isSafeInteger(width) || width < 1 || width > 4096 || !Number.isSafeInteger(height) || height < 1 || height > 4096 ||
+      width * height > 16_777_216 || (width * 8 + 1) * height > 64 * 1024 * 1024 ||
+      !Number.isSafeInteger(alpha) || alpha < 0 || alpha > 0xffff) {
+    throw new TypeError("PNG16 fixture dimensions and alpha must be bounded integers.");
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 16;
+  header[9] = 6;
+  const rowBytes = width * 8;
+  const rows = Buffer.alloc((rowBytes + 1) * height);
+  for (let y = 0; y < height; y += 1) {
+    const rowOffset = y * (rowBytes + 1);
+    for (let x = 0; x < width; x += 1) {
+      const pixelOffset = rowOffset + 1 + x * 8;
+      rows.writeUInt16BE(0x7530, pixelOffset);
+      rows.writeUInt16BE(0x7530, pixelOffset + 2);
+      rows.writeUInt16BE(0x7530, pixelOffset + 4);
+      rows.writeUInt16BE(alpha, pixelOffset + 6);
+    }
+  }
+  return Buffer.concat([
+    SIGNATURE,
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(rows, { level: 9 })),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
 export function makeInvalidIndexedPng({ width = 16, height = 16 } = {}) {
   const header = Buffer.alloc(13);
   header.writeUInt32BE(width, 0);
