@@ -97,6 +97,7 @@
     "bounded_inputs": {
       "state_utf8_bytes": 16384,
       "question_count": 24,
+      "dependencies_per_question": 23,
       "observation_count": 16,
       "choice_options": 255,
       "ordered_score_levels": 10,
@@ -118,6 +119,9 @@
     "batching": "Independent questions may be planned together only when none depends on another. The DAG planner returns ordered ID batches only; it neither executes requests nor creates updated dependent state.",
     "result_status": "complete only when all answers are valid and no policy uncertainty trigger exists; abstention or low confidence/uncertain Noul requires review; timeout, cancellation or unavailable uses a typed safe fallback.",
     "usage": "Completeness is complete, incomplete, or unknown; known provider input/output counts are retained even when the decision is malformed, unavailable, timed out, or cancelled; unknown usage has no fabricated counts.",
+    "state_byte_basis": "UTF-8 bytes of the JSON-serialized entire state object, including field names and structural overhead.",
+    "dependency_policy": "Each question has at most 23 unique dependencies, and every dependency names another question in the request.",
+    "noul_criteria": "Exactly the true and false labels are allowed.",
     "structured_observation": "Observer identity, content hash, uncertainty status, bounded summary and optional source reference; no raw raster input."
   },
   "hashing": {

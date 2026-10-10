@@ -33,6 +33,8 @@
       "key": "admission_credential",
       "status": "verified",
       "value": "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+      "candidate_values": ["SYNTHETIC-NOT-A-REAL-CREDENTIAL"],
+      "raw_value": "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
       "provenance": [{"source_id": "page-1", "retrieved_at_status": "unknown"}]
     }
   ],

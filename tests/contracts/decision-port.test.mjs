@@ -156,6 +156,12 @@ test("dependent questions are planned sequentially and independent batches carry
   const cycle = clone(sequential);
   cycle.questions.layout_choice.depends_on = ["palette_score"];
   expectCode("invalid_dependency", () => planQuestionBatches(cycle, { trustedScope }));
+  const repeatedDependency = clone(sequential);
+  repeatedDependency.questions.palette_score.depends_on = Array(100_000).fill("layout_choice");
+  expectCode("out_of_bounds", () => validateDecisionRequest(repeatedDependency, { trustedScope }));
+  const duplicateDependency = clone(sequential);
+  duplicateDependency.questions.palette_score.depends_on = ["layout_choice", "layout_choice"];
+  expectCode("invalid_dependency", () => validateDecisionRequest(duplicateDependency, { trustedScope }));
   const answerLeak = clone(request);
   answerLeak.state.answers = { layout_choice: "centered" };
   expectCode("unknown_field", () => validateDecisionRequest(answerLeak, { trustedScope }));
@@ -178,6 +184,16 @@ test("scope, attempt, deadline, budget, cancellation, and state bounds are enfor
   const tooLarge = clone(request);
   tooLarge.state.text = "x".repeat(16_385);
   expectCode("out_of_bounds", () => validateDecisionRequest(tooLarge, { trustedScope }));
+  const wholeStateTooLarge = clone(request);
+  wholeStateTooLarge.state.text = "x".repeat(8_000);
+  wholeStateTooLarge.state.observations = Array.from({ length: 16 }, () => ({
+    ...clone(request.state.observations[0]),
+    summary: "x".repeat(1_000),
+  }));
+  expectCode("out_of_bounds", () => validateDecisionRequest(wholeStateTooLarge, { trustedScope }));
+  const extraNoulCriterion = clone(request);
+  extraNoulCriterion.questions.binary_match.criteria.extra = "x".repeat(1_000_000);
+  expectCode("unknown_field", () => validateDecisionRequest(extraNoulCriterion, { trustedScope }));
   expectCode("missing_trusted_context", () => validateDecisionRequest(request));
 });
 

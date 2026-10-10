@@ -90,8 +90,14 @@ function validateQuestion(id, question, contract) {
   expectString(question.policy_version, contract, "questions." + id + ".policy_version", { maxLength: 100 });
   expectString(question.instructions, contract, "questions." + id + ".instructions", { maxLength: 2048 });
   const dependencies = question.depends_on === undefined ? [] : expectArray(question.depends_on, contract, "questions." + id + ".depends_on");
+  if (dependencies.length > DECISION_LIMITS.questions - 1) {
+    fail("out_of_bounds", contract, "questions." + id + ".depends_on", "A question may depend on at most 23 other questions.");
+  }
   dependencies.forEach((dependency, index) =>
     expectString(dependency, contract, "questions." + id + ".depends_on[" + index + "]", { maxLength: 64 }));
+  if (new Set(dependencies).size !== dependencies.length) {
+    fail("invalid_dependency", contract, "questions." + id + ".depends_on", "Question dependencies must be unique.");
+  }
 
   if (question.type === "choice") {
     assertOnlyKeys(question, [...commonKeys, "criteria", "eligible_candidate_ids", "policy"], contract, "questions." + id);
@@ -125,9 +131,10 @@ function validateQuestion(id, question, contract) {
   } else {
     assertOnlyKeys(question, [...commonKeys, "criteria", "policy"], contract, "questions." + id);
     validateQuestionPolicy(question, contract, id);
-    expectObject(question.criteria, contract, "questions." + id + ".criteria");
-    expectString(question.criteria.true, contract, "questions." + id + ".criteria.true", { maxLength: 1000 });
-    expectString(question.criteria.false, contract, "questions." + id + ".criteria.false", { maxLength: 1000 });
+    const criteria = expectObject(question.criteria, contract, "questions." + id + ".criteria");
+    assertOnlyKeys(criteria, ["true", "false"], contract, "questions." + id + ".criteria");
+    expectString(criteria.true, contract, "questions." + id + ".criteria.true", { maxLength: 1000 });
+    expectString(criteria.false, contract, "questions." + id + ".criteria.false", { maxLength: 1000 });
   }
   return dependencies;
 }
@@ -254,6 +261,9 @@ export function validateDecisionRequest(value, options = {}) {
     fail("out_of_bounds", contract, "state.observations", "State exceeds the observation limit.");
   }
   observations.forEach((observation, index) => validateObservation(observation, index, contract));
+  if (Buffer.byteLength(JSON.stringify(value.state), "utf8") > DECISION_LIMITS.stateBytes) {
+    fail("out_of_bounds", contract, "state", "JSON-serialized state exceeds the 16 KiB UTF-8 byte limit.");
+  }
   const questions = expectObject(value.questions, contract, "questions");
   const ids = Object.keys(questions);
   if (ids.length === 0 || ids.length > DECISION_LIMITS.questions) {

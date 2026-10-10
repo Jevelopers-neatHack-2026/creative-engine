@@ -113,18 +113,46 @@ test("synthetic admission credentials are omitted from declared and unknown nest
   assert.equal(normalized.facts[1].key, "admission_credential");
   assert.equal(normalized.facts[1].status, "unknown");
   assert.equal(Object.hasOwn(normalized.facts[1], "value"), false);
+  assert.equal(Object.hasOwn(normalized.facts[1], "candidate_values"), false);
+  assert.equal(Object.hasOwn(normalized.facts[1], "raw_value"), false);
   assert.equal(normalized.facts[1].provenance[0].source_id, "page-1");
   assert.equal(Object.hasOwn(normalized.source_identity[0], "admission_credential"), false);
   assert.equal(Object.hasOwn(normalized.future_source_metadata.audit, "source_credential"), false);
   assert.equal(Object.hasOwn(normalized.future_source_metadata.audit.semantic_field, "value"), false);
   assert.equal(serialized.includes("SYNTHETIC-NOT-A-REAL-CREDENTIAL"), false);
   assert.deepEqual(normalized.security_redactions.map((item) => item.field_path).sort(), [
+    "facts[1].candidate_values",
+    "facts[1].raw_value",
     "facts[1].value",
     "future_source_metadata.audit.semantic_field.value",
     "future_source_metadata.audit.source_credential",
     "source_identity[0].admission_credential",
   ]);
   assert.ok(normalized.security_redactions.every((item) => item.reason === "credential_material_omitted"));
+
+  const legacy = await fixture("creative/older.json");
+  legacy.facts.push({
+    fact_id: "admission-credential-legacy",
+    key: "admission_credential",
+    status: "verified",
+    value: "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+    candidate_values: ["SYNTHETIC-NOT-A-REAL-CREDENTIAL"],
+    raw_value: "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+    source_refs: ["page-1"],
+  });
+  const migratedLegacy = normalizeResearchPackage(legacy, trustedScope);
+  const legacyCredential = migratedLegacy.facts.find((fact) => fact.fact_id === "admission-credential-legacy");
+  assert.equal(legacyCredential.status, "unknown");
+  assert.equal(Object.hasOwn(legacyCredential, "value"), false);
+  assert.equal(Object.hasOwn(legacyCredential, "candidate_values"), false);
+  assert.equal(Object.hasOwn(legacyCredential, "raw_value"), false);
+  assert.equal(legacyCredential.provenance[0].source_id, "page-1");
+  assert.equal(JSON.stringify(migratedLegacy).includes("SYNTHETIC-NOT-A-REAL-CREDENTIAL"), false);
+  assert.deepEqual(migratedLegacy.security_redactions.map((item) => item.field_path).sort(), [
+    "facts[1].candidate_values",
+    "facts[1].raw_value",
+    "facts[1].value",
+  ]);
 
   const brief = await fixture("creative/creative-brief.json");
   const packageInput = await fixture("creative/current.json");
@@ -133,6 +161,18 @@ test("synthetic admission credentials are omitted from declared and unknown nest
     trustedScope,
     researchPackage: packageInput,
   }));
+  for (const [field, value] of [
+    ["value", "SYNTHETIC-NOT-A-REAL-CREDENTIAL"],
+    ["candidate_values", ["SYNTHETIC-NOT-A-REAL-CREDENTIAL"]],
+    ["raw_value", "SYNTHETIC-NOT-A-REAL-CREDENTIAL"],
+  ]) {
+    const semanticCredential = clone(await fixture("creative/creative-brief.json"));
+    semanticCredential.future_metadata = { key: "admission_credential", [field]: value };
+    expectCode("forbidden_sensitive_field", () => validateCreativeBrief(semanticCredential, {
+      trustedScope,
+      researchPackage: packageInput,
+    }));
+  }
 });
 
 test("conflicting facts and missing reproduction permissions remain incomplete", async () => {
@@ -258,6 +298,19 @@ test("EditPlan accepts only bounded typed actions and references", async () => {
     known_fact_ids: ["event-date-1"],
   };
   assert.equal(validateEditPlan(plan, validOptions).steps.length, 1);
+
+  const conceptPlan = clone(plan);
+  conceptPlan.operation = "concept.generate";
+  conceptPlan.steps[0].action = "concept.generate";
+  conceptPlan.steps[0].parameters = { brief_id: "brief-1", variant_count: 1 };
+  assert.equal(validateEditPlan(conceptPlan, validOptions).steps.length, 1);
+  const foreignBrief = clone(conceptPlan);
+  foreignBrief.steps[0].parameters.brief_id = "brief-other-tenant";
+  expectCode("scope_mismatch", () => validateEditPlan(foreignBrief, validOptions));
+  expectCode("missing_trusted_context", () => validateEditPlan(conceptPlan, {
+    ...validOptions,
+    trustedScope: { tenant_id: "tenant-1", project_id: "project-1" },
+  }));
 
   const unknownAction = clone(plan);
   unknownAction.steps[0].action = "image.render_privileged";

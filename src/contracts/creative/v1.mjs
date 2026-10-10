@@ -654,7 +654,14 @@ function validateActionParameters(action, parameters, contract, field, options) 
   switch (action) {
     case "concept.generate": {
       assertOnlyKeys(parameters, ["brief_id", "variant_count", "style_ref"], contract, field);
-      expectString(parameters.brief_id, contract, field + ".brief_id", { maxLength: 200 });
+      const briefId = expectString(parameters.brief_id, contract, field + ".brief_id", { maxLength: 200 });
+      if (!options.trustedScope || typeof options.trustedScope.brief_id !== "string") {
+        fail("missing_trusted_context", contract, "trusted_scope.brief_id", "Concept generation requires the separately trusted brief identity.");
+      }
+      const trustedBriefId = expectString(options.trustedScope.brief_id, contract, "trusted_scope.brief_id", { maxLength: 200 });
+      if (briefId !== trustedBriefId) {
+        fail("scope_mismatch", contract, field + ".brief_id", "Concept generation must target the trusted brief.");
+      }
       expectInteger(parameters.variant_count, contract, field + ".variant_count", { min: 1, max: 4 });
       if (Object.prototype.hasOwnProperty.call(parameters, "style_ref")) {
         expectString(parameters.style_ref, contract, field + ".style_ref", { maxLength: 300 });

@@ -105,6 +105,14 @@ function normalizedKey(key) {
   return key.toLowerCase().replace(/[-_]/g, "");
 }
 
+const SENSITIVE_SEMANTIC_VALUE_KEYS = new Set([
+  "value", "candidatevalues", "text", "answer", "content", "rawvalue",
+]);
+
+function isSensitiveSemanticValueKey(key) {
+  return SENSITIVE_SEMANTIC_VALUE_KEYS.has(normalizedKey(key));
+}
+
 function isSensitiveKey(key, parentPath) {
   const normalized = normalizedKey(key);
   if (parentPath === "usage" && (normalized === "inputtokens" || normalized === "outputtokens")) return false;
@@ -117,9 +125,10 @@ export function rejectCredentialMaterial(value, contract, path = "") {
     return;
   }
   if (value === null || typeof value !== "object") return;
+  const sensitiveSemanticKey = typeof value.key === "string" && isSensitiveKey(value.key, path);
   for (const [key, entry] of Object.entries(value)) {
     const nextPath = path ? path + "." + key : key;
-    if (isSensitiveKey(key, path)) {
+    if (isSensitiveKey(key, path) || (sensitiveSemanticKey && isSensitiveSemanticValueKey(key))) {
       fail(
         "forbidden_sensitive_field",
         contract,
@@ -147,8 +156,7 @@ export function sanitizeCredentialFields(value) {
     const sensitiveSemanticKey = typeof current.key === "string" && isSensitiveKey(current.key, path);
     for (const [key, entry] of Object.entries(current)) {
       const nextPath = path ? path + "." + key : key;
-      const semanticValue = sensitiveSemanticKey &&
-        ["value", "candidate_values", "text", "answer", "content", "raw_value"].includes(normalizedKey(key));
+      const semanticValue = sensitiveSemanticKey && isSensitiveSemanticValueKey(key);
       if (isSensitiveKey(key, path) || semanticValue) {
         omitted.push(Object.freeze({
           field_path: nextPath,
