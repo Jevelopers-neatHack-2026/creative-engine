@@ -1,0 +1,34 @@
+.PHONY: bootstrap build check acceptance typecheck-contracts
+
+TARGET ?= all
+MODE ?= mock
+
+bootstrap:
+	npm ci --ignore-scripts --offline
+
+build:
+	npm run build
+	node --check src/controls/runtime.mjs
+	node --check src/controls/schema.mjs
+	node --check src/controls/contract.mjs
+	node --check src/controls/actions.mjs
+	node --check src/controls/index.mjs
+
+typecheck-contracts:
+	node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc -p tests/contracts/types/tsconfig.json
+
+check:
+	@if [ "$(MODE)" != "mock" ]; then \
+		echo "MODE=$(MODE) is unavailable: only offline mock checks are implemented; no live provider dispatch exists." >&2; \
+		exit 2; \
+	fi
+	@case "$(TARGET)" in \
+		contracts) npm run check:contracts ;; \
+		decision-contract) npm run check:decision-contract ;; \
+		controls) node fixtures/controls/check.mjs ;; \
+		all) npm test && node fixtures/controls/check.mjs ;; \
+		*) echo "Unknown TARGET=$(TARGET). Use controls, contracts, decision-contract, or all." >&2; exit 2 ;; \
+	esac
+
+acceptance:
+	node scripts/acceptance-gate.mjs "$(TARGET)"
