@@ -27,6 +27,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --offline
       - run: npm ci --prefix examples/frontend-action-roundtrip
+      - run: npm ci --prefix src/models/codec-runtime --ignore-scripts
       - run: node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --version
       - run: make typecheck-contracts
       - run: make check TARGET=eval-policy MODE=mock

@@ -25,12 +25,12 @@ There is no automatic retry. `Retry-After` seconds or HTTP dates are parsed into
 
 Live operation remains blocked until the real owners provide accepted account/project capability and quota evidence, grant and credential bindings, Finance reservation/lease/cap semantics, and usage mapping. This branch now includes the local API/C03/CE08/CE11 integration, durable byte publication, and private usage attribution exercised with intercepted fixtures. Those fixtures contain synthetic responses and do not establish live access, model selection, or canonical Finance agreement. The live gate reads no credentials and makes zero provider requests. Relevant acceptance remains open: ART-01, FIN-01, FIN-03, FIN-04, and AGT-03.
 
-Run the standalone source checks while shared build integration is serialized:
+Install the locked root, consumer-type, and decoder dependencies with `make bootstrap`. The integrated checks run on Node 22.23.3 and 24.15.0:
 
 ```sh
-npm ci --prefix src/models/codec-runtime
-node --test tests/models/openai-images.test.mjs
-node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --noEmit --strict --skipLibCheck false --module NodeNext --moduleResolution NodeNext --target ES2022 tests/models/public-consumer.mts
+make build
+make check TARGET=image-adapter MODE=mock
+make check TARGET=all MODE=mock
 ```
 
-The required eventual integration target is `make check TARGET=image-adapter MODE=mock`, plus the project build and aggregate checks. A live check without real owner authority must fail before any POST. Mock success does not count as live evidence.
+The image-adapter check runs the intercepted native transport fixtures and strict public consumer typecheck; its zero exit status is the test result. The evidence file is only an implementation-input inventory and is not itself a test receipt. `make check TARGET=image-adapter MODE=live` and `make acceptance TARGET=image-adapter` intentionally exit 2 until owner evidence and the accepted external contract exist. Neither command reads credentials or dispatches a provider request. Mock success does not count as live evidence.
