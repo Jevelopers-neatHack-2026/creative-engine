@@ -583,4 +583,3 @@ test("brief operations enforce explicit permissions and reject unknown operation
   assert.equal(system.counters.provider, 0);
   assert.equal(system.counters.reserve, 0);
 });
-
