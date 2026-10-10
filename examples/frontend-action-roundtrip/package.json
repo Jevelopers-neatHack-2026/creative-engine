@@ -1,0 +1,19 @@
+{
+  "name": "creative-controls-mock-browser-fixture",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.23.3 <23 || >=24.15.0 <25"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "playwright test",
+    "test:types": "tsc -p ../../tests/controls/types/tsconfig.json",
+    "test:unit": "node --test ../../tests/controls/actions.test.mjs"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.11.1",
+    "@playwright/test": "1.58.2",
+    "typescript": "5.9.3"
+  }
+}
