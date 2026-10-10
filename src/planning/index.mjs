@@ -80,7 +80,7 @@ function decodedVariants(value) {
   let malformed = false;
   for (let index = 0; index < 8; index += 1) {
     try {
-      const next = decodeURIComponent(decoded.replace(/\+/g, "%20"));
+      const next = decodeURIComponent(decoded);
       if (next === decoded) break;
       decoded = next;
       variants.push(decoded);
@@ -109,6 +109,18 @@ function decodedVariants(value) {
   return { variants, exhausted, malformed };
 }
 
+function queryDecodedVariants(value) {
+  const percentOnly = decodedVariants(value);
+  // Query/form decoding treats `+` as a space. Keep it as a distinct
+  // screening variant so a literal `+` in Basic base64 remains intact too.
+  const formQuery = decodedVariants(value.replace(/\+/g, "%20"));
+  return {
+    variants: [...new Set([...percentOnly.variants, ...formQuery.variants])],
+    exhausted: percentOnly.exhausted || formQuery.exhausted,
+    malformed: percentOnly.malformed || formQuery.malformed,
+  };
+}
+
 function privacyVariants(values) {
   const expanded = [];
   for (const value of values) {
@@ -127,13 +139,15 @@ function hasSignedUrl(value, variants) {
       for (const decoded of privacyVariants(candidateVariants.variants)) {
         if (SENSITIVE_VALUE.test(decoded) || hasBasicAuthMaterial(decoded)) return true;
       }
-      const decoded = candidateVariants.variants.at(-1);
       try {
-        const parsed = new URL(decoded);
+        // Parse the candidate at this decoding layer. Fully decoding the URL
+        // first would erase whether a query `+` came from `%2B` or from form
+        // syntax before URLSearchParams can apply its own decoding rules.
+        const parsed = new URL(candidate);
         if (parsed.username || parsed.password) return true;
         for (const [key, queryValue] of parsed.searchParams) {
-          const keyVariants = decodedVariants(key);
-          const valueVariants = decodedVariants(queryValue);
+          const keyVariants = queryDecodedVariants(key);
+          const valueVariants = queryDecodedVariants(queryValue);
           if (keyVariants.exhausted || valueVariants.exhausted) return true;
           if (keyVariants.variants.some((item) => SIGNED_URL_PARAMETER.test(item))) return true;
           if (valueVariants.variants.some((item) => SENSITIVE_VALUE.test(item) || hasBasicAuthMaterial(item))) return true;

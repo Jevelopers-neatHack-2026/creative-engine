@@ -293,6 +293,49 @@ test("Basic prose remains usable while credential-looking values are rejected", 
   assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes("Og=="), false);
 });
 
+test("partially encoded Basic credentials preserve base64 plus signs during privacy screening", () => {
+  const token = Buffer.from("~~~:p", "utf8").toString("base64");
+  assert.equal(token, "fn5+OnA=");
+  const cases = [
+    ["encoded Basic space in a customer value", "fn5+OnA=", (research) => {
+      research.preferences.items[0].value = `Basic%20${token}`;
+    }],
+    ["encoded Basic word in a recursive key", "fn5+OnA=", (research) => {
+      research.preferences.items[0][`%42asic ${token}`] = "safe";
+    }],
+    ["encoded UTF-8 prefix and Basic token in artistic intent", "fn5+OnA=", (research, extra) => {
+      extra.artistic_intent = [{ interpretation_id: "privacy-fixture", text: `caf%C3%A9%20%42asic%20${token}` }];
+    }],
+    ["partially encoded Basic credentials in a URI path", "fn5+OnA=", (research) => {
+      research.source_identity[0].uri = `https://example.test/Basic%20${token}`;
+    }],
+    ["encoded Basic word with UTF-8 in a URI path", "fn5+OnA=", (research) => {
+      research.source_identity[0].uri = `https://example.test/caf%C3%A9/%42asic%20${token}`;
+    }],
+    ["partially encoded Basic credentials in a URI query", "fn5+OnA=", (research) => {
+      research.source_identity[0].uri = `https://example.test/?note=Basic%20${token.replace("+", "%2B")}`;
+    }],
+    ["query-form spaces and percent-encoded Basic plus in a URI query", "fn5+OnA=", (research) => {
+      research.source_identity[0].uri = `https://example.test/?note=Basic+${token.replace("+", "%2B").replace("=", "%3D")}`;
+    }],
+  ];
+  for (const [name, marker, mutate] of cases) {
+    const research = completeResearchPackage();
+    const extra = {};
+    mutate(research, extra);
+    let failure;
+    try { plan(research, baseTime, extra); } catch (error) { failure = error; }
+    assert.equal(failure?.code, "sensitive_input", name);
+    assert.equal(`${failure.message} ${failure.field} ${failure.stack}`.includes(marker), false, name);
+  }
+  for (const value of ["Basic illustrations with warm colors", "Use plus signs in the design + palette"]) {
+    const result = plan(completeResearchPackage(), baseTime, {
+      customer_preferences: [{ preference_id: "ordinary-plus-prose", value }],
+    });
+    assert.equal(result.brief.preferences.items.some((item) => item.value === value), true, value);
+  }
+});
+
 test("invalid UTF-8 escape bytes cannot shield encoded credentials across public brief fields", () => {
   const percentEveryByte = (text) => [...Buffer.from(text, "utf8")]
     .map((byte) => `%${byte.toString(16).padStart(2, "0")}`).join("");
