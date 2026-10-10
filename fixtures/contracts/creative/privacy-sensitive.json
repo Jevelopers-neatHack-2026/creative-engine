@@ -1,0 +1,55 @@
+{
+  "contract": "EventIntelligencePackage",
+  "schema_version": "1.1",
+  "event_id": "event-eip-privacy-1",
+  "tenant_id": "tenant-1",
+  "project_id": "project-1",
+  "correlation_id": "journey-1",
+  "producer": "event-intelligence@fixture",
+  "occurred_at": "2026-10-10T12:00:00Z",
+  "ingested_at": "2026-10-10T12:00:02Z",
+  "environment": "test",
+  "billing_mode": "simulated",
+  "source_refs": ["source:page-1"],
+  "package_id": "eip-privacy-1",
+  "source_identity": [
+    {
+      "source_id": "page-1",
+      "uri": "https://example.test/events/1",
+      "retrieved_at_status": "unknown",
+      "admission_credential": "SYNTHETIC-NOT-A-REAL-CREDENTIAL"
+    }
+  ],
+  "facts": [
+    {
+      "fact_id": "event-name-1",
+      "key": "event_name",
+      "status": "verified",
+      "value": "Example Festival",
+      "provenance": [{"source_id": "page-1", "retrieved_at_status": "unknown"}]
+    },
+    {
+      "fact_id": "admission-credential-1",
+      "key": "admission_credential",
+      "status": "verified",
+      "value": "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+      "candidate_values": ["SYNTHETIC-NOT-A-REAL-CREDENTIAL"],
+      "raw_value": "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+      "provenance": [{"source_id": "page-1", "retrieved_at_status": "unknown"}]
+    }
+  ],
+  "assets": {"presence": "absent", "items": []},
+  "preferences": {"presence": "absent", "items": []},
+  "interpretations": {"presence": "absent", "items": []},
+  "permissions": {"presence": "absent", "items": []},
+  "locks": {"presence": "absent", "items": []},
+  "future_source_metadata": {
+    "audit": {
+      "source_credential": "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+      "semantic_field": {
+        "key": "source_credential",
+        "value": "SYNTHETIC-NOT-A-REAL-CREDENTIAL"
+      }
+    }
+  }
+}
