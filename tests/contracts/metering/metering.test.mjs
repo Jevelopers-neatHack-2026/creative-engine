@@ -146,6 +146,47 @@ test('two workers contend atomically and a denied reservation never reaches the 
   assert.equal(authority.availableAmount().amount, '0.07');
 });
 
+test('dispatch receives the exact immutable reservation reference, including the 256-character bound', async () => {
+  const authority = new FakeMeteringAuthority();
+  const request = attempt();
+  const reservationId = 'r'.repeat(256);
+  const originalReserve = authority.reserveAttempt.bind(authority);
+  let reservedResponse;
+  authority.reserveAttempt = async (value) => {
+    reservedResponse = await originalReserve(value);
+    const stored = authority.reservations.get(reservedResponse.reservation_id);
+    authority.reservations.delete(reservedResponse.reservation_id);
+    stored.reservation_id = reservationId;
+    authority.reservations.set(reservationId, stored);
+    authority.byAttempt.set(value.billable_attempt_id, reservationId);
+    reservedResponse.reservation_id = reservationId;
+    return reservedResponse;
+  };
+  const originalInFlight = authority.markAttemptInFlight.bind(authority);
+  authority.markAttemptInFlight = async (command) => {
+    const ack = await originalInFlight(command);
+    reservedResponse.reservation_id = 'r:mutated-after-await';
+    return ack;
+  };
+  let observedReservation;
+  const outcome = await executeMeteredAttempt({
+    port: authority,
+    request,
+    trustedScope,
+    dispatch: async ({ reservation_ref, recordTransportAttempt }) => {
+      observedReservation = reservation_ref;
+      await recordTransportAttempt('test:transport-reservation-ref');
+      return { usage_observation: observation(request, {
+        source_observation_id: 'test:usage-reservation-ref',
+        transport_attempt_id: 'test:transport-reservation-ref',
+      }) };
+    },
+  });
+  assert.equal(observedReservation, reservationId);
+  assert.equal(outcome.status, 'settled');
+  assert.equal(outcome.settlement.reservation_id, reservationId);
+});
+
 test('direct and trace observations keep separate observation IDs but one effective attempt charge', async () => {
   const authority = new FakeMeteringAuthority();
   const request = attempt();

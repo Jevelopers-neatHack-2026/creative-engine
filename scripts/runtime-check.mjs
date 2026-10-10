@@ -10,9 +10,9 @@ function compareVersions(left, right) {
 
 if (compareVersions(actual, supportedMinimum) < 0) {
   process.stderr.write(
-    "creative-engine contracts require Node.js >=22.23.3; detected " + process.versions.node + ".\n",
+    "creative-engine requires Node.js >=22.23.3; detected " + process.versions.node + ".\n",
   );
   process.exitCode = 1;
 } else {
-  process.stdout.write("Node.js " + process.versions.node + " meets the contract runtime floor (22.23.3).\n");
+  process.stdout.write("Node.js " + process.versions.node + " meets the creative-engine runtime floor (22.23.3).\n");
 }

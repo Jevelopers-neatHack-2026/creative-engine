@@ -1,0 +1,19 @@
+{
+  "contract": "CreativeApiFixtureScenarios",
+  "schema_version": "1.0",
+  "dependency_mode": "mock",
+  "cases": [
+    { "id": "generate-valid", "operation": "generate", "expect": "completed-job-and-immutable-design" },
+    { "id": "edit-valid", "operation": "edit", "expect": "versioned-child-design" },
+    { "id": "inspect-valid", "operation": "inspect", "expect": "scoped-design" },
+    { "id": "list-order-cursor", "operation": "list", "expect": "stable-keyset-page" },
+    { "id": "compare-valid", "operation": "compare", "expect": "two-scoped-versions" },
+    { "id": "restore-valid", "operation": "restore", "expect": "new-version-with-parent" },
+    { "id": "cancel-fence", "operation": "cancel", "expect": "cancelled-result-never-published" },
+    { "id": "handoff-approval", "operation": "handoff", "expect": "exact-version-approval" },
+    { "id": "job-status-scoped", "operation": "job.status", "expect": "tenant-project-filtered-status" },
+    { "id": "duplicate-action", "operation": "generate", "expect": "replay-or-payload-conflict" },
+    { "id": "expired-context", "operation": "all", "expect": "denied-before-port-use" },
+    { "id": "missing-provider", "operation": "generate", "expect": "unavailable-without-fake-success" }
+  ]
+}

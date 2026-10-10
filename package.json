@@ -2,13 +2,17 @@
   "name": "creative-engine",
   "version": "0.0.0",
   "private": true,
-  "description": "Creative contract proposals and standalone conformance fixtures",
+  "description": "Typed creative API runtime, contract proposals, and offline conformance fixtures",
   "type": "module",
   "engines": {
     "node": ">=22.23.3"
   },
   "types": "src/contracts/index.d.mts",
   "exports": {
+    "./api/v1": {
+      "types": "./src/api/v1.d.mts",
+      "import": "./src/api/v1.mjs"
+    },
     "./contracts": {
       "types": "./src/contracts/index.d.mts",
       "import": "./src/contracts/index.mjs"
@@ -32,12 +36,13 @@
   },
   "scripts": {
     "bootstrap": "npm ci --ignore-scripts --offline",
-    "build": "node scripts/runtime-check.mjs && node --check evals/creative/validator.mjs && node --check scripts/acceptance-gate.mjs && node --check src/contracts/validation.mjs && node --check src/contracts/scope.mjs && node --check src/contracts/creative/v1.mjs && node --check src/contracts/decision-port/v1.mjs && node --check src/contracts/metering.mjs && node --check src/contracts/approval-handoff.mjs && node --check src/contracts/index.mjs",
+    "build": "node scripts/runtime-check.mjs && node --check evals/creative/validator.mjs && node --check scripts/acceptance-gate.mjs && node --check src/contracts/validation.mjs && node --check src/contracts/scope.mjs && node --check src/contracts/creative/v1.mjs && node --check src/contracts/decision-port/v1.mjs && node --check src/contracts/metering.mjs && node --check src/contracts/approval-handoff.mjs && node --check src/contracts/index.mjs && node --check src/runtime/creative-runtime.mjs && node --check src/api/v1.mjs",
     "check:contracts": "node --test tests/contracts/creative-contract.test.mjs tests/contracts/fixture-manifest.test.mjs tests/contracts/dependency-boundary.test.mjs tests/contracts/acceptance-gate.test.mjs",
     "check:decision-contract": "node --test tests/contracts/decision-port.test.mjs tests/contracts/fixture-manifest.test.mjs tests/contracts/dependency-boundary.test.mjs tests/contracts/acceptance-gate.test.mjs",
     "check:eval-policy": "node --test tests/evaluation/*.test.mjs",
     "check:metering-contract": "node --test tests/contracts/metering/*.test.mjs",
     "check:handoff-contract": "node --test tests/contracts/approval/*.test.mjs",
-    "test": "node --test tests/contracts/*.test.mjs"
+    "check:api": "node scripts/runtime-check.mjs && node scripts/api-check.mjs --out build/api-check-evidence.json",
+    "test": "node --test tests/contracts/*.test.mjs tests/api/*.test.mjs"
   }
 }

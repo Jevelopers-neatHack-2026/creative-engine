@@ -1,0 +1,40 @@
+{
+  "contract": "EditPlan",
+  "schema_version": "1.0",
+  "event_id": "event-plan-edit-1",
+  "tenant_id": "tenant-api-1",
+  "project_id": "project-api-1",
+  "correlation_id": "correlation-plan-edit-1",
+  "producer": "fixture-api",
+  "occurred_at": "2026-10-10T12:03:00.000Z",
+  "ingested_at": "2026-10-10T12:03:00.000Z",
+  "environment": "test",
+  "billing_mode": "simulated",
+  "source_refs": ["source-api-1"],
+  "plan_id": "plan-edit-1",
+  "base": {
+    "brief_hash": "sha256:4128c720b3feae75564fb946f0c785f16c3c300fe57ee964ccb8ebe5d980c870",
+    "design_hash": "sha256:103e1315bec9fc880a0df83f51514a79176990d262bcb6061136280f279c13fb",
+    "design_version_id": "design-api-1"
+  },
+  "operation": "image.edit",
+  "steps": [
+    {
+      "step_id": "step-edit-1",
+      "action": "image.edit",
+      "source_refs": ["source-api-1"],
+      "parameters": {
+        "design_version_id": "design-api-1",
+        "artifact_id": "artifact-api-1",
+        "instruction": "Refine the balanced border while preserving the supplied event details."
+      }
+    }
+  ],
+  "expected_result": {
+    "contract": "DesignVersion",
+    "schema_version": "1.0",
+    "parent_version_id": "design-api-1",
+    "artifact_kind": "image"
+  },
+  "invalidates": []
+}

@@ -326,6 +326,7 @@ export async function executeMeteredAttempt({ port, request, trustedScope, dispa
   }
   id(reservation.reservation_id, 'reservation.reservation_id');
   id(reservation.billable_attempt_id, 'reservation.billable_attempt_id');
+  const reservationReference = reservation.reservation_id;
   if (reservation.billable_attempt_id !== attempt.billable_attempt_id) {
     fail('reservation_attempt_mismatch', 'Reservation is bound to a different billable attempt', 'reservation.billable_attempt_id');
   }
@@ -333,7 +334,7 @@ export async function executeMeteredAttempt({ port, request, trustedScope, dispa
   id(reservation.lease_id, 'reservation.lease_id');
 
   const reservationRef = {
-    reservation_id: reservation.reservation_id,
+    reservation_id: reservationReference,
     billable_attempt_id: attempt.billable_attempt_id,
     logical_operation_id: attempt.logical_operation_id,
     lease_id: reservation.lease_id,
@@ -352,7 +353,7 @@ export async function executeMeteredAttempt({ port, request, trustedScope, dispa
   try {
     const started = await port.markAttemptInFlight(reservationRef);
     record(started, 'in_flight_ack');
-    if (started.status !== 'in_flight' || started.reservation_id !== reservation.reservation_id) {
+    if (started.status !== 'in_flight' || started.reservation_id !== reservationReference) {
       fail('invalid_in_flight_ack', 'Metering authority did not confirm the held attempt as in flight', 'in_flight_ack');
     }
   } catch {
@@ -385,6 +386,7 @@ export async function executeMeteredAttempt({ port, request, trustedScope, dispa
   try {
     dispatchPromise = Promise.resolve(dispatch({
       attempt,
+      reservation_ref: reservationReference,
       signal,
       recordTransportAttempt: recordTransport,
     }));
@@ -472,7 +474,7 @@ export async function executeMeteredAttempt({ port, request, trustedScope, dispa
     return { status: 'settlement_unknown', published: false, ...safeOutcome, error_code: 'settlement_response_unknown', hold: 'retained_for_reconciliation' };
   }
   record(settlement, 'settlement');
-  if (settlement.reservation_id !== reservation.reservation_id) {
+  if (settlement.reservation_id !== reservationReference) {
     fail('settlement_reservation_mismatch', 'Settlement belongs to a different reservation', 'settlement.reservation_id');
   }
   if (settlement.status === 'held_for_reconciliation') {
@@ -480,7 +482,7 @@ export async function executeMeteredAttempt({ port, request, trustedScope, dispa
       status: 'settlement_pending',
       published: false,
       ...safeOutcome,
-      settlement: { reservation_id: reservation.reservation_id, status: 'held_for_reconciliation' },
+      settlement: { reservation_id: reservationReference, status: 'held_for_reconciliation' },
     };
   }
   if (settlement.status !== 'settled') {
@@ -489,7 +491,7 @@ export async function executeMeteredAttempt({ port, request, trustedScope, dispa
   validateExactAmount(settlement.consumed_amount, 'settlement.consumed_amount');
   validateExactAmount(settlement.released_unused_amount, 'settlement.released_unused_amount');
   const safeSettlement = {
-    reservation_id: reservation.reservation_id,
+    reservation_id: reservationReference,
     status: 'settled',
     consumed_amount: { amount: settlement.consumed_amount.amount, currency: settlement.consumed_amount.currency },
     released_unused_amount: { amount: settlement.released_unused_amount.amount, currency: settlement.released_unused_amount.currency },

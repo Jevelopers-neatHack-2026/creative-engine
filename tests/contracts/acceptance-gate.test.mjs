@@ -34,6 +34,15 @@ test("canonical owner acceptance gate reports missing C01 and C02 agreements as 
   assert.match(creative.stderr, /event_intelligence_producer/);
   assert.match(creative.stderr, /trusted_project_membership/);
 
+  const api = spawnSync(process.execPath, ["scripts/acceptance-gate.mjs", "api"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  assert.equal(api.status, 2);
+  assert.match(api.stderr, /shared_contracts_creative_schemas/);
+  assert.match(api.stderr, /event_intelligence_producer/);
+  assert.match(api.stderr, /trusted_project_membership/);
+
   for (const [target, expectedIds] of [
     ["metering-contract", ["finance_metering_budget_protocol", "shared_contracts_usage_budget_schemas"]],
     ["handoff-contract", ["product_approval_protocol_and_consumer", "production_artwork_handoff", "shared_contracts_approval_handoff_schemas"]],

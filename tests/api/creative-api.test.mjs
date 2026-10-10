@@ -1,0 +1,1042 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import test from "node:test";
+import { canonicalHash, computeDesignVersionHash } from "../../src/contracts/index.mjs";
+import { createConsumptionReceipt, hashCompositionLayerManifest } from "../../src/contracts/approval-handoff.mjs";
+import { FakeMeteringAuthority } from "../../fixtures/contracts/metering/fake-authority.mjs";
+import { createCreativeApi } from "../../src/api/v1.mjs";
+
+const FIXTURE = async (name) => JSON.parse(await readFile(new URL(`../../fixtures/api/${name}.json`, import.meta.url), "utf8"));
+const NOW = Date.parse("2026-10-10T12:30:00.000Z");
+const PERMISSIONS = [
+  "creative.generate", "creative.edit", "creative.read", "creative.restore",
+  "creative.cancel", "creative.handoff",
+];
+
+let requestNumber = 0;
+function request(operation, payload, action_id) {
+  requestNumber += 1;
+  return {
+    contract: "CreativeApiRequest",
+    schema_version: "1.0",
+    event_id: `event-${requestNumber}`,
+    request_id: `request-${requestNumber}`,
+    tenant_id: "tenant-api-1",
+    project_id: "project-api-1",
+    correlation_id: `correlation-${requestNumber}`,
+    producer: "creative-api-tests",
+    occurred_at: "2026-10-10T12:20:00.000Z",
+    ingested_at: "2026-10-10T12:20:00.000Z",
+    environment: "test",
+    billing_mode: "simulated",
+    source_refs: ["source-api-1"],
+    operation,
+    ...(action_id ? { action_id } : {}),
+    payload,
+  };
+}
+
+function actor(overrides = {}) {
+  return {
+    actor_id: "actor-api-1",
+    tenant_id: "tenant-api-1",
+    project_id: "project-api-1",
+    expires_at: "2026-10-11T00:00:00.000Z",
+    permissions: [...PERMISSIONS],
+    budget_scope_id: "budget-api-1",
+    budget_policy_version: "budget-policy/1",
+    ...overrides,
+  };
+}
+
+function versionFrom(base, patch = {}) {
+  const next = { ...base, ...patch, design_hash: undefined };
+  delete next.design_hash;
+  return { ...next, design_hash: computeDesignVersionHash(next) };
+}
+
+function sortedVersions(values) {
+  return [...values].sort((a, b) => b.occurred_at.localeCompare(a.occurred_at) || a.design_version_id.localeCompare(b.design_version_id));
+}
+
+function afterCursor(item, cursor) {
+  return item.occurred_at < cursor.occurred_at ||
+    (item.occurred_at === cursor.occurred_at && item.design_version_id > cursor.design_version_id);
+}
+
+function makeHarness({ withDesign = true, providerImpl, omit = [], foreignDesign = false, longReservationId = false } = {}) {
+  const brief = awaitableCloneBrief();
+  const designs = new Map();
+  const current = new Map();
+  const selectionRevisions = new Map();
+  const records = new Map();
+  const actions = new Map();
+  const cancelActions = new Map();
+  const handoffContexts = new Map();
+  const stateArtifactBytes = new Map();
+  const leaseTokens = new Map();
+  const dispatchIntents = [];
+  const calls = { storage: [], provider: 0, reserve: 0, usage: [], approval: 0, handoff: 0, cancel: 0, inspection: 0, decision: 0,
+    decisionReservationRefs: [], traces: [] };
+  let generated = 0;
+  let jobCounter = 0;
+  let idCounter = 0;
+  let dispatchIntentCounter = 0;
+  const lockQueues = new Map();
+
+  function withLock(key, work) {
+    const prior = lockQueues.get(key) ?? Promise.resolve();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const queued = prior.then(() => gate);
+    lockQueues.set(key, queued);
+    return prior.then(work).finally(() => {
+      release();
+      if (lockQueues.get(key) === queued) lockQueues.delete(key);
+    });
+  }
+
+  function jobKey(scope, actorId, actionId) {
+    return `${scope.tenant_id}/${scope.project_id}/${actorId}/${actionId}`;
+  }
+
+  const jobs = {
+    begin(input) {
+      const key = jobKey(input.scope, input.actor_id, input.action_id);
+      const old = actions.get(key);
+      if (old) {
+        const job = records.get(old);
+        return job.request_hash === input.request_hash ? { kind: "existing", job } : { kind: "conflict" };
+      }
+      jobCounter += 1;
+      const job = {
+        tenant_id: input.scope.tenant_id,
+        project_id: input.scope.project_id,
+        ...(input.scope.brief_id ? { brief_id: input.scope.brief_id } : {}),
+        actor_id: input.actor_id,
+        action_id: input.action_id,
+        operation: input.operation,
+        job_id: `job-api-${jobCounter}`,
+        status: "running",
+        request_hash: input.request_hash,
+      };
+      records.set(job.job_id, job);
+      actions.set(key, job.job_id);
+      const lease_token = `lease-${job.job_id}`;
+      leaseTokens.set(job.job_id, lease_token);
+      return { kind: "started", job_id: job.job_id, lease_token };
+    },
+    async authorizeDispatch(input) {
+      return withLock(input.job_id, async () => {
+        const job = records.get(input.job_id);
+        if (!job || job.tenant_id !== input.scope.tenant_id || job.project_id !== input.scope.project_id ||
+          job.actor_id !== input.actor_id || job.action_id !== input.action_id || job.operation !== input.operation ||
+          leaseTokens.get(input.job_id) !== input.lease_token) return { status: "lease_lost" };
+        if (job.status === "cancelled") return { status: "cancelled" };
+        if (job.status !== "running") return { status: "lease_lost" };
+        dispatchIntentCounter += 1;
+        const dispatch_intent_ref = `dispatch-intent:${input.job_id}:${dispatchIntentCounter}`;
+        dispatchIntents.push({ job_id: input.job_id, transport_attempt_id: input.transport_attempt_id,
+          billable_attempt_id: input.billable_attempt_id, dispatch_intent_ref });
+        return { status: "authorized", dispatch_intent_ref };
+      });
+    },
+    async completeIfActive(input, publish) {
+      return withLock(input.job_id, async () => {
+        const job = records.get(input.job_id);
+        if (!job || job.tenant_id !== input.scope.tenant_id || job.project_id !== input.scope.project_id ||
+          job.actor_id !== input.actor_id || input.lease_token !== leaseTokens.get(input.job_id)) return { status: "cancelled" };
+        if (job.status === "cancelled") return { status: "cancelled", job };
+        if (job.status === "completed") return { status: "completed", job, result: job.result };
+        const publishResult = await publish();
+        job.status = "completed";
+        job.result = input.result;
+        job.publish_result = publishResult;
+        return { status: "completed", job, result: input.result };
+      });
+    },
+    async failIfActive(input) {
+      return withLock(input.job_id, async () => {
+        const job = records.get(input.job_id);
+        if (!job || job.tenant_id !== input.scope.tenant_id || job.project_id !== input.scope.project_id ||
+          job.actor_id !== input.actor_id || input.lease_token !== leaseTokens.get(input.job_id)) return { status: "cancelled", job };
+        if (job.status === "cancelled") return { status: "cancelled", job };
+        if (job.status !== "running") return { status: "cancelled", job };
+        job.status = "failed";
+        job.error = input.error;
+        return { status: "failed", job };
+      });
+    },
+    get(input) {
+      const job = records.get(input.job_id);
+      if (!job || job.tenant_id !== input.scope.tenant_id || job.project_id !== input.scope.project_id) return null;
+      return job;
+    },
+    async cancel(input) {
+      calls.cancel += 1;
+      return withLock(input.job_id, async () => {
+        const cancellationKey = jobKey(input.scope, input.actor_id, input.action_id);
+        const previous = cancelActions.get(cancellationKey);
+        if (previous) {
+          if (previous.request_hash !== input.request_hash || previous.target_action_id !== input.target_action_id) return { kind: "conflict" };
+          const existing = records.get(previous.job_id);
+          return existing ? { kind: "replayed", job: existing } : { kind: "not_found" };
+        }
+        const job = records.get(input.job_id);
+        if (!job || job.tenant_id !== input.scope.tenant_id || job.project_id !== input.scope.project_id ||
+          job.action_id !== input.target_action_id) return { kind: "not_found" };
+        if (job.status === "running" || job.status === "queued") job.status = "cancelled";
+        cancelActions.set(cancellationKey, { request_hash: input.request_hash, target_action_id: input.target_action_id, job_id: job.job_id });
+        return { kind: "cancelled", job };
+      });
+    },
+  };
+
+  const storage = {
+    getBrief(input) {
+      calls.storage.push({ method: "getBrief", scope: input.scope });
+      if (input.scope.tenant_id !== brief.tenant_id || input.scope.project_id !== brief.project_id || input.brief_id !== brief.brief_id) return null;
+      return structuredClone(brief);
+    },
+    getDesignVersion(input) {
+      calls.storage.push({ method: "getDesignVersion", scope: input.scope });
+      if (foreignDesign) return { ...structuredClone(designs.get(input.design_version_id) ?? (withDesign ? initialDesign : {})), project_id: "foreign-project" };
+      if (input.scope.tenant_id !== brief.tenant_id || input.scope.project_id !== brief.project_id) return null;
+      const design = designs.get(input.design_version_id);
+      if (!design || design.brief_id !== input.brief_id) return null;
+      return structuredClone(design);
+    },
+    getCurrentDesignVersion(input) {
+      calls.storage.push({ method: "getCurrentDesignVersion", scope: input.scope });
+      const id = current.get(input.brief_id);
+      return id ? structuredClone(designs.get(id)) : null;
+    },
+    getSelection(input) {
+      calls.storage.push({ method: "getSelection", scope: input.scope });
+      const id = current.get(input.brief_id);
+      return id ? { tenant_id: brief.tenant_id, project_id: brief.project_id, brief_id: input.brief_id,
+        design_version_id: id, revision: selectionRevisions.get(input.brief_id) ?? 0 } : null;
+    },
+    listDesignVersions(input) {
+      calls.storage.push({ method: "listDesignVersions", scope: input.scope });
+      let items = sortedVersions([...designs.values()].filter((item) => item.brief_id === input.brief_id));
+      if (input.after) items = items.filter((item) => afterCursor(item, input.after));
+      const has_more = items.length > input.limit;
+      return { items: items.slice(0, input.limit), has_more };
+    },
+    saveDesignVersion(input) {
+      calls.storage.push({ method: "saveDesignVersion", scope: input.scope });
+      if (input.scope.tenant_id !== brief.tenant_id || input.scope.project_id !== brief.project_id) throw new Error("foreign scope");
+      const currentId = current.get(input.brief_id) ?? null;
+      if (currentId !== input.expected_current_design_version_id) return { status: "stale" };
+      designs.set(input.design_version.design_version_id, structuredClone(input.design_version));
+      current.set(input.brief_id, input.design_version.design_version_id);
+      selectionRevisions.set(input.brief_id, (selectionRevisions.get(input.brief_id) ?? 0) + 1);
+      return { status: "saved" };
+    },
+    selectDesignVersion(input) {
+      calls.storage.push({ method: "selectDesignVersion", scope: input.scope });
+      if (input.scope.tenant_id !== brief.tenant_id || input.scope.project_id !== brief.project_id) throw new Error("foreign scope");
+      if (!designs.has(input.design_version_id)) return { status: "stale" };
+      const revision = selectionRevisions.get(input.brief_id) ?? 0;
+      if (revision !== input.expected_selection_revision) return { status: "stale" };
+      current.set(input.brief_id, input.design_version_id);
+      selectionRevisions.set(input.brief_id, revision + 1);
+      return { status: "selected", selection: { tenant_id: brief.tenant_id, project_id: brief.project_id,
+        brief_id: input.brief_id, design_version_id: input.design_version_id, revision: revision + 1 } };
+    },
+    getBriefForDesign(input) {
+      calls.storage.push({ method: "getBriefForDesign", scope: input.scope });
+      const design = designs.get(input.design_version_id);
+      if (!design || design.tenant_id !== input.scope.tenant_id || design.project_id !== input.scope.project_id) return null;
+      return { tenant_id: design.tenant_id, project_id: design.project_id, brief_id: design.brief_id };
+    },
+    getHandoffContext(input) {
+      calls.storage.push({ method: "getHandoffContext", scope: input.scope });
+      const design = designs.get(input.design_version_id);
+      if (!design || design.tenant_id !== input.scope.tenant_id || design.project_id !== input.scope.project_id) return null;
+      const key = design.design_version_id;
+      if (!handoffContexts.has(key)) {
+        const bytes = stateArtifactBytes.get(design.artifact.artifact_id) ?? Buffer.from("fixture artwork bytes");
+        const artworkHash = design.artifact.content_hash.replace(/^sha256:/, "");
+        const artifact = { artifact_id: design.artifact.artifact_id, locator_ref: `artifact-locator:${design.artifact.artifact_id}`,
+          sha256: artworkHash, mime_type: design.artifact.media_type, width_px: 640, height_px: 480, access_policy_ref: "access-policy-fixture-1" };
+        const binding = {
+          tenant_id: design.tenant_id, project_id: design.project_id,
+          design_version: { design_version_id: design.design_version_id, artwork_sha256: artworkHash },
+          brief: { brief_id: brief.brief_id, sha256: canonicalHash(brief).slice(7) },
+          facts: { revision_id: "facts-revision-1", sha256: canonicalHash(brief.facts).slice(7) },
+          assets: [],
+          composition: { composition_id: `composition:${design.design_version_id}`, revision_id: "composition-revision-1", sha256: "0".repeat(64) },
+          preview_sha256: createHash("sha256").update("fixture preview").digest("hex"),
+        };
+        const layer_manifest = [{ layer_id: "artwork-layer-1", kind: "artwork", artifact_id: artifact.artifact_id, sha256: artifact.sha256 }];
+        binding.composition.sha256 = hashCompositionLayerManifest({ binding, artifact, layer_manifest, trustedScope: input.scope });
+        handoffContexts.set(key, { binding, artifact, layer_manifest });
+        if (!stateArtifactBytes.has(artifact.artifact_id)) stateArtifactBytes.set(artifact.artifact_id, bytes);
+      }
+      return structuredClone(handoffContexts.get(key));
+    },
+  };
+
+  const imageRoute = { retry_mapping_ref: "retry:image-v1", provider: {
+    name: "fixture-provider", model: "fixture-model", endpoint: "test:/image", sdk: { name: "fixture-sdk", version: "1.0" },
+  } };
+  const provider = {
+    resolveRoute() { return structuredClone(imageRoute); },
+    async generate(input) {
+      calls.provider += 1;
+      await input.recordTransportAttempt(input.transport_attempt_id);
+      return providerImpl ? providerImpl("generate", input) : providerOutput();
+    },
+    async edit(input) {
+      calls.provider += 1;
+      await input.recordTransportAttempt(input.transport_attempt_id);
+      return providerImpl ? providerImpl("edit", input) : providerOutput();
+    },
+  };
+
+  function providerOutput() {
+    generated += 1;
+    return {
+      design_version_id: `generated-design-${generated}`,
+      artifact: {
+        artifact_id: `generated-artifact-${generated}`,
+        content_hash: `sha256:${String(generated).padStart(64, "c")}`,
+        media_type: "image/png",
+      },
+      provider: "fixture-provider",
+      model: "fixture-model",
+      usage: { completeness: "complete", input_tokens: 12, output_tokens: 24 },
+    };
+  }
+
+  const authority = new FakeMeteringAuthority({ budget: "100.00", defaultHold: "1.00", defaultConsumed: "0.10" });
+  if (longReservationId) {
+    const originalReserve = authority.reserveAttempt.bind(authority);
+    authority.reserveAttempt = async (value) => {
+      const response = await originalReserve(value);
+      const oldId = response.reservation_id;
+      const stored = authority.reservations.get(oldId);
+      const longId = "r".repeat(256);
+      authority.reservations.delete(oldId);
+      stored.reservation_id = longId;
+      authority.reservations.set(longId, stored);
+      authority.byAttempt.set(value.billable_attempt_id, longId);
+      response.reservation_id = longId;
+      return response;
+    };
+  }
+  const metering = {
+    reserveAttempt(input) { calls.reserve += 1; return authority.reserveAttempt(input); },
+    releaseBeforeDispatch: (input) => authority.releaseBeforeDispatch(input),
+    markAttemptInFlight: (input) => authority.markAttemptInFlight(input),
+    recordTransportAttempt: (input) => authority.recordTransportAttempt(input),
+    recordUsageObservation(input) { calls.usage.push(input.observation); return authority.recordUsageObservation(input); },
+    settleReservation: (input) => authority.settleReservation(input),
+    markOutcomeUnknown: (input) => authority.markOutcomeUnknown(input),
+  };
+  const approval = {
+    verifyApproval(input) {
+      calls.approval += 1;
+      return { status: "valid", verified_binding: structuredClone(input.expected_binding), approval: {
+        approval_reference: input.approval_reference, approval_id: "approval-fixture-1", issuer_id: "issuer-fixture-1",
+        audience: input.expected_audience, issued_at: "2026-10-10T12:00:00.000Z", expires_at: "2026-10-11T12:00:00.000Z",
+        key_id: "key-fixture-1", key_set_version: "keys-fixture/1",
+        revocation: { status: "active", checked_at: "2026-10-10T12:00:00.000Z", record_ref: "revocation-fixture-1" },
+      } };
+    },
+  };
+  const handoff = {
+    resolveDestination() { return { expected_audience: "print-service-fixture" }; },
+    submit(input) {
+      calls.handoff += 1;
+      const design = designs.get(input.handoff.binding.design_version.design_version_id);
+      const bytes = stateArtifactBytes.get(design.artifact.artifact_id) ?? Buffer.from("fixture artwork bytes");
+      return createConsumptionReceipt({ handoff: input.handoff,
+        artifactBytesById: { [design.artifact.artifact_id]: bytes },
+        trustedScope: input.scope, consumer_id: "consumer-fixture-1", receipt_id: `receipt-${calls.handoff}`,
+        access_grants: [{ artifact_id: design.artifact.artifact_id, grant_ref: `grant-${calls.handoff}` }],
+        consumed_at: "2026-10-10T12:30:00.000Z", now: new Date(NOW) });
+    },
+  };
+  const inspection = {
+    resolveRoute() { return { retry_mapping_ref: "retry:vision-v1", provider: {
+      name: "fixture-vision", model: "fixture-vision-model", endpoint: "test:/inspect", sdk: { name: "fixture-sdk", version: "1.0" },
+    } }; },
+    async inspect(input) {
+      calls.inspection += 1;
+      const transport_attempt_id = `transport:inspect:${calls.inspection}`;
+      await input.recordTransportAttempt(transport_attempt_id);
+      return { tenant_id: input.scope.tenant_id, project_id: input.scope.project_id, brief_id: input.brief.brief_id,
+        design_version_id: input.design_version.design_version_id, artifact_id: input.design_version.artifact.artifact_id,
+        artifact_hash: input.design_version.artifact.content_hash, design_hash: input.design_version.design_hash,
+        inspection_id: `inspection-${calls.inspection}`, observations: [],
+        usage: { completeness: "complete", input_tokens: 1, output_tokens: 1, transport_attempt_id } };
+    },
+  };
+  const trace = { record(event) { calls.traces.push(event); } };
+  const decisionPort = {
+    resolveRoute() { return { retry_mapping_ref: "retry:jev-v1", provider: {
+      name: "fixture-jev", model: "jev-1.13.0", endpoint: "test:/jev", sdk: { name: "fixture-sdk", version: "1.0" },
+    } }; },
+    execute: async ({ request: input }) => { calls.decision += 1;
+      calls.decisionReservationRefs.push(input.budget_ref.reservation_ref);
+      return ({ contract: "DecisionPortResult", schema_version: "1.0",
+      event_id: `result:${input.event_id}`, tenant_id: input.tenant_id, project_id: input.project_id,
+      correlation_id: input.correlation_id, producer: "fixture-jev", occurred_at: input.occurred_at,
+      ingested_at: input.ingested_at, environment: input.environment, billing_mode: input.billing_mode,
+      source_refs: input.source_refs, request_id: input.request_id, logical_operation_id: input.logical_operation_id,
+      billable_attempt_id: input.billable_attempt_id, model_id: input.model_policy.model_id,
+      model_policy_version: input.model_policy.policy_version, status: "complete", job_id: input.job_id,
+      answers: Object.fromEntries(Object.entries(input.questions).map(([key, q]) => [key, q.type === "noul"
+        ? { status: "answered", question_schema_version: q.question_schema_version, policy_version: q.policy_version, answer: { type: "noul", noul: 0.2 } }
+        : q.type === "choice"
+          ? { status: "answered", question_schema_version: q.question_schema_version, policy_version: q.policy_version,
+            answer: { type: "choice", choice: q.eligible_candidate_ids[0], probabilities: Object.fromEntries(q.eligible_candidate_ids.map((candidate, index) => [candidate, index === 0 ? 1 : 0])), confidence: 1 } }
+          : { status: "answered", question_schema_version: q.question_schema_version, policy_version: q.policy_version,
+            answer: { type: "score", score: 0, legend: Object.fromEntries(q.criteria.map((value, index) => [String(index), value])),
+              probabilities: Object.fromEntries(q.criteria.map((_, index) => [String(index), index === 0 ? 1 : 0])), confidence: 1 } }])),
+      usage: { completeness: "complete", input_tokens: 1, output_tokens: 1, provider_request_id: `provider:jev:${input.billable_attempt_id}` } }); },
+  };
+  const portMap = { jobs, storage, provider, metering, approval, handoff, trace, decisionPort, inspection };
+  for (const key of omit) delete portMap[key];
+
+  const api = createCreativeApi({
+    ports: portMap,
+    now: () => NOW,
+    idFactory: () => { idCounter += 1; return `generated-id-${idCounter}`; },
+  });
+  const state = { brief, designs, current, selectionRevisions, jobs: records, actions, calls, authority, handoffContexts,
+    stateArtifactBytes, leaseTokens, dispatchIntents };
+  return { api, state, ports: portMap };
+
+}
+
+let briefFixture;
+let initialDesign;
+function awaitableCloneBrief() {
+  return structuredClone(briefFixture);
+}
+
+async function setup(options = {}) {
+  briefFixture = await FIXTURE("brief");
+  initialDesign = await FIXTURE("design-version");
+  const artworkBytes = Buffer.from("fixture artwork bytes");
+  initialDesign = versionFrom(initialDesign, { artifact: { ...initialDesign.artifact,
+    content_hash: "sha256:" + createHash("sha256").update(artworkBytes).digest("hex") } });
+  const harness = makeHarness(options);
+  if (options.withDesign !== false) {
+    harness.state.designs.set(initialDesign.design_version_id, structuredClone(initialDesign));
+    harness.state.current.set(initialDesign.brief_id, initialDesign.design_version_id);
+    harness.state.selectionRevisions.set(initialDesign.brief_id, 0);
+    harness.state.stateArtifactBytes.set(initialDesign.artifact.artifact_id, artworkBytes);
+    if (options.secondDesign) {
+      const second = versionFrom(initialDesign, {
+        event_id: "event-design-2",
+        occurred_at: "2026-10-10T12:04:00.000Z",
+        ingested_at: "2026-10-10T12:04:00.000Z",
+        design_version_id: "design-api-2",
+        parent_version_id: initialDesign.design_version_id,
+        artifact: { artifact_id: "artifact-api-2", content_hash: `sha256:${"d".repeat(64)}`, media_type: "image/png" },
+      });
+      harness.state.designs.set(second.design_version_id, second);
+      harness.state.current.set(second.brief_id, second.design_version_id);
+      harness.state.selectionRevisions.set(second.brief_id, 1);
+    }
+  }
+  return harness;
+}
+
+function generationRequest(actionId = "action-generate-1") {
+  return request("generate", { brief_id: "brief-api-1", plan: structuredClone(generatePlan) }, actionId);
+}
+
+function validDecisionInput() {
+  return { execution_mode: "independent_batch", state: { text: "Choose the clearest layout." },
+    questions: { layout_choice: { type: "choice", question_schema_version: "1.0", policy_version: "layout/1",
+      instructions: "Choose one eligible layout.", criteria: { compact: "Compact", wide: "Wide" },
+      eligible_candidate_ids: ["compact", "wide"], policy: { minimum_confidence: 0.5, low_confidence_action: "review" } } } };
+}
+
+function boundEditPlan(state, designVersionId = "design-api-1") {
+  const plan = structuredClone(editPlan);
+  const design = state.designs.get(designVersionId);
+  plan.base.brief_hash = canonicalHash(state.brief);
+  plan.base.design_hash = design.design_hash;
+  plan.base.design_version_id = designVersionId;
+  plan.expected_result.parent_version_id = designVersionId;
+  for (const step of plan.steps) {
+    if (step.parameters.design_version_id !== undefined) step.parameters.design_version_id = designVersionId;
+    if (step.parameters.artifact_id !== undefined) step.parameters.artifact_id = design.artifact.artifact_id;
+  }
+  return plan;
+}
+
+let generatePlan;
+let editPlan;
+async function loadPlans() {
+  generatePlan = await FIXTURE("generate-plan");
+  editPlan = await FIXTURE("edit-plan");
+}
+
+test("fixture scenario manifest covers every API operation and negative boundary", async () => {
+  await loadPlans();
+  const scenarios = await FIXTURE("scenarios");
+  const operations = new Set(scenarios.cases.map((item) => item.operation));
+  for (const operation of ["generate", "edit", "inspect", "list", "compare", "restore", "cancel", "handoff", "job.status"]) {
+    assert.ok(operations.has(operation), `scenario missing ${operation}`);
+  }
+  assert.equal(scenarios.dependency_mode, "mock");
+});
+
+test("valid generation is metered before dispatch and publishes a validated immutable version", async () => {
+  await loadPlans();
+  const { api, state } = await setup({ withDesign: false });
+  const response = await api.invoke(actor(), generationRequest());
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(response.job.status, "completed");
+  assert.equal(response.result.design_version.parent_version_id, null);
+  assert.equal(response.result.design_version.brief_id, "brief-api-1");
+  assert.equal(state.calls.reserve, 1);
+  assert.equal(state.calls.provider, 1);
+  assert.equal(state.calls.usage.length, 1);
+  assert.equal(state.calls.usage[0].completeness, "complete");
+  assert.equal(state.designs.has(response.result.design_version.design_version_id), true);
+});
+
+test("edit checks current version, known source/artifact references, and parent linkage", async () => {
+  await loadPlans();
+  const { api, state } = await setup();
+  const response = await api.invoke(actor(), request("edit", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", plan: boundEditPlan(state),
+  }, "action-edit-1"));
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(response.result.design_version.parent_version_id, "design-api-1");
+  assert.equal(state.calls.provider, 1);
+  assert.equal(state.current.get("brief-api-1"), response.result.design_version.design_version_id);
+});
+
+test("malformed and unsupported requests fail before billing or provider dispatch", async () => {
+  await loadPlans();
+  const { api, state } = await setup({ withDesign: false });
+  const unsupported = generationRequest();
+  unsupported.schema_version = "2.0";
+  assert.equal((await api.invoke(actor(), unsupported)).error.code, "unsupported_version");
+  const malformed = generationRequest();
+  malformed.operation = "tool.execute";
+  assert.equal((await api.invoke(actor(), malformed)).error.code, "invalid_request");
+  const badPlan = structuredClone(generatePlan);
+  badPlan.operation = "privileged.dynamic.action";
+  const badBody = request("generate", { brief_id: "brief-api-1", plan: badPlan }, "action-bad-plan");
+  assert.equal((await api.invoke(actor(), badBody)).ok, false);
+  assert.equal(state.calls.provider, 0);
+  assert.equal(state.calls.reserve, 0);
+});
+
+test("every API operation rejects expired trusted context before touching any port", async () => {
+  await loadPlans();
+  const expired = actor({ expires_at: "2026-10-10T12:29:59.999Z" });
+  const requests = [
+    generationRequest(),
+    request("edit", { brief_id: "brief-api-1", design_version_id: "design-api-1", plan: structuredClone(editPlan) }, "edit-expired"),
+    request("inspect", { brief_id: "brief-api-1", design_version_id: "design-api-1" }, "inspect-expired"),
+    request("list", { brief_id: "brief-api-1" }),
+    request("compare", { brief_id: "brief-api-1", left_design_version_id: "design-api-1", right_design_version_id: "design-api-1" }),
+    request("restore", { brief_id: "brief-api-1", target_design_version_id: "design-api-1", expected_selection_revision: 0 }, "restore-expired"),
+    request("cancel", { job_id: "job-existing" }, "cancel-expired"),
+    request("handoff", { brief_id: "brief-api-1", design_version_id: "design-api-1", approval_ref: "approval-1", destination_ref: "print-1" }, "handoff-expired"),
+    request("job.status", { job_id: "job-existing" }),
+  ];
+  for (const item of requests) {
+    const { api, state } = await setup();
+    const response = await api.invoke(expired, item);
+    assert.equal(response.ok, false, item.operation);
+    assert.equal(response.error.code, "unauthorized", item.operation);
+    assert.equal(state.calls.storage.length, 0, item.operation);
+    assert.equal(state.calls.provider, 0, item.operation);
+  }
+});
+
+test("forged tenant or project scope and foreign artifact records never cross storage boundaries", async () => {
+  await loadPlans();
+  const harness = await setup({ foreignDesign: true });
+  const forged = request("inspect", { brief_id: "brief-api-1", design_version_id: "design-api-1" }, "inspect-forged");
+  forged.project_id = "other-project";
+  assert.equal((await harness.api.invoke(actor(), forged)).error.code, "scope_denied");
+  const foreign = request("inspect", { brief_id: "brief-api-1", design_version_id: "design-api-1" }, "inspect-foreign");
+  assert.equal((await harness.api.invoke(actor(), foreign)).error.code, "scope_denied");
+  assert.equal(harness.state.calls.provider, 0);
+});
+
+test("inspect, compare, and list use scoped reads and deterministic keyset pagination", async () => {
+  await loadPlans();
+  const { api, state } = await setup({ secondDesign: true });
+  const inspected = await api.invoke(actor(), request("inspect", { brief_id: "brief-api-1", design_version_id: "design-api-1" }, "inspect-valid"));
+  assert.equal(inspected.ok, true, JSON.stringify(inspected));
+  const compared = await api.invoke(actor(), request("compare", {
+    brief_id: "brief-api-1", left_design_version_id: "design-api-1", right_design_version_id: "design-api-2",
+  }));
+  assert.equal(compared.ok, true);
+  assert.deepEqual(compared.result.changed_fields, ["artifact.content_hash", "parent_version_id"]);
+  const first = await api.invoke(actor(), request("list", { brief_id: "brief-api-1", limit: 1 }));
+  assert.equal(first.ok, true);
+  assert.equal(first.result.items.length, 1);
+  assert.equal(first.result.items[0].design_version_id, "design-api-2");
+  assert.ok(first.result.next_cursor);
+  const second = await api.invoke(actor(), request("list", { brief_id: "brief-api-1", limit: 1, cursor: first.result.next_cursor }));
+  assert.equal(second.result.items[0].design_version_id, "design-api-1");
+  assert.equal(second.result.next_cursor, null);
+  const forgedCursor = Buffer.from(JSON.stringify({ tenant_id: "other", project_id: "project-api-1", brief_id: "brief-api-1",
+    occurred_at: "2026-10-10T12:04:00.000Z", design_version_id: "design-api-2" })).toString("base64url");
+  assert.equal((await api.invoke(actor(), request("list", { brief_id: "brief-api-1", cursor: forgedCursor }))).error.code, "invalid_request");
+  assert.equal(state.calls.provider, 0);
+});
+
+test("inspection output omits unknown provider usage fields and untrusted notes", async () => {
+  await loadPlans();
+  const { api, ports, state } = await setup();
+  const inspect = ports.inspection.inspect;
+  ports.inspection.inspect = async (input) => ({ ...(await inspect(input)), usage: {
+    completeness: "complete", input_tokens: 1, output_tokens: 1,
+    transport_attempt_id: `transport:inspect:${state.calls.inspection}`,
+    access_token: "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+    reason: "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+  } });
+  const response = await api.invoke(actor(), request("inspect", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1",
+  }, "inspect-usage-scrub"));
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.deepEqual(response.result.usage, { completeness: "complete", input_tokens: 1, output_tokens: 1 });
+  assert.equal(JSON.stringify(response).includes("SYNTHETIC-NOT-A-REAL-CREDENTIAL"), false);
+});
+
+test("restore selects the existing immutable version by selection CAS without creating a version", async () => {
+  await loadPlans();
+  const { api, state } = await setup({ secondDesign: true });
+  const restored = await api.invoke(actor(), request("restore", {
+    brief_id: "brief-api-1", target_design_version_id: "design-api-1", expected_selection_revision: 1,
+  }, "action-restore-1"));
+  assert.equal(restored.ok, true, JSON.stringify(restored));
+  assert.deepEqual(restored.result.selection, { tenant_id: "tenant-api-1", project_id: "project-api-1", brief_id: "brief-api-1",
+    design_version_id: "design-api-1", revision: 2 });
+  assert.equal(state.designs.size, 2);
+  assert.equal(state.designs.get("design-api-1").design_hash, initialDesign.design_hash);
+  assert.equal(state.designs.has("design-api-2"), true);
+  assert.equal(state.current.get("brief-api-1"), "design-api-1");
+  assert.equal(state.calls.provider, 0);
+});
+
+test("completed restore replay reports its original selection after later selection changes", async () => {
+  await loadPlans();
+  const { api, state } = await setup({ secondDesign: true });
+  const firstRequest = request("restore", {
+    brief_id: "brief-api-1", target_design_version_id: "design-api-1", expected_selection_revision: 1,
+  }, "action-restore-replay");
+  const first = await api.invoke(actor(), firstRequest);
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(first.result.selection.revision, 2);
+
+  const later = await api.invoke(actor(), request("restore", {
+    brief_id: "brief-api-1", target_design_version_id: "design-api-2", expected_selection_revision: 2,
+  }, "action-restore-later"));
+  assert.equal(later.ok, true, JSON.stringify(later));
+  assert.equal(state.current.get("brief-api-1"), "design-api-2");
+  assert.equal(state.selectionRevisions.get("brief-api-1"), 3);
+
+  const replay = structuredClone(firstRequest);
+  replay.event_id = "restore-replay-event";
+  replay.request_id = "restore-replay-request";
+  replay.correlation_id = "restore-replay-correlation";
+  const repeated = await api.invoke(actor(), replay);
+  assert.equal(repeated.ok, true, JSON.stringify(repeated));
+  assert.equal(repeated.replayed, true);
+  assert.equal(repeated.result.selection.design_version_id, "design-api-1");
+  assert.equal(repeated.result.selection.revision, 2);
+  assert.equal(state.current.get("brief-api-1"), "design-api-2");
+  assert.equal(state.selectionRevisions.get("brief-api-1"), 3);
+  assert.equal(state.calls.provider, 0);
+});
+
+test("stale edit and restore versions fail before any provider dispatch", async () => {
+  await loadPlans();
+  const { api, state } = await setup({ secondDesign: true });
+  const edit = await api.invoke(actor(), request("edit", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", plan: boundEditPlan(state),
+  }, "action-stale-edit"));
+  assert.equal(edit.error.code, "stale_version");
+  const restore = await api.invoke(actor(), request("restore", {
+    brief_id: "brief-api-1", target_design_version_id: "design-api-1", expected_selection_revision: 0,
+  }, "action-stale-restore"));
+  assert.equal(restore.error.code, "stale_version");
+  assert.equal(state.calls.provider, 0);
+  assert.equal(state.calls.reserve, 0);
+});
+
+test("same action identity replays and changed payload conflicts, including concurrent duplicates", async () => {
+  await loadPlans();
+  let started;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const begun = new Promise((resolve) => { started = resolve; });
+  const harness = await setup({ withDesign: false, providerImpl: async () => {
+    started();
+    await gate;
+    return {
+      design_version_id: "design-concurrent-1",
+      artifact: { artifact_id: "artifact-concurrent-1", content_hash: `sha256:${"e".repeat(64)}`, media_type: "image/png" },
+      provider: "fixture-provider", model: "fixture-model", usage: { completeness: "complete", input_tokens: 2, output_tokens: 3 },
+    };
+  } });
+  const firstRequest = generationRequest("action-dedupe-1");
+  const firstPromise = harness.api.invoke(actor(), firstRequest);
+  await begun;
+  const retry = structuredClone(firstRequest);
+  retry.event_id = "different-event";
+  retry.request_id = "different-request";
+  retry.correlation_id = "different-correlation";
+  retry.occurred_at = "2026-10-10T12:21:00.000Z";
+  const duplicate = await harness.api.invoke(actor(), retry);
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.replayed, true);
+  assert.equal(harness.state.calls.provider, 1);
+  const conflicting = structuredClone(retry);
+  conflicting.payload.plan.steps[0].parameters.variant_count = 2;
+  assert.equal((await harness.api.invoke(actor(), conflicting)).error.code, "conflict");
+  release();
+  assert.equal((await firstPromise).ok, true);
+});
+
+test("completed replay validates persisted scope and result before returning it", async () => {
+  await loadPlans();
+  const harness = await setup({ withDesign: false });
+  const firstRequest = generationRequest("action-replay-corrupt");
+  const first = await harness.api.invoke(actor(), firstRequest);
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const stored = [...harness.state.jobs.values()].find((job) => job.action_id === firstRequest.action_id);
+  assert.ok(stored);
+  stored.result.design.artifact.content_hash = `sha256:${"z".repeat(64)}`;
+
+  const replayRequest = structuredClone(firstRequest);
+  replayRequest.event_id = "corrupt-replay-event";
+  replayRequest.request_id = "corrupt-replay-request";
+  replayRequest.correlation_id = "corrupt-replay-correlation";
+  const replay = await harness.api.invoke(actor(), replayRequest);
+  assert.equal(replay.ok, false);
+  assert.equal(replay.error.code, "invalid_request");
+  assert.equal(harness.state.calls.provider, 1);
+});
+
+test("cancellation that wins the publication fence prevents a provider result from being saved", async () => {
+  await loadPlans();
+  let signalStarted;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const providerStarted = new Promise((resolve) => { signalStarted = resolve; });
+  const harness = await setup({ withDesign: false, providerImpl: async () => {
+    signalStarted();
+    await gate;
+    return {
+      design_version_id: "design-cancelled-1",
+      artifact: { artifact_id: "artifact-cancelled-1", content_hash: `sha256:${"f".repeat(64)}`, media_type: "image/png" },
+      provider: "fixture-provider", model: "fixture-model", usage: { completeness: "complete", input_tokens: 2, output_tokens: 3 },
+    };
+  } });
+  const generation = harness.api.invoke(actor(), generationRequest("action-cancel-target"));
+  await providerStarted;
+  const job = [...harness.state.jobs.values()][0];
+  const cancelled = await harness.api.invoke(actor(), request("cancel", { job_id: job.job_id }, "action-cancel-1"));
+  assert.equal(cancelled.ok, true);
+  assert.equal(cancelled.job.status, "cancelled");
+  release();
+  const result = await generation;
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "cancelled");
+  assert.equal(harness.state.designs.has("design-cancelled-1"), false);
+  assert.equal(harness.state.calls.usage[0].completeness, "complete");
+});
+
+test("cancellation during route, reservation, or in-flight waits wins before dispatch intent", async () => {
+  await loadPlans();
+  for (const phase of ["route", "reservation", "in_flight"]) {
+    let entered;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const waiting = new Promise((resolve) => { entered = resolve; });
+    const harness = await setup({ withDesign: false });
+    if (phase === "route") {
+      const resolveRoute = harness.ports.provider.resolveRoute;
+      harness.ports.provider.resolveRoute = async (...args) => {
+        entered();
+        await gate;
+        return resolveRoute(...args);
+      };
+    } else if (phase === "reservation") {
+      const reserve = harness.ports.metering.reserveAttempt.bind(harness.ports.metering);
+      harness.ports.metering.reserveAttempt = async (input) => {
+        const result = await reserve(input);
+        entered();
+        await gate;
+        return result;
+      };
+    } else {
+      const mark = harness.ports.metering.markAttemptInFlight.bind(harness.ports.metering);
+      harness.ports.metering.markAttemptInFlight = async (input) => {
+        const result = await mark(input);
+        entered();
+        await gate;
+        return result;
+      };
+    }
+    const operation = harness.api.invoke(actor(), generationRequest(`action-cancel-${phase}`));
+    await waiting;
+    const target = [...harness.state.jobs.values()].find((job) => job.action_id === `action-cancel-${phase}`);
+    const cancelled = await harness.api.invoke(actor(), request("cancel", { job_id: target.job_id }, `cancel-${phase}`));
+    assert.equal(cancelled.ok, true, `${phase}: ${JSON.stringify(cancelled)}`);
+    release();
+    const result = await operation;
+    assert.equal(result.error.code, "cancelled", `${phase}: ${JSON.stringify(result)}`);
+    assert.equal(harness.state.calls.provider, 0, `${phase}: provider must not receive a call`);
+    assert.equal(harness.state.dispatchIntents.length, 0, `${phase}: cancellation must precede intent`);
+  }
+});
+
+test("lease replacement before intent authorization prevents every provider call", async () => {
+  await loadPlans();
+  const harness = await setup({ withDesign: false });
+  const authorize = harness.ports.jobs.authorizeDispatch.bind(harness.ports.jobs);
+  harness.ports.jobs.authorizeDispatch = async (input) => {
+    harness.state.leaseTokens.set(input.job_id, "replacement-lease");
+    return authorize(input);
+  };
+  const result = await harness.api.invoke(actor(), generationRequest("action-replaced-lease"));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "cancelled");
+  assert.equal(harness.state.calls.provider, 0);
+  assert.equal(harness.state.dispatchIntents.length, 0);
+});
+
+test("a transport intent authorized before cancellation retains usage and blocks later retry transport", async () => {
+  await loadPlans();
+  let harness;
+  let retryWasBlocked = false;
+  harness = await setup({ withDesign: false, providerImpl: async (_operation, input) => {
+    const target = [...harness.state.jobs.values()].find((job) => job.action_id === "action-cancel-after-intent");
+    const cancelled = await harness.api.invoke(actor(), request("cancel", { job_id: target.job_id }, "cancel-after-intent"));
+    assert.equal(cancelled.ok, true);
+    try {
+      await input.recordTransportAttempt("transport:retry-after-cancel");
+    } catch {
+      retryWasBlocked = true;
+    }
+    return {
+      design_version_id: "generated-after-cancel",
+      artifact: {
+        artifact_id: "generated-artifact-after-cancel",
+        content_hash: `sha256:${"e".repeat(64)}`,
+        media_type: "image/png",
+      },
+      provider: "fixture-provider",
+      model: "fixture-model",
+      usage: { completeness: "complete", input_tokens: 12, output_tokens: 24 },
+    };
+  } });
+  const result = await harness.api.invoke(actor(), generationRequest("action-cancel-after-intent"));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "cancelled");
+  assert.equal(retryWasBlocked, true);
+  assert.equal(harness.state.dispatchIntents.length, 1);
+  assert.equal(harness.state.calls.provider, 1);
+  assert.equal(harness.state.calls.usage[0].completeness, "complete");
+});
+
+test("cancel validates the scoped target job before invoking its cancellation port", async () => {
+  await loadPlans();
+  const harness = await setup();
+  harness.state.jobs.set("job-incomplete", {
+    job_id: "job-incomplete", tenant_id: "tenant-api-1", project_id: "project-api-1",
+    actor_id: "actor-api-1", operation: "generate", request_hash: "request-hash-fixture", status: "running",
+  });
+  const response = await harness.api.invoke(actor(), request("cancel", { job_id: "job-incomplete" }, "cancel-incomplete"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "not_found");
+  assert.equal(harness.state.calls.cancel, 0);
+});
+
+test("trace failures do not turn a committed operation into an API failure", async () => {
+  await loadPlans();
+  const harness = await setup({ withDesign: false });
+  harness.ports.trace.record = async () => { throw new Error("trace transport token must stay private"); };
+  const response = await harness.api.invoke(actor(), generationRequest("action-trace-failure"));
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(response.job.status, "completed");
+  assert.equal(harness.state.calls.provider, 1);
+  assert.equal(JSON.stringify(response).includes("trace transport token"), false);
+});
+
+test("stale metered inspection is reconciled but never published", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const inspect = harness.ports.inspection.inspect;
+  harness.ports.inspection.inspect = async (input) => ({ ...(await inspect(input)), design_hash: `sha256:${"0".repeat(64)}` });
+  const response = await harness.api.invoke(actor(), request("inspect", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1",
+  }, "inspect-stale-output"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "stale_version");
+  assert.equal(harness.state.calls.inspection, 1);
+  assert.equal(harness.state.calls.usage.length, 1);
+  const job = [...harness.state.jobs.values()].find((entry) => entry.action_id === "inspect-stale-output");
+  assert.equal(job.status, "failed");
+  assert.equal(job.result, undefined);
+});
+
+test("handoff requires a scoped approval for the exact immutable version hash", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const response = await harness.api.invoke(actor(), request("handoff", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", approval_ref: "approval-exact-1", destination_ref: "production-queue-1",
+  }, "action-handoff-1"));
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(harness.state.calls.approval, 2);
+  assert.equal(harness.state.calls.handoff, 1);
+  assert.equal(response.result.receipt.status, "consumed_exact_bytes");
+  assert.equal(response.result.handoff.binding.design_version.design_version_id, "design-api-1");
+  const foreign = await setup();
+  foreign.ports.approval.verifyApproval = () => ({ status: "rejected" });
+  const denied = await foreign.api.invoke(actor(), request("handoff", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", approval_ref: "approval-forged", destination_ref: "production-queue-1",
+  }, "action-handoff-forged"));
+  assert.equal(denied.error.code, "permission_denied");
+  assert.equal(foreign.state.calls.handoff, 0);
+});
+
+test("handoff rechecks the exact approval binding after an asynchronous verifier call", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const verify = harness.ports.approval.verifyApproval;
+  let mutated = false;
+  harness.ports.approval.verifyApproval = async (input) => {
+    const result = await verify(input);
+    if (!mutated) {
+      await Promise.resolve();
+      const context = harness.state.handoffContexts.get("design-api-1");
+      context.binding.preview_sha256 = "f".repeat(64);
+      mutated = true;
+    }
+    return result;
+  };
+  const response = await harness.api.invoke(actor(), request("handoff", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", approval_ref: "approval-race", destination_ref: "production-queue-1",
+  }, "action-handoff-race"));
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "stale_version");
+  assert.equal(harness.state.calls.handoff, 0);
+});
+
+test("job status cannot disclose another project's operation", async () => {
+  await loadPlans();
+  const harness = await setup();
+  harness.state.jobs.set("job-foreign", { job_id: "job-foreign", tenant_id: "tenant-api-1", project_id: "other-project", status: "completed" });
+  const response = await harness.api.invoke(actor(), request("job.status", { job_id: "job-foreign" }));
+  assert.equal(response.error.code, "not_found");
+});
+
+test("missing provider and decision ports fail closed without reporting a completed job", async () => {
+  await loadPlans();
+  const missingProvider = await setup({ withDesign: false, omit: ["provider"] });
+  const unavailable = await missingProvider.api.invoke(actor(), generationRequest("action-no-provider"));
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.error.code, "unavailable");
+  assert.equal(missingProvider.state.calls.provider, 0);
+  assert.equal(missingProvider.state.calls.reserve, 0);
+
+  const missingDecision = await setup({ withDesign: false, omit: ["decisionPort"] });
+  const requestWithDecision = generationRequest("action-no-decision");
+  requestWithDecision.payload.decision_request = validDecisionInput();
+  const decisionUnavailable = await missingDecision.api.invoke(actor(), requestWithDecision);
+  assert.equal(decisionUnavailable.error.code, "unavailable");
+  assert.equal(missingDecision.state.calls.provider, 0);
+  assert.equal(missingDecision.state.calls.reserve, 0);
+
+  const missingDispatchFence = await setup({ withDesign: false });
+  delete missingDispatchFence.ports.jobs.authorizeDispatch;
+  const dispatchUnavailable = await missingDispatchFence.api.invoke(actor(), generationRequest("action-no-dispatch-fence"));
+  assert.equal(dispatchUnavailable.error.code, "unavailable");
+  assert.equal(missingDispatchFence.state.calls.provider, 0);
+  assert.equal(missingDispatchFence.state.calls.reserve, 1);
+});
+
+test("decision execution binds the exact reserved attempt and uses the pinned JEV route", async () => {
+  await loadPlans();
+  const harness = await setup({ withDesign: false });
+  const body = generationRequest("action-decision-success");
+  body.payload.decision_request = validDecisionInput();
+  const response = await harness.api.invoke(actor(), body);
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(harness.state.calls.decision, 1);
+  assert.equal(harness.state.calls.reserve, 2);
+  assert.equal(harness.state.calls.usage.length, 2);
+  assert.equal(harness.state.authority.reservations.has(harness.state.calls.decisionReservationRefs[0]), true);
+});
+
+test("a 256-character reservation ID is passed unchanged and rejected before JEV transport", async () => {
+  await loadPlans();
+  const harness = await setup({ withDesign: false, longReservationId: true });
+  const body = generationRequest("action-decision-long-reservation");
+  body.payload.decision_request = validDecisionInput();
+  const response = await harness.api.invoke(actor(), body);
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "unavailable");
+  assert.equal(harness.state.calls.decision, 0);
+  assert.equal(harness.state.calls.provider, 0);
+  const held = [...harness.state.authority.reservations.values()].find((entry) => entry.state === "held_for_reconciliation");
+  assert.ok(held);
+  assert.equal(held.reservation_id, "r".repeat(256));
+});
+
+test("port failure messages and malformed provider usage never leak or become zero usage", async () => {
+  await loadPlans();
+  const failing = await setup({ withDesign: false, providerImpl: async () => { throw new Error("secret-admission-token"); } });
+  const response = await failing.api.invoke(actor(), generationRequest("action-provider-error"));
+  assert.equal(response.error.code, "unavailable");
+  assert.equal(JSON.stringify(response).includes("secret-admission-token"), false);
+  assert.equal(failing.state.calls.usage.length, 0);
+
+  const malformed = await setup({ withDesign: false, providerImpl: async () => ({
+    design_version_id: "design-malformed-usage",
+    artifact: { artifact_id: "artifact-malformed-usage", content_hash: `sha256:${"a".repeat(64)}`, media_type: "image/png" },
+    provider: "fixture-provider", model: "fixture-model", usage: { completeness: "complete", input_tokens: -1 },
+  }) });
+  const invalidUsage = await malformed.api.invoke(actor(), generationRequest("action-malformed-usage"));
+  assert.equal(invalidUsage.ok, false);
+  assert.equal(invalidUsage.error.code, "unavailable");
+  assert.equal(malformed.state.calls.usage[0].completeness, "unknown");
+  assert.equal((malformed.state.calls.usage[0].usage_units ?? []).some((unit) => unit.name === "input_tokens"), false);
+  assert.ok(malformed.state.calls.usage[0].missing_fields.includes("input_tokens"));
+});
+
+test("asset inputs require the action-specific granted permission", async () => {
+  await loadPlans();
+  const harness = await setup();
+  const plan = boundEditPlan(harness.state);
+  plan.steps[0].action = "composition.update";
+  plan.operation = "composition.update";
+  plan.steps[0].parameters = { design_version_id: "design-api-1", changes: [
+    { field: "logo", value: "asset-api-1", asset_id: "asset-api-1" },
+  ] };
+  plan.expected_result.parent_version_id = "design-api-1";
+  harness.state.brief.permissions.items = harness.state.brief.permissions.items.filter((item) => item.action !== "modify");
+  const editedBriefHash = canonicalHash(harness.state.brief);
+  const baseDesign = harness.state.designs.get("design-api-1");
+  const amendedDesign = versionFrom(baseDesign, { brief_hash: editedBriefHash });
+  harness.state.designs.set(amendedDesign.design_version_id, amendedDesign);
+  plan.base.brief_hash = editedBriefHash;
+  plan.base.design_hash = amendedDesign.design_hash;
+  const output = await harness.api.invoke(actor(), request("edit", {
+    brief_id: "brief-api-1", design_version_id: "design-api-1", plan,
+  }, "action-asset-permission"));
+  assert.equal(output.error.code, "permission_denied");
+  assert.equal(harness.state.calls.provider, 0);
+});

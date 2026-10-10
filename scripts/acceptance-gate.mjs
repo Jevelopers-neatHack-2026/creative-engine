@@ -7,6 +7,12 @@ import { canonicalHash } from "../src/contracts/validation.mjs";
 import { evaluatePolicyAcceptance } from "../evals/creative/validator.mjs";
 
 const requirements = {
+  api: [
+    "shared_contracts_creative_schemas",
+    "event_intelligence_producer",
+    "trusted_project_membership",
+    "creative_controls_consumer",
+  ],
   contracts: [
     "shared_contracts_creative_schemas",
     "event_intelligence_producer",
@@ -117,7 +123,7 @@ async function verifyAgreement(id, agreement, repoRoot) {
 
 export async function evaluateAcceptanceRecord(record, target, repoRoot) {
   const selected = target === "all"
-    ? Object.values(requirements).flat()
+    ? [...new Set(Object.values(requirements).flat())]
     : requirements[target];
   if (!selected) throw new TypeError("Unknown acceptance target " + target + ".");
   const allOwnersAccepted = record?.proposal_state === "accepted";
@@ -165,7 +171,7 @@ async function main() {
     return;
   }
   if (!Object.hasOwn(requirements, target) && target !== "all") {
-    process.stderr.write("Unknown acceptance target " + target + ". Use contracts, decision-contract, metering-contract, handoff-contract, eval-policy, or all.\n");
+    process.stderr.write("Unknown acceptance target " + target + ". Use api, contracts, decision-contract, metering-contract, handoff-contract, eval-policy, or all.\n");
     process.exitCode = 2;
     return;
   }

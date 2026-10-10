@@ -1,0 +1,40 @@
+{
+  "contract": "CreativeBrief",
+  "schema_version": "1.0",
+  "event_id": "event-brief-1",
+  "tenant_id": "tenant-api-1",
+  "project_id": "project-api-1",
+  "correlation_id": "correlation-brief-1",
+  "producer": "fixture-api",
+  "occurred_at": "2026-10-10T12:00:00.000Z",
+  "ingested_at": "2026-10-10T12:00:00.000Z",
+  "environment": "test",
+  "billing_mode": "simulated",
+  "source_refs": ["source-api-1"],
+  "brief_id": "brief-api-1",
+  "research_package_ref": {
+    "contract": "EventIntelligencePackage",
+    "schema_version": "1.1",
+    "package_id": "research-api-1",
+    "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "source_identity": [
+    { "source_id": "source-api-1", "uri": "https://example.test/event" }
+  ],
+  "facts": {
+    "verified": [
+      { "fact_id": "fact-api-1", "key": "event_name", "value": "Example Event", "provenance_refs": ["source-api-1"] }
+    ],
+    "unresolved": []
+  },
+  "preferences": { "presence": "absent", "items": [] },
+  "interpretations": { "presence": "absent", "items": [] },
+  "permissions": {
+    "presence": "present",
+    "items": [
+      { "asset_id": "asset-api-1", "action": "reproduce", "status": "granted", "evidence_refs": ["source-api-1"] },
+      { "asset_id": "asset-api-1", "action": "modify", "status": "granted", "evidence_refs": ["source-api-1"] }
+    ]
+  },
+  "locks": { "presence": "absent", "items": [] }
+}

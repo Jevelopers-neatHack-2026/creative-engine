@@ -125,6 +125,8 @@ export interface MeteredDispatchResult {
 
 export interface MeteredDispatchContext {
   attempt: MeteredAttemptRequest;
+  /** Exact reservation ID returned and validated before dispatch authorization. */
+  readonly reservation_ref: string;
   signal?: AbortSignal;
   recordTransportAttempt(transportAttemptId: string): Promise<void>;
 }

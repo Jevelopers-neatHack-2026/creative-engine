@@ -1,0 +1,45 @@
+name: Creative API offline checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    name: api / Node ${{ matrix.node-version }} / Linux x64
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - 22.23.3
+          - 24.15.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install the locked root package
+        run: npm ci --ignore-scripts --offline
+      - name: Install locked TypeScript consumer tools
+        run: npm ci --prefix examples/frontend-action-roundtrip
+      - name: Verify TypeScript compiler version
+        run: node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --version
+      - name: Clean build and strict public consumer types
+        run: make build
+      - name: API tests and sanitized machine-readable evidence
+        run: make check TARGET=api MODE=mock
+      - name: Aggregate offline checks
+        run: make check TARGET=all MODE=mock
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 verified 2026-10-10
+        if: always()
+        with:
+          name: creative-api-evidence-node-${{ matrix.node-version }}
+          path: build/api-check-evidence.json
+          if-no-files-found: warn

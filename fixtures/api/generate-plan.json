@@ -1,0 +1,35 @@
+{
+  "contract": "EditPlan",
+  "schema_version": "1.0",
+  "event_id": "event-plan-generate-1",
+  "tenant_id": "tenant-api-1",
+  "project_id": "project-api-1",
+  "correlation_id": "correlation-plan-generate-1",
+  "producer": "fixture-api",
+  "occurred_at": "2026-10-10T12:02:00.000Z",
+  "ingested_at": "2026-10-10T12:02:00.000Z",
+  "environment": "test",
+  "billing_mode": "simulated",
+  "source_refs": ["source-api-1"],
+  "plan_id": "plan-generate-1",
+  "base": {
+    "brief_hash": "sha256:4128c720b3feae75564fb946f0c785f16c3c300fe57ee964ccb8ebe5d980c870",
+    "design_hash": "sha256:b87cc92addf3f430f69981dbc9115bc6473b27dadc22cafe84cabd91a6fcbf81"
+  },
+  "operation": "concept.generate",
+  "steps": [
+    {
+      "step_id": "step-generate-1",
+      "action": "concept.generate",
+      "source_refs": ["source-api-1"],
+      "parameters": { "brief_id": "brief-api-1", "variant_count": 1 }
+    }
+  ],
+  "expected_result": {
+    "contract": "DesignVersion",
+    "schema_version": "1.0",
+    "parent_version_id": "root:brief-api-1",
+    "artifact_kind": "image"
+  },
+  "invalidates": []
+}
