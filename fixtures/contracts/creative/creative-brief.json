@@ -1,0 +1,65 @@
+{
+  "contract": "CreativeBrief",
+  "schema_version": "1.0",
+  "event_id": "event-brief-1",
+  "tenant_id": "tenant-1",
+  "project_id": "project-1",
+  "correlation_id": "journey-1",
+  "producer": "creative-engine@fixture",
+  "occurred_at": "2026-10-10T12:01:00Z",
+  "ingested_at": "2026-10-10T12:01:01Z",
+  "environment": "test",
+  "billing_mode": "simulated",
+  "source_refs": ["source:page-1"],
+  "brief_id": "brief-1",
+  "research_package_ref": {
+    "contract": "EventIntelligencePackage",
+    "schema_version": "1.1",
+    "package_id": "eip-1",
+    "content_hash": "sha256:d2b172aeba5134311ef3b06a071179d6c9c1bba8f4ac17446bd6fd68cac316ef"
+  },
+  "source_identity": [
+    {"source_id": "page-1", "uri": "https://example.test/events/1"}
+  ],
+  "facts": {
+    "verified": [
+      {
+        "fact_id": "event-date-1",
+        "key": "event_date",
+        "value": "2027-05-18",
+        "provenance_refs": ["page-1"]
+      }
+    ],
+    "unresolved": []
+  },
+  "preferences": {
+    "presence": "present",
+    "items": [{"preference_id": "pref-1", "value": "blue and warm"}]
+  },
+  "interpretations": {
+    "presence": "present",
+    "items": [{"interpretation_id": "idea-1", "text": "celebratory", "basis": "customer preference"}]
+  },
+  "permissions": {
+    "presence": "present",
+    "items": [
+      {
+        "asset_id": "asset-1",
+        "action": "reproduce",
+        "status": "granted",
+        "evidence_refs": ["page-1"]
+      }
+    ]
+  },
+  "locks": {
+    "presence": "present",
+    "items": [
+      {
+        "lock_id": "lock-1",
+        "field": "event_date",
+        "value_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "reason": "verified date must remain exact"
+      }
+    ]
+  }
+}

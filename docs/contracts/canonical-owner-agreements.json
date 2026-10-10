@@ -1,0 +1,76 @@
+{
+  "proposal_state": "pending_external_owner_agreement",
+  "notice": "This file records outstanding owner decisions. A local fixture pass is not canonical schema or producer/consumer acceptance.",
+  "agreements": {
+    "shared_contracts_creative_schemas": {
+      "triage": "CE-C01",
+      "owner_role": "Agent and research",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1",
+      "required_outcome": "Publish executable creative schemas and supported-version fixtures; confirm ResearchPackage maps to EventIntelligencePackage.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null
+    },
+    "event_intelligence_producer": {
+      "triage": "CE-C01",
+      "owner_role": "Agent and research",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/event-intelligence/issues/3",
+      "required_outcome": "Agree producer fields, compatibility, correction and permission semantics for the package.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null
+    },
+    "trusted_project_membership": {
+      "triage": "CE-C01",
+      "owner_role": "Product and frontend",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/getticketstub.com/issues/1",
+      "required_outcome": "Provide authenticated tenant/project membership context consumed by creative validators.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null
+    },
+    "creative_controls_consumer": {
+      "triage": "CE-C01",
+      "owner_role": "Product and frontend",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/creative-engine/issues/4",
+      "required_outcome": "Review the DesignControlSchema-to-creative-controls version and hash translation.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null
+    },
+    "shared_contracts_decision_port": {
+      "triage": "CE-C02",
+      "owner_role": "Agent and research",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1",
+      "required_outcome": "Publish neutral DecisionPort request, result, error and usage shapes without a harness dependency cycle.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null
+    },
+    "harness_decision_port_consumer": {
+      "triage": "CE-C02",
+      "owner_role": "Agent and research",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/agent-harness/issues/5",
+      "required_outcome": "Coordinate canonical DecisionPort schemas and fixture agreement with the harness consumer.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null
+    },
+    "harness_jev_transport_owner": {
+      "triage": "CE-C02",
+      "owner_role": "Agent and research",
+      "owner_ref": "https://github.com/Jevelopers-neatHack-2026/agent-harness/issues/15",
+      "required_outcome": "Confirm the sole JEV transport owner and record actual active-routing evidence separately from this contract proposal.",
+      "status": "pending",
+      "accepted_commit": null,
+      "schema_hashes": [],
+      "review_record": null
+    }
+  }
+}

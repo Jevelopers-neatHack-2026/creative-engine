@@ -1,0 +1,29 @@
+{
+  "contract": "EventIntelligencePackage",
+  "schema_version": "1.1",
+  "event_id": "event-eip-future-1",
+  "tenant_id": "tenant-1",
+  "project_id": "project-1",
+  "correlation_id": "journey-1",
+  "producer": "event-intelligence@fixture",
+  "occurred_at": "2026-10-10T12:00:00Z",
+  "ingested_at": "2026-10-10T12:00:02Z",
+  "environment": "test",
+  "billing_mode": "simulated",
+  "source_refs": ["source:page-1"],
+  "package_id": "eip-future-1",
+  "source_identity": [
+    {"source_id": "page-1", "uri": "https://example.test/events/1", "retrieved_at_status": "unknown"}
+  ],
+  "facts": [],
+  "assets": {"presence": "absent", "items": []},
+  "preferences": {"presence": "unknown", "items": []},
+  "interpretations": {"presence": "absent", "items": []},
+  "permissions": {"presence": "unknown", "items": []},
+  "locks": {"presence": "absent", "items": []},
+  "future_additive": {
+    "producer_hint": "non-authoritative",
+    "revision": 2,
+    "__proto__": {"preserved": true}
+  }
+}

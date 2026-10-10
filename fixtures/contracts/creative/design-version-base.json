@@ -1,0 +1,22 @@
+{
+  "contract": "DesignVersion",
+  "schema_version": "1.0",
+  "event_id": "event-design-version-1",
+  "tenant_id": "tenant-1",
+  "project_id": "project-1",
+  "correlation_id": "journey-1",
+  "producer": "creative-engine@fixture",
+  "occurred_at": "2026-10-10T12:04:00Z",
+  "ingested_at": "2026-10-10T12:04:01Z",
+  "environment": "test",
+  "billing_mode": "simulated",
+  "source_refs": ["source:page-1", "asset:asset-1"],
+  "design_version_id": "design-v1",
+  "parent_version_id": null,
+  "brief_hash": "sha256:b61afdd4326b4c59d03aefc3592d98da2e07dea4d78d5c1bbedeaeeb2cdb8927",
+  "artifact": {
+    "artifact_id": "artifact-1",
+    "content_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "media_type": "image/png"
+  }
+}

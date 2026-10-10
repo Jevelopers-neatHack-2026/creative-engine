@@ -1,0 +1,208 @@
+{
+  "proposal_id": "creative-engine-local-consumer-contracts/1",
+  "state": "local_proposal_only",
+  "canonical_owner_acceptance": "pending",
+  "runtime": {
+    "minimum_node": "22.23.3",
+    "local_development_node": "24.15.0",
+    "verified_node_22_platform": "Darwin arm64",
+    "server_runtime": "unknown; no server patch was inspected",
+    "package_format": "dependency-free ESM with TypeScript declarations"
+  },
+  "wire_contracts": {
+    "EventIntelligencePackage": {
+      "current_schema_version": "1.1",
+      "supported_schema_versions": ["1.0", "1.1"],
+      "alias": {
+        "ResearchPackage": "EventIntelligencePackage",
+        "normal_form_contract": "EventIntelligencePackage"
+      }
+    },
+    "CreativeBrief": {"schema_version": "1.0"},
+    "DesignControlSchema": {
+      "schema_version": "1.0",
+      "control_contract": "creative-controls",
+      "supported_control_schema_versions": ["1.0", "1.1"]
+    },
+    "EditPlan": {"schema_version": "1.0"},
+    "DesignVersion": {"schema_version": "1.0"}
+  },
+  "common_envelope": {
+    "required": [
+      "contract",
+      "schema_version",
+      "event_id",
+      "tenant_id",
+      "project_id",
+      "correlation_id",
+      "producer",
+      "occurred_at",
+      "ingested_at",
+      "environment",
+      "billing_mode",
+      "source_refs"
+    ],
+    "optional_ids": [
+      "workflow_id",
+      "run_id",
+      "order_id",
+      "job_id",
+      "design_version_id",
+      "artifact_id",
+      "logical_operation_id",
+      "billable_attempt_id",
+      "transport_attempt_id",
+      "provider_request_id"
+    ],
+    "unknown_id_rule": "No client-provided scope field grants authorization; applicable IDs are compared with the separately supplied trusted scope."
+  },
+  "research_compatibility": {
+    "older_1_0_to_current_1_1": {
+      "facts": "Downgrade every imported fact to unknown; retain prior value only as candidate_values and preserve provenance.",
+      "permissions": "Discard old claims as authority; set section to unknown when legacy claims were present and to absent when missing.",
+      "source_identity": "Preserve source identity and provenance. Missing retrieval time is represented as retrieved_at_status=unknown.",
+      "missing_optional_sections": "Normalize to presence=absent with empty items.",
+      "unknown_additive_fields": "Preserve non-sensitive fields in the normalized input as inert data; never infer facts, permissions, locks, or executable actions from them.",
+      "sensitive_fields": "Recursively omit fields whose normalized names identify credentials, tokens, secrets, passwords, authorization, bearer values, API keys, or cookies; record only field_path and credential_material_omitted."
+    },
+    "unknown_optional_sections": "Represent absent, unknown, and present independently; absent/unknown sections contain no items.",
+    "unsupported_versions": "Return a typed unsupported_version or unsupported_major ContractError."
+  },
+  "creative_boundaries": {
+    "fact_states": ["verified", "conflicting", "unknown"],
+    "permission_states": ["granted", "denied", "unknown"],
+    "readiness": "Any conflicting/unknown fact or missing per-asset reproduction permission keeps the package incomplete.",
+    "brief": "Verified facts, unresolved facts, source identity, preferences, interpretations, permissions, and locks are separate fields; when a research package is supplied, references, values and content hash are cross-checked.",
+    "design_control_translation": {
+      "outer_contract_version": "DesignControlSchema.schema_version",
+      "inner_contract_version": "control_schema_version",
+      "inner_contract_name": "control_contract",
+      "hash": "control_schema_hash is canonical SHA-256 of the exact local creative-controls payload; outer validation can compare the supplied payload.",
+      "trusted_versions": "expected_versions binds brief, design, and composition identities for a consumer to compare."
+    },
+    "edit_plan_actions": {
+      "allowlist": ["concept.generate", "image.edit", "composition.update", "correction.apply"],
+      "parameter_rules": "Each action has a fixed parameter shape, 1 to 20 steps, at most 32 composition changes, at most 8 correction references, 8 KiB parameters, and bounded nested JSON values.",
+      "unknown_action": "Typed unsupported_action; never executable."
+    },
+    "design_version": "design_hash is SHA-256 over the canonical record with design_hash omitted; artifact content_hash is separately retained."
+  },
+  "decision_port": {
+    "request_result_contract_version": "1.0",
+    "model_id": "jev-1.13.0",
+    "moving_latest_alias_allowed": false,
+    "bounded_inputs": {
+      "state_utf8_bytes": 16384,
+      "question_count": 24,
+      "observation_count": 16,
+      "choice_options": 255,
+      "ordered_score_levels": 10,
+      "attempt_limit": 3,
+      "deadline_required": true,
+      "cancellation_reference_required": true,
+      "budget_scope_and_reservation_references_required": true
+    },
+    "question_policy": {
+      "Choice_and_Score": {
+        "fields": ["minimum_confidence", "low_confidence_action"],
+        "low_confidence_action": "review"
+      },
+      "Noul": {
+        "fields": ["uncertain_probability_band.lower", "uncertain_probability_band.upper"],
+        "confidence_field": "forbidden"
+      }
+    },
+    "batching": "Independent questions may be planned together only when none depends on another. Dependent IDs are sequenced by a DAG planner; results are not inserted into the request or shared batch state.",
+    "result_status": "complete only when all answers are valid and no policy uncertainty trigger exists; abstention or low confidence/uncertain Noul requires review; timeout, cancellation or unavailable uses a typed safe fallback.",
+    "usage": "Completeness is complete, incomplete, or unknown; unknown usage has no fabricated token counts.",
+    "structured_observation": "Observer identity, content hash, uncertainty status, bounded summary and optional source reference; no raw raster input."
+  },
+  "hashing": {
+    "algorithm": "canonical-json/1",
+    "serialization": "UTF-8 JSON; object keys sorted by Unicode code-unit order at every depth; no insignificant whitespace; array order retained; finite JSON numbers only; -0 serialized as 0.",
+    "digest": "sha256:<64 lowercase hexadecimal characters>",
+    "content_identity": "Canonical hash changes when any included field changes, including preserved unknown additive fields; design_hash alone is omitted from its own DesignVersion input."
+  },
+  "error_codes": [
+    "unsupported_version",
+    "unsupported_major",
+    "unsupported_action",
+    "scope_mismatch",
+    "invalid_reference",
+    "hash_mismatch",
+    "forbidden_sensitive_field",
+    "invalid_dependency",
+    "invalid_distribution",
+    "invalid_legend",
+    "invalid_usage",
+    "invalid_result_status"
+  ],
+  "canonical_owner_obligations": [
+    {
+      "triage": "CE-C01",
+      "id": "CON-01",
+      "owner_role": "Agent and research",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1"
+    },
+    {
+      "triage": "CE-C01",
+      "id": "CON-02",
+      "owner_role": "Agent and research",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1"
+    },
+    {
+      "triage": "CE-C01",
+      "id": "CON-03",
+      "owner_role": "Agent and research",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1"
+    },
+    {
+      "triage": "CE-C01",
+      "id": "ARC-02",
+      "owner_role": "Product and frontend",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/getticketstub.com/issues/1"
+    },
+    {
+      "triage": "CE-C01",
+      "id": "ART-01",
+      "owner_role": "Creative and fulfillment",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/creative-engine/issues/3"
+    },
+    {
+      "triage": "CE-C01",
+      "id": "ART-05",
+      "owner_role": "Creative and fulfillment",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/creative-engine/issues/3"
+    },
+    {
+      "triage": "CE-C02",
+      "id": "CON-01",
+      "owner_role": "Agent and research",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1"
+    },
+    {
+      "triage": "CE-C02",
+      "id": "CON-03",
+      "owner_role": "Agent and research",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1"
+    },
+    {
+      "triage": "CE-C02",
+      "id": "FIN-01",
+      "owner_role": "Finance and reliability",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/integration-evals"
+    },
+    {
+      "triage": "CE-C02",
+      "id": "AGT-03",
+      "owner_role": "Agent and research",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/agent-harness/issues/5"
+    },
+    {
+      "triage": "CE-C02",
+      "id": "AGT-04",
+      "owner_role": "Agent and research",
+      "owner_anchor": "https://github.com/Jevelopers-neatHack-2026/agent-harness/issues/5"
+    }
+  ]
+}

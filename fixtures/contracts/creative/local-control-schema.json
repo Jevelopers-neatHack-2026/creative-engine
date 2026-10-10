@@ -1,0 +1,13 @@
+{
+  "contract": "creative-controls",
+  "schema_version": "1.1",
+  "controls": [
+    {
+      "field": "background_color",
+      "type": "choice",
+      "allowed_values": ["blue", "green", "cream"]
+    }
+  ],
+  "followups": ["title_text"],
+  "locks": ["event_date"]
+}
