@@ -68,7 +68,7 @@ export type CreativeVersionRuntimePorts = Omit<CreativeRuntimePorts, "storage" |
   planning: CreativeVersionRuntimePlanning;
 };
 
-export interface CreativeVersionRuntimePlanning extends BasePlanning {
+export interface CreativeVersionRuntimePlanning extends Omit<BasePlanning, "applyInvalidation"> {
   getBriefAction(input: { scope: import("../planning/index.mjs").PlanningScope; actor_id: string; action_id: string;
     request_hash: string }): Promise<Readonly<{ status: "conflict" }> |
       Readonly<{ status: "replayed"; brief_hash: string; plan: import("../planning/index.mjs").CreativeBriefPlan }> | null>;
