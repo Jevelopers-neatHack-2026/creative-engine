@@ -116,6 +116,52 @@ test('exact permission plus model listing still require authorization and reserv
   assert.match(fixture.capabilityInputs[2].at, /^\d{4}-\d\d-\d\dT/);
 });
 
+test('runner postcondition retains the hold when an adapter returns before its Finance acknowledgement completes', async () => {
+  const fixture = createMockAccessFixture({ runId: 'test:runner-pending-finance-ack' });
+  let acknowledgementRejected = false;
+  let pendingAcknowledgement;
+  fixture.authority.evidence_mode = 'live';
+
+  const promote = (port, methods) => {
+    port.evidence_mode = 'live';
+    for (const method of methods) {
+      const original = port[method].bind(port);
+      port[method] = async (input) => {
+        const decision = await original(input);
+        decision.evidence_mode = 'live';
+        return decision;
+      };
+    }
+  };
+  promote(fixture.pinVerifier, ['verifyPin']);
+  promote(fixture.capabilityVerifier, ['verifyCapability', 'revalidateCapability']);
+  promote(fixture.authorizationPort, ['verifyGrant', 'revalidateGrant']);
+  promote(fixture.reservationVerifier, ['verifyReservation']);
+  fixture.authority.recordTransportAttempt = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    acknowledgementRejected = true;
+    throw new Error('synthetic Finance acknowledgement denial');
+  };
+  const inspect = fixture.adapter.inspect.bind(fixture.adapter);
+  fixture.adapter.evidence_mode = 'live';
+  fixture.adapter.inspect = async (...args) => ({ ...(await inspect(...args)), evidence_mode: 'live' });
+  fixture.adapter.dispatch = async (input) => {
+    pendingAcknowledgement = input.metering.recordTransportAttempt('test:transport-1');
+    pendingAcknowledgement.catch(() => {});
+    return { evidence_mode: 'live', provider_outcome: 'succeeded' };
+  };
+
+  const result = await executeAuthorizedAccessCell({ ...fixture.args, mode: 'live' });
+  await pendingAcknowledgement.catch(() => {});
+
+  assert.equal(acknowledgementRejected, true);
+  assert.equal(result.status, 'unknown', JSON.stringify(result));
+  assert.equal(result.reason_code, 'transport_authorization_fence_missing');
+  assert.equal(result.financial_hold, 'retained_for_reconciliation');
+  assert.equal(fixture.calls.reserve, 1);
+  assert.equal(fixture.calls.settle, 0);
+});
+
 test('generation evidence never substitutes for the separately authorized edit cell', async () => {
   const generation = createMockAccessFixture({ cellId: 'image_generation' });
   const generationResult = await executeAuthorizedAccessCell(generation.args);
@@ -366,7 +412,7 @@ test('more than one transport record fails closed and preserves the hold', async
   const result = await executeAuthorizedAccessCell(fixture.args);
   assert.equal(result.status, 'unknown');
   assert.equal(result.financial_hold, 'retained_for_reconciliation');
-  assert.equal(result.reason_code, 'provider_outcome_unknown');
+  assert.equal(result.reason_code, 'transport_attempt_limit_exceeded');
   assert.equal(fixture.authority.reservationFor(fixture.meteringRequest.billable_attempt_id).transport_attempt_ids.length, 1);
 });
 
@@ -505,6 +551,35 @@ test('unsafe configuration values and public identifiers are rejected while max_
     configuration.labels = { support_contact: 'person@example.invalid' };
   });
   assert.equal(validateAccessPlan(nestedSensitive, fixtureScope).cells[0].input_error_code, 'sensitive_configuration_value');
+});
+
+test('plan candidate and provider identifiers reject credential and personal-address values without echoing them', () => {
+  const cases = [
+    ['selection.candidate_ref', `ghp_${'SyntheticCredentialValue'.repeat(2)}`],
+    ['target.model', `ghp_${'SyntheticCredentialValue'.repeat(2)}`],
+    ['target.service', `ghp_${'SyntheticCredentialValue'.repeat(2)}`],
+    ['target.sdk.name', `ghp_${'SyntheticCredentialValue'.repeat(2)}`],
+    ['target.model', 'person@example.invalid'],
+  ];
+  for (const [field, unsafeValue] of cases) {
+    const plan = structuredClone(createMockAccessFixture().plan);
+    const cell = plan.cells.find((entry) => entry.cell_id === 'image_generation');
+    if (field === 'selection.candidate_ref') {
+      cell.selection.candidate_ref = unsafeValue;
+      cell.selection.candidate_sha256 = digest('candidate fixture');
+    } else if (field === 'target.sdk.name') {
+      cell.target.sdk.name = unsafeValue;
+      cell.target.configuration_sha256 = canonicalHash(cell.target.configuration);
+    } else {
+      const [, key] = field.split('.');
+      cell.target[key] = unsafeValue;
+      cell.target.configuration_sha256 = canonicalHash(cell.target.configuration);
+    }
+    const normalized = validateAccessPlan(plan, fixtureScope);
+    assert.equal(normalized.cells[0].input_status, 'invalid', field);
+    assert.equal(normalized.cells[0].input_error_code, 'invalid_identifier', field);
+    assert.doesNotMatch(JSON.stringify(normalized), /SyntheticCredentialValue|person@example\.invalid/, field);
+  }
 });
 
 test('configuration screening catches canonical Basic credentials without rejecting ordinary prose and hides them from reports', async () => {

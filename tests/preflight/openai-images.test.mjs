@@ -339,6 +339,163 @@ test('post-acknowledgement authority changes and cancellation prevent the built-
   }
 });
 
+test('built-in Images adapter rejects a Finance acknowledgement that was started but not awaited', async () => {
+  const fixture = createMockAccessFixture({ runId: 'test:misordered-finance-ack' });
+  let acknowledgementStarted = false;
+  let acknowledgementRejected = false;
+  let posts = 0;
+  const requestMethods = [];
+  fixture.authority.evidence_mode = 'live';
+
+  const promote = (port, methods) => {
+    port.evidence_mode = 'live';
+    for (const method of methods) {
+      const original = port[method].bind(port);
+      port[method] = async (input) => {
+        const decision = await original(input);
+        decision.evidence_mode = 'live';
+        return decision;
+      };
+    }
+  };
+  promote(fixture.pinVerifier, ['verifyPin']);
+  promote(fixture.capabilityVerifier, ['verifyCapability', 'revalidateCapability']);
+  promote(fixture.authorizationPort, ['verifyGrant', 'revalidateGrant']);
+  promote(fixture.reservationVerifier, ['verifyReservation']);
+  fixture.authority.recordTransportAttempt = async () => {
+    acknowledgementStarted = true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    acknowledgementRejected = true;
+    throw new Error('synthetic Finance acknowledgement denial');
+  };
+
+  const imageAdapter = createOpenAIImagesAdapter({
+    credentialPort: scopedCredentialPort().port,
+    promptPort: { async resolve() { return 'test prompt for image_generation'; } },
+  });
+  const misorderedAdapter = {
+    ...imageAdapter,
+    async dispatch(input) {
+      let pendingAcknowledgement;
+      try {
+        return await imageAdapter.dispatch({
+          ...input,
+          metering: {
+            ...input.metering,
+            recordTransportAttempt(transportId) {
+              pendingAcknowledgement = input.metering.recordTransportAttempt(transportId);
+              pendingAcknowledgement.catch(() => {});
+              return Promise.resolve();
+            },
+          },
+        });
+      } finally {
+        await pendingAcknowledgement?.catch(() => {});
+      }
+    },
+  };
+
+  const result = await withInterceptedFetch(async (_url, options) => {
+    requestMethods.push(options.method);
+    if (options.method === 'GET') {
+      return new Response(JSON.stringify({ data: [{ id: fixture.target.model }] }), { status: 200 });
+    }
+    posts += 1;
+    return new Response(JSON.stringify({
+      model: fixture.target.model,
+      data: [{ b64_json: makePng(1024, 1024).toString('base64') }],
+      usage: completeUsage(),
+    }), { status: 200 });
+  }, () => executeAuthorizedAccessCell({ ...fixture.args, mode: 'live', adapter: misorderedAdapter }));
+
+  assert.equal(acknowledgementStarted, true);
+  assert.equal(acknowledgementRejected, true);
+  assert.equal(result.status, 'unknown', JSON.stringify(result));
+  assert.equal(result.financial_hold, 'retained_for_reconciliation');
+  assert.equal(fixture.calls.reserve, 1);
+  assert.equal(fixture.calls.settle, 0);
+  assert.equal(posts, 0);
+  assert.deepEqual(requestMethods, ['GET']);
+});
+
+test('built-in Images adapter cannot swallow a rejected Finance acknowledgement and continue', async () => {
+  const fixture = createMockAccessFixture({ runId: 'test:swallowed-finance-ack-rejection' });
+  let acknowledgementStarted = false;
+  let acknowledgementRejected = false;
+  let rejectionSwallowed = false;
+  let posts = 0;
+  const requestMethods = [];
+  fixture.authority.evidence_mode = 'live';
+
+  const promote = (port, methods) => {
+    port.evidence_mode = 'live';
+    for (const method of methods) {
+      const original = port[method].bind(port);
+      port[method] = async (input) => {
+        const decision = await original(input);
+        decision.evidence_mode = 'live';
+        return decision;
+      };
+    }
+  };
+  promote(fixture.pinVerifier, ['verifyPin']);
+  promote(fixture.capabilityVerifier, ['verifyCapability', 'revalidateCapability']);
+  promote(fixture.authorizationPort, ['verifyGrant', 'revalidateGrant']);
+  promote(fixture.reservationVerifier, ['verifyReservation']);
+  fixture.authority.recordTransportAttempt = async () => {
+    acknowledgementStarted = true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    acknowledgementRejected = true;
+    throw new Error('synthetic Finance acknowledgement denial');
+  };
+
+  const imageAdapter = createOpenAIImagesAdapter({
+    credentialPort: scopedCredentialPort().port,
+    promptPort: { async resolve() { return 'test prompt for image_generation'; } },
+  });
+  const swallowingAdapter = {
+    ...imageAdapter,
+    async dispatch(input) {
+      return imageAdapter.dispatch({
+        ...input,
+        metering: {
+          ...input.metering,
+          async recordTransportAttempt(transportId) {
+            try {
+              await input.metering.recordTransportAttempt(transportId);
+            } catch {
+              rejectionSwallowed = true;
+            }
+          },
+        },
+      });
+    },
+  };
+
+  const result = await withInterceptedFetch(async (_url, options) => {
+    requestMethods.push(options.method);
+    if (options.method === 'GET') {
+      return new Response(JSON.stringify({ data: [{ id: fixture.target.model }] }), { status: 200 });
+    }
+    posts += 1;
+    return new Response(JSON.stringify({
+      model: fixture.target.model,
+      data: [{ b64_json: makePng(1024, 1024).toString('base64') }],
+      usage: completeUsage(),
+    }), { status: 200 });
+  }, () => executeAuthorizedAccessCell({ ...fixture.args, mode: 'live', adapter: swallowingAdapter }));
+
+  assert.equal(acknowledgementStarted, true);
+  assert.equal(acknowledgementRejected, true);
+  assert.equal(rejectionSwallowed, true);
+  assert.equal(result.status, 'unknown', JSON.stringify(result));
+  assert.equal(result.financial_hold, 'retained_for_reconciliation');
+  assert.equal(fixture.calls.reserve, 1);
+  assert.equal(fixture.calls.settle, 0);
+  assert.equal(posts, 0);
+  assert.deepEqual(requestMethods, ['GET']);
+});
+
 test('reported Images usage subsets are preserved and malformed detail dimensions remain partial', async () => {
   const { target, deadline_at } = imageTarget();
   const fixture = createMockAccessFixture();

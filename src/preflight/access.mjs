@@ -145,7 +145,9 @@ function text(value, field, { max = 300 } = {}) {
 }
 
 function id(value, field) {
-  if (typeof value !== 'string' || !ID.test(value)) fail('invalid_identifier', 'Expected an opaque identifier.', field);
+  if (typeof value !== 'string' || !ID.test(value) || hasSensitiveValue(value)) {
+    fail('invalid_identifier', 'Expected an opaque identifier without credential or personal data.', field);
+  }
   return value;
 }
 
@@ -1161,22 +1163,58 @@ export async function executeAuthorizedAccessCell(args) {
           throw new AccessPreflightError('reservation_scope_unknown', 'Finance reservation lease expired before transport.');
         }
         let transportCount = 0;
+        let transportAckState = 'not_started';
         let transportFenceCount = 0;
         let transportAssertionCount = 0;
         let transportFenceState = 'not_started';
         const boundedContext = {
           ...context,
-          recordTransportAttempt: async (transportAttemptId) => {
+          recordTransportAttempt: (transportAttemptId) => {
             transportCount += 1;
-            if (transportCount > 1) fail('transport_attempt_limit_exceeded', 'The approved preflight allows one transport attempt.', 'metering.recordTransportAttempt');
-            return context.recordTransportAttempt(transportAttemptId);
+            if (transportCount !== 1 || transportAckState !== 'not_started' || transportFenceState !== 'not_started') {
+              transportAckState = 'failed';
+              transportFenceState = 'failed';
+              dispatchRejectCode = 'transport_attempt_limit_exceeded';
+              fail('transport_attempt_limit_exceeded', 'The approved preflight allows one transport attempt.', 'metering.recordTransportAttempt');
+            }
+            transportAckState = 'pending';
+            let acknowledgement;
+            try {
+              acknowledgement = context.recordTransportAttempt(transportAttemptId);
+            } catch {
+              acknowledgement = Promise.reject(new Error('Finance transport acknowledgement failed.'));
+            }
+            const trackedAcknowledgement = Promise.resolve(acknowledgement).then(
+              (result) => {
+                if (transportAckState !== 'pending' || transportFenceState !== 'not_started') {
+                  transportAckState = 'failed';
+                  transportFenceState = 'failed';
+                  dispatchRejectCode = 'transport_authorization_fence_missing';
+                  throw new AccessPreflightError('transport_authorization_fence_missing', 'Finance transport acknowledgement completed after the dispatch fence was already poisoned.');
+                }
+                transportAckState = 'completed';
+                return result;
+              },
+              () => {
+                transportAckState = 'failed';
+                transportFenceState = 'failed';
+                dispatchRejectCode = 'metering_or_dispatch_unknown';
+                throw new AccessPreflightError('metering_or_dispatch_unknown', 'Finance did not acknowledge the transport identity.');
+              },
+            );
+            // The tracked promise is also observed here so an adapter that starts
+            // the acknowledgement without awaiting it cannot leak an unhandled
+            // rejection or turn its eventual outcome into a successful fence.
+            trackedAcknowledgement.catch(() => {});
+            return trackedAcknowledgement;
           },
           authorizeTransport: async () => {
             transportFenceCount += 1;
-            if (transportFenceCount !== 1 || transportCount !== 1 || transportFenceState !== 'not_started') {
+            if (transportFenceCount !== 1 || transportCount !== 1 || transportAckState !== 'completed' || transportFenceState !== 'not_started') {
+              transportAckState = 'failed';
               transportFenceState = 'failed';
               dispatchRejectCode = 'transport_authorization_fence_missing';
-              throw new AccessPreflightError('transport_authorization_fence_missing', 'Transport authorization must follow the one acknowledged transport identity.');
+              throw new AccessPreflightError('transport_authorization_fence_missing', 'Transport authorization must follow the completed Finance acknowledgement for its one transport identity.');
             }
             transportFenceState = 'pending';
             try {
@@ -1281,7 +1319,9 @@ export async function executeAuthorizedAccessCell(args) {
           },
           assertTransportReady: () => {
             transportAssertionCount += 1;
-            if (transportAssertionCount !== 1 || transportFenceCount !== 1 || transportCount !== 1 || transportFenceState !== 'authorized') {
+            if (transportAssertionCount !== 1 || transportFenceCount !== 1 || transportCount !== 1
+              || transportAckState !== 'completed' || transportFenceState !== 'authorized') {
+              transportAckState = 'failed';
               transportFenceState = 'failed';
               dispatchRejectCode = 'transport_authorization_fence_missing';
               throw new AccessPreflightError('transport_authorization_fence_missing', 'A single final transport authorization fence is required.');
@@ -1329,8 +1369,8 @@ export async function executeAuthorizedAccessCell(args) {
           metering: boundedContext,
         });
         if (transportCount !== 1) fail('transport_attempt_limit_exceeded', 'The approved adapter must report exactly one transport attempt.', 'metering.recordTransportAttempt');
-        if (transportFenceCount !== 1 || transportAssertionCount !== 1 || transportFenceState !== 'asserted') {
-          dispatchRejectCode = 'transport_authorization_fence_missing';
+        if (transportAckState !== 'completed' || transportFenceCount !== 1 || transportAssertionCount !== 1 || transportFenceState !== 'asserted') {
+          dispatchRejectCode ??= 'transport_authorization_fence_missing';
           fail('transport_authorization_fence_missing', 'The approved adapter must complete and assert authority immediately before transport.', 'metering.authorizeTransport');
         }
         const cleanEvidence = validateAdapterDispatch(providerResult, cell, mode);
