@@ -189,6 +189,7 @@ export interface EditPlan extends CommonEnvelope {
   plan_id: string;
   base: {
     brief_hash: string;
+    design_hash: string;
     design_version_id?: string;
   };
   operation: EditAction;
@@ -267,6 +268,7 @@ export declare function validateEditPlan(
   options: {
     trustedScope: TrustedScope;
     brief_hash?: string;
+    design_hash?: string;
     known_source_refs?: string[];
     design_version_ids?: string[];
     known_artifact_ids?: string[];

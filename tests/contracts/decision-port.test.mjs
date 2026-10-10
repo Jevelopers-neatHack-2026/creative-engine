@@ -143,9 +143,12 @@ test("dependent questions are planned sequentially and independent batches carry
   const sequential = clone(request);
   sequential.execution_mode = "sequential";
   sequential.questions.palette_score.depends_on = ["layout_choice"];
+  const originalState = clone(sequential.state);
   const batches = planQuestionBatches(sequential, { trustedScope });
   assert.deepEqual(batches, [["layout_choice", "binary_match"], ["palette_score"]]);
   assert.equal(JSON.stringify(batches).includes("answers"), false);
+  assert.deepEqual(sequential.state, originalState);
+  assert.deepEqual(batches.flat().sort(), Object.keys(sequential.questions).sort());
 
   const invalidBatch = clone(sequential);
   invalidBatch.execution_mode = "independent_batch";
@@ -199,4 +202,32 @@ test("missing usage details and forged result scope are rejected", async () => {
   const wrongScope = clone(result);
   wrongScope.tenant_id = "tenant-forged";
   expectCode("scope_mismatch", () => validateDecisionResult(request, wrongScope, { trustedScope }));
+});
+
+test("known provider usage survives malformed, timed-out, and cancelled decision outcomes", async () => {
+  const request = await fixture("decision-port/request.json");
+  const valid = await fixture("decision-port/result.json");
+  for (const [status, errorCode] of [
+    ["unavailable", "malformed_response"],
+    ["timeout", "timeout"],
+    ["cancelled", "cancelled"],
+  ]) {
+    const failed = clone(valid);
+    failed.status = status;
+    failed.answers = Object.fromEntries(Object.entries(request.questions).map(([id, question]) => [id, {
+      status: "unavailable",
+      question_schema_version: question.question_schema_version,
+      policy_version: question.policy_version,
+      reason: "decision unusable; usage was still reported",
+    }]));
+    failed.error = {
+      code: errorCode,
+      retryable: false,
+      fallback: "review",
+      user_message: "The decision could not be used.",
+    };
+    failed.usage.completeness = "complete";
+    assert.equal(validateDecisionResult(request, failed, { trustedScope }).usage.input_tokens, 412);
+    assert.equal(failed.usage.output_tokens, 103);
+  }
 });

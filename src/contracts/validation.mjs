@@ -140,13 +140,27 @@ export function sanitizeCredentialFields(value) {
     }
     if (current === null || typeof current !== "object") return current;
     const output = {};
+    // A producer can place a credential-like semantic label in a fact's
+    // `key` and keep the credential itself under the innocuous `value` key.
+    // Treat that pair like a sensitive field while retaining the fact's
+    // source identity and provenance for auditability.
+    const sensitiveSemanticKey = typeof current.key === "string" && isSensitiveKey(current.key, path);
     for (const [key, entry] of Object.entries(current)) {
       const nextPath = path ? path + "." + key : key;
-      if (isSensitiveKey(key, path)) {
+      const semanticValue = sensitiveSemanticKey &&
+        ["value", "candidate_values", "text", "answer", "content", "raw_value"].includes(normalizedKey(key));
+      if (isSensitiveKey(key, path) || semanticValue) {
         omitted.push(Object.freeze({
           field_path: nextPath,
           reason: "credential_material_omitted",
         }));
+      } else if (sensitiveSemanticKey && normalizedKey(key) === "status" && entry === "verified") {
+        Object.defineProperty(output, key, {
+          value: "unknown",
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
       } else {
         Object.defineProperty(output, key, {
           value: copy(entry, nextPath),

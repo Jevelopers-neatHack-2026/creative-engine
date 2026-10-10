@@ -5,6 +5,7 @@ import {
   canonicalHash,
   canonicalSerialize,
 } from "../../src/contracts/index.mjs";
+import { ContractError as CreativeContractError } from "../../src/contracts/creative/v1.mjs";
 import {
   assessResearchReadiness,
   computeDesignVersionHash,
@@ -44,6 +45,10 @@ test("valid current and local alias packages normalize as EventIntelligencePacka
   assert.equal(aliased.package_id, normalized.package_id);
   assert.equal(canonicalHash(normalized), canonicalHash(validateResearchPackage(clone(current), trustedScope)));
   assert.deepEqual(assessResearchReadiness(normalized), { state: "ready", reasons: [] });
+});
+
+test("creative subpath runtime exports the same ContractError declared by its public type surface", () => {
+  assert.equal(CreativeContractError, ContractError);
 });
 
 test("supported older package migrates values and permissions without granting authority", async () => {
@@ -103,10 +108,17 @@ test("synthetic admission credentials are omitted from declared and unknown nest
   assert.equal(normalized.source_identity[0].source_id, "page-1");
   assert.equal(normalized.source_identity[0].uri, "https://example.test/events/1");
   assert.equal(normalized.facts[0].provenance[0].source_id, "page-1");
+  assert.equal(normalized.facts[1].key, "admission_credential");
+  assert.equal(normalized.facts[1].status, "unknown");
+  assert.equal(Object.hasOwn(normalized.facts[1], "value"), false);
+  assert.equal(normalized.facts[1].provenance[0].source_id, "page-1");
   assert.equal(Object.hasOwn(normalized.source_identity[0], "admission_credential"), false);
   assert.equal(Object.hasOwn(normalized.future_source_metadata.audit, "source_credential"), false);
+  assert.equal(Object.hasOwn(normalized.future_source_metadata.audit.semantic_field, "value"), false);
   assert.equal(serialized.includes("SYNTHETIC-NOT-A-REAL-CREDENTIAL"), false);
   assert.deepEqual(normalized.security_redactions.map((item) => item.field_path).sort(), [
+    "facts[1].value",
+    "future_source_metadata.audit.semantic_field.value",
     "future_source_metadata.audit.source_credential",
     "source_identity[0].admission_credential",
   ]);
@@ -155,29 +167,85 @@ test("CreativeBrief binds each fact and source back to the normalized package", 
   const wrongValue = clone(brief);
   wrongValue.facts.verified[0].value = "2027-05-19";
   expectCode("invalid_reference", () => validateCreativeBrief(wrongValue, { trustedScope, researchPackage }));
+  const wrongKey = clone(brief);
+  wrongKey.facts.verified[0].key = "venue_name";
+  expectCode("invalid_reference", () => validateCreativeBrief(wrongKey, { trustedScope, researchPackage }));
   const incompleteProjection = clone(brief);
   incompleteProjection.facts.verified = [];
   expectCode("incomplete_projection", () => validateCreativeBrief(incompleteProjection, { trustedScope, researchPackage }));
+
+  const unresolvedInput = clone(packageInput);
+  unresolvedInput.facts[0].status = "unknown";
+  delete unresolvedInput.facts[0].value;
+  const unresolvedPackage = normalizeResearchPackage(unresolvedInput, trustedScope);
+  const unresolvedBrief = clone(brief);
+  unresolvedBrief.research_package_ref.content_hash = canonicalHash(unresolvedPackage);
+  unresolvedBrief.facts.verified = [];
+  unresolvedBrief.facts.unresolved = [{
+    fact_id: unresolvedPackage.facts[0].fact_id,
+    key: unresolvedPackage.facts[0].key,
+    status: "unknown",
+    provenance_refs: ["page-1"],
+  }];
+  assert.equal(validateCreativeBrief(unresolvedBrief, { trustedScope, researchPackage: unresolvedPackage }).facts.unresolved.length, 1);
+  const renamedUnresolved = clone(unresolvedBrief);
+  renamedUnresolved.facts.unresolved[0].key = "venue_name";
+  expectCode("invalid_reference", () => validateCreativeBrief(renamedUnresolved, { trustedScope, researchPackage: unresolvedPackage }));
 });
 
-test("DesignControlSchema names and hashes the local creative-controls payload", async () => {
+test("CreativeBrief cannot grant permissions absent or unknown in its research package", async () => {
+  const packageInput = await fixture("creative/current.json");
+  packageInput.permissions = { presence: "unknown", items: [] };
+  const researchPackage = normalizeResearchPackage(packageInput, trustedScope);
+  const brief = await fixture("creative/creative-brief.json");
+  brief.research_package_ref.content_hash = canonicalHash(researchPackage);
+  brief.permissions = { presence: "unknown", items: [] };
+  assert.equal(validateCreativeBrief(brief, { trustedScope, researchPackage }).permissions.items.length, 0);
+
+  const forgedGrant = clone(brief);
+  forgedGrant.permissions = {
+    presence: "present",
+    items: [{ asset_id: "asset-1", action: "reproduce", status: "granted", evidence_refs: ["page-1"] }],
+  };
+  expectCode("invalid_reference", () => validateCreativeBrief(forgedGrant, { trustedScope, researchPackage }));
+});
+
+test("DesignControlSchema translates the checked-in producer's names, scope, versions, and hash", async () => {
   const wrapper = await fixture("creative/design-control-schema.json");
-  const payload = await fixture("creative/local-control-schema.json");
-  const validated = validateDesignControlSchema(wrapper, { trustedScope, controlSchemaPayload: payload });
+  const producer = await fixture("creative/controls-producer-valid.json");
+  const payload = producer.schema;
+  const controlsScope = { ...trustedScope, tenant_id: wrapper.tenant_id, project_id: wrapper.project_id };
+  assert.equal(producer.control_reference.control_contract, wrapper.control_contract);
+  assert.equal(producer.control_reference.control_schema_version, wrapper.control_schema_version);
+  assert.equal(producer.control_reference.tenant_id, wrapper.tenant_id);
+  assert.equal(producer.control_reference.project_id, wrapper.project_id);
+  assert.deepEqual(producer.control_reference.expected_versions, wrapper.expected_versions);
+  assert.equal(producer.control_reference.control_schema_hash, wrapper.control_schema_hash);
+  const validated = validateDesignControlSchema(wrapper, { trustedScope: controlsScope, controlSchemaPayload: payload });
   assert.equal(validated.control_contract, "creative-controls");
-  assert.equal(validated.control_schema_version, payload.schema_version);
+  assert.equal(validated.control_schema_version, payload.schema_version.split("/")[1]);
   assert.equal(validated.control_schema_hash, canonicalHash(payload));
 
   const changedPayload = clone(payload);
-  changedPayload.locks.push("headline");
-  expectCode("hash_mismatch", () => validateDesignControlSchema(wrapper, { trustedScope, controlSchemaPayload: changedPayload }));
+  changedPayload.controls[0].label = "Altered by consumer";
+  expectCode("hash_mismatch", () => validateDesignControlSchema(wrapper, { trustedScope: controlsScope, controlSchemaPayload: changedPayload }));
+  const foreignScope = clone(payload);
+  foreignScope.tenant_id = "tenant-forged";
+  expectCode("scope_mismatch", () => validateDesignControlSchema(wrapper, { trustedScope: controlsScope, controlSchemaPayload: foreignScope }));
+  const wrongVersion = clone(payload);
+  wrongVersion.schema_version = "creative-controls/1.0";
+  expectCode("version_mismatch", () => validateDesignControlSchema(wrapper, { trustedScope: controlsScope, controlSchemaPayload: wrongVersion }));
 });
 
 test("EditPlan accepts only bounded typed actions and references", async () => {
   const plan = await fixture("creative/edit-plan.json");
+  const baseDesign = await fixture("creative/design-version-base.json");
+  const baseDesignHash = computeDesignVersionHash(baseDesign);
+  assert.equal(plan.base.design_hash, baseDesignHash);
   const validOptions = {
     trustedScope,
     brief_hash: plan.base.brief_hash,
+    design_hash: baseDesignHash,
     known_source_refs: ["source:page-1", "asset:asset-1"],
     design_version_ids: ["design-v1"],
     known_asset_ids: ["asset-1"],
@@ -196,6 +264,10 @@ test("EditPlan accepts only bounded typed actions and references", async () => {
   expectCode("out_of_bounds", () => validateEditPlan(outOfBound, validOptions));
   const forgedBrief = clone(plan);
   expectCode("hash_mismatch", () => validateEditPlan(forgedBrief, { ...validOptions, brief_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }));
+  expectCode("hash_mismatch", () => validateEditPlan(plan, { ...validOptions, design_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }));
+  const missingDesignHash = clone(plan);
+  delete missingDesignHash.base.design_hash;
+  expectCode("invalid_type", () => validateEditPlan(missingDesignHash, validOptions));
 });
 
 test("DesignVersion hash is canonical, immutable, and bound to the brief", async () => {
@@ -210,6 +282,10 @@ test("DesignVersion hash is canonical, immutable, and bound to the brief", async
   assert.equal(validateDesignVersion(version, options).design_hash, version.design_hash);
   const changed = { ...version, artifact: { ...version.artifact, content_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
   expectCode("hash_mismatch", () => validateDesignVersion(changed, options));
+  const foreignNestedArtifact = clone(version);
+  foreignNestedArtifact.artifact.artifact_id = "artifact-other-owned";
+  foreignNestedArtifact.design_hash = computeDesignVersionHash(foreignNestedArtifact);
+  expectCode("scope_mismatch", () => validateDesignVersion(foreignNestedArtifact, options));
   const credentialed = { ...version, source_credential: "SYNTHETIC-NOT-A-REAL-CREDENTIAL" };
   credentialed.design_hash = computeDesignVersionHash(credentialed);
   expectCode("forbidden_sensitive_field", () => validateDesignVersion(credentialed, options));

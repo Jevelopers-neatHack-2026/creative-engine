@@ -27,6 +27,13 @@
       "status": "verified",
       "value": "Example Festival",
       "provenance": [{"source_id": "page-1", "retrieved_at_status": "unknown"}]
+    },
+    {
+      "fact_id": "admission-credential-1",
+      "key": "admission_credential",
+      "status": "verified",
+      "value": "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+      "provenance": [{"source_id": "page-1", "retrieved_at_status": "unknown"}]
     }
   ],
   "assets": {"presence": "absent", "items": []},
@@ -36,7 +43,11 @@
   "locks": {"presence": "absent", "items": []},
   "future_source_metadata": {
     "audit": {
-      "source_credential": "SYNTHETIC-NOT-A-REAL-CREDENTIAL"
+      "source_credential": "SYNTHETIC-NOT-A-REAL-CREDENTIAL",
+      "semantic_field": {
+        "key": "source_credential",
+        "value": "SYNTHETIC-NOT-A-REAL-CREDENTIAL"
+      }
     }
   }
 }

@@ -8,6 +8,11 @@ bootstrap:
 
 build:
 	npm run build
+	node --check src/controls/runtime.mjs
+	node --check src/controls/schema.mjs
+	node --check src/controls/contract.mjs
+	node --check src/controls/actions.mjs
+	node --check src/controls/index.mjs
 
 check:
 	@if [ "$(MODE)" != "mock" ]; then \
@@ -17,8 +22,9 @@ check:
 	@case "$(TARGET)" in \
 		contracts) npm run check:contracts ;; \
 		decision-contract) npm run check:decision-contract ;; \
-		all) npm test ;; \
-		*) echo "Unknown TARGET=$(TARGET). Use contracts, decision-contract, or all." >&2; exit 2 ;; \
+		controls) node fixtures/controls/check.mjs ;; \
+		all) npm test && node fixtures/controls/check.mjs ;; \
+		*) echo "Unknown TARGET=$(TARGET). Use controls, contracts, decision-contract, or all." >&2; exit 2 ;; \
 	esac
 
 acceptance:

@@ -77,6 +77,8 @@
       "outer_contract_version": "DesignControlSchema.schema_version",
       "inner_contract_version": "control_schema_version",
       "inner_contract_name": "control_contract",
+      "producer_wire_version": "<control_contract>/<control_schema_version>; current fixture uses creative-controls/1.1",
+      "producer_fields_bound": ["tenant_id", "project_id", "expected_versions"],
       "hash": "control_schema_hash is canonical SHA-256 of the exact local creative-controls payload; outer validation can compare the supplied payload.",
       "trusted_versions": "expected_versions binds brief, design, and composition identities for a consumer to compare."
     },
@@ -85,7 +87,8 @@
       "parameter_rules": "Each action has a fixed parameter shape, 1 to 20 steps, at most 32 composition changes, at most 8 correction references, 8 KiB parameters, and bounded nested JSON values.",
       "unknown_action": "Typed unsupported_action; never executable."
     },
-    "design_version": "design_hash is SHA-256 over the canonical record with design_hash omitted; artifact content_hash is separately retained."
+    "design_version": "design_hash is SHA-256 over the canonical record with design_hash omitted; artifact content_hash is separately retained, and nested artifact_id is checked against trusted artifact scope.",
+    "edit_plan_base": "Every EditPlan binds both base.brief_hash and base.design_hash; supplied current hashes are compared before accepting a plan."
   },
   "decision_port": {
     "request_result_contract_version": "1.0",
@@ -112,9 +115,9 @@
         "confidence_field": "forbidden"
       }
     },
-    "batching": "Independent questions may be planned together only when none depends on another. Dependent IDs are sequenced by a DAG planner; results are not inserted into the request or shared batch state.",
+    "batching": "Independent questions may be planned together only when none depends on another. The DAG planner returns ordered ID batches only; it neither executes requests nor creates updated dependent state.",
     "result_status": "complete only when all answers are valid and no policy uncertainty trigger exists; abstention or low confidence/uncertain Noul requires review; timeout, cancellation or unavailable uses a typed safe fallback.",
-    "usage": "Completeness is complete, incomplete, or unknown; unknown usage has no fabricated token counts.",
+    "usage": "Completeness is complete, incomplete, or unknown; known provider input/output counts are retained even when the decision is malformed, unavailable, timed out, or cancelled; unknown usage has no fabricated counts.",
     "structured_observation": "Observer identity, content hash, uncertainty status, bounded summary and optional source reference; no raw raster input."
   },
   "hashing": {

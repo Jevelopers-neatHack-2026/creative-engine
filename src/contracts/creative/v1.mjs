@@ -1,4 +1,5 @@
 import {
+  ContractError,
   assertHash,
   assertIsoDateTime,
   assertOnlyKeys,
@@ -14,6 +15,8 @@ import {
   sanitizeCredentialFields,
 } from "../validation.mjs";
 import { assertTrustedScope } from "../scope.mjs";
+
+export { ContractError };
 
 export const CREATIVE_CONTRACT_VERSIONS = Object.freeze({
   EventIntelligencePackage: "1.1",
@@ -458,7 +461,8 @@ export function validateCreativeBrief(value, options = {}) {
     const packageFactIds = new Set(research.facts.map((candidate) => candidate.fact_id));
     for (const fact of verified) {
       const original = research.facts.find((candidate) => candidate.fact_id === fact.fact_id);
-      if (!original || original.status !== "verified" || canonicalHash(original.value) !== canonicalHash(fact.value)) {
+      if (!original || original.status !== "verified" || original.key !== fact.key ||
+        canonicalHash(original.value) !== canonicalHash(fact.value)) {
         fail("invalid_reference", contract, "facts.verified", "Brief verified fact is not verified in its research package.");
       }
       for (const ref of fact.provenance_refs) {
@@ -469,7 +473,7 @@ export function validateCreativeBrief(value, options = {}) {
     }
     for (const fact of unresolved) {
       const original = research.facts.find((candidate) => candidate.fact_id === fact.fact_id);
-      if (!original || original.status !== fact.status) {
+      if (!original || original.status !== fact.status || original.key !== fact.key) {
         fail("invalid_reference", contract, "facts.unresolved", "Brief unresolved fact state does not match the referenced package.");
       }
       if (fact.candidate_values && canonicalHash(fact.candidate_values) !== canonicalHash(original.candidate_values ?? [])) {
@@ -484,11 +488,33 @@ export function validateCreativeBrief(value, options = {}) {
     if (verified.length + unresolved.length !== packageFactIds.size) {
       fail("incomplete_projection", contract, "facts", "Brief must carry every research-package fact as verified or unresolved.");
     }
-    const packageAssetIds = new Set(research.assets.items.map((asset) => asset.asset_id));
-    for (const permission of value.permissions.items) {
-      if (!packageAssetIds.has(permission.asset_id)) {
-        fail("invalid_reference", contract, "permissions", "Brief permission refers to an asset absent from the research package.");
+    if (value.permissions.presence !== research.permissions.presence) {
+      fail("invalid_reference", contract, "permissions.presence", "Brief permission presence must match the referenced research package.");
+    }
+    const permissionKey = (permission) => permission.asset_id + "\u0000" + permission.action;
+    const researchPermissions = new Map();
+    for (const permission of research.permissions.items) {
+      const key = permissionKey(permission);
+      if (researchPermissions.has(key)) {
+        fail("duplicate_reference", contract, "permissions", "Research package permission asset/action pairs must be unique.");
       }
+      researchPermissions.set(key, permission);
+    }
+    const briefPermissions = new Set();
+    for (const permission of value.permissions.items) {
+      const key = permissionKey(permission);
+      if (briefPermissions.has(key)) {
+        fail("duplicate_reference", contract, "permissions", "Brief permission asset/action pairs must be unique.");
+      }
+      briefPermissions.add(key);
+      const original = researchPermissions.get(key);
+      if (!original || original.status !== permission.status ||
+        canonicalHash(original.evidence_refs) !== canonicalHash(permission.evidence_refs)) {
+        fail("invalid_reference", contract, "permissions", "Brief permission must match the referenced package action, status, and evidence.");
+      }
+    }
+    if (briefPermissions.size !== researchPermissions.size) {
+      fail("incomplete_projection", contract, "permissions", "Brief must carry every research-package permission record.");
     }
   }
   assertTrustedScope(value, options.trustedScope, contract);
@@ -513,9 +539,14 @@ export function validateDesignControlSchema(value, options = {}) {
   assertHash(value.control_schema_hash, contract, "control_schema_hash");
   if (options.controlSchemaPayload) {
     expectObject(options.controlSchemaPayload, contract, "control_schema_payload");
-    if (options.controlSchemaPayload.contract !== value.control_contract ||
-      options.controlSchemaPayload.schema_version !== value.control_schema_version) {
-      fail("version_mismatch", contract, "control_schema_payload", "Control payload name or version does not match the referenced local UI control contract.");
+    const expectedPayloadVersion = value.control_contract + "/" + value.control_schema_version;
+    if (options.controlSchemaPayload.schema_version !== expectedPayloadVersion) {
+      fail("version_mismatch", contract, "control_schema_payload.schema_version", "Control payload version does not match the referenced producer schema version.");
+    }
+    if (options.controlSchemaPayload.tenant_id !== value.tenant_id ||
+      options.controlSchemaPayload.project_id !== value.project_id ||
+      canonicalHash(options.controlSchemaPayload.expected_versions) !== canonicalHash(value.expected_versions)) {
+      fail("scope_mismatch", contract, "control_schema_payload", "Control payload scope and expected versions must match the outer reference.");
     }
     if (canonicalHash(options.controlSchemaPayload) !== value.control_schema_hash) {
       fail("hash_mismatch", contract, "control_schema_hash", "Control schema hash does not match the canonical local UI control payload.");
@@ -536,6 +567,10 @@ export function validateEditPlan(value, options = {}) {
   assertHash(value.base.brief_hash, contract, "base.brief_hash");
   if (options.brief_hash && value.base.brief_hash !== options.brief_hash) {
     fail("hash_mismatch", contract, "base.brief_hash", "Edit plan is not bound to the supplied brief hash.");
+  }
+  assertHash(value.base.design_hash, contract, "base.design_hash");
+  if (options.design_hash && value.base.design_hash !== options.design_hash) {
+    fail("hash_mismatch", contract, "base.design_hash", "Edit plan is not bound to the supplied base design hash.");
   }
   if (Object.prototype.hasOwnProperty.call(value.base, "design_version_id")) {
     expectString(value.base.design_version_id, contract, "base.design_version_id", { maxLength: 200 });
@@ -763,6 +798,12 @@ export function validateDesignVersion(value, options = {}) {
   });
   expectObject(value.artifact, contract, "artifact");
   expectString(value.artifact.artifact_id, contract, "artifact.artifact_id", { maxLength: 200 });
+  if (Object.prototype.hasOwnProperty.call(value, "artifact_id") && value.artifact_id !== value.artifact.artifact_id) {
+    fail("scope_mismatch", contract, "artifact.artifact_id", "Nested artifact identity must match the design version envelope.");
+  }
+  if (options.trustedScope?.artifact_id !== undefined && value.artifact.artifact_id !== options.trustedScope.artifact_id) {
+    fail("scope_mismatch", contract, "artifact.artifact_id", "Nested artifact identity does not match the trusted object reference.");
+  }
   assertHash(value.artifact.content_hash, contract, "artifact.content_hash");
   expectString(value.artifact.media_type, contract, "artifact.media_type", { maxLength: 100 });
   assertHash(value.design_hash, contract, "design_hash");

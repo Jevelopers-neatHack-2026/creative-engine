@@ -1,22 +1,22 @@
 {
   "contract": "DesignControlSchema",
   "schema_version": "1.0",
-  "event_id": "event-control-schema-1",
-  "tenant_id": "tenant-1",
-  "project_id": "project-1",
-  "correlation_id": "journey-1",
-  "producer": "creative-engine@fixture",
+  "event_id": "event-control-schema-2",
+  "tenant_id": "fixture_tenant",
+  "project_id": "fixture_project",
+  "correlation_id": "journey-controls-1",
+  "producer": "creative-controls@fixture",
   "occurred_at": "2026-10-10T12:02:00Z",
   "ingested_at": "2026-10-10T12:02:01Z",
   "environment": "test",
   "billing_mode": "simulated",
-  "source_refs": ["source:page-1"],
+  "source_refs": ["fixture:controls-valid"],
   "control_contract": "creative-controls",
   "control_schema_version": "1.1",
   "expected_versions": {
-    "brief": "brief-1",
-    "design": "design-v1",
-    "composition": "composition-v1"
+    "brief": "brief_v1",
+    "design": "design_v1",
+    "composition": "composition_v1"
   },
-  "control_schema_hash": "sha256:7052c43f2f41a5e8dbcf4c110a2e2f7bb2963ce42bd2960648a55916ab1492ce"
+  "control_schema_hash": "sha256:c8c4ec7ece4ea3b8a79eee93cbc704e0e3bf11a5ba123e220700192da6e34516"
 }

@@ -452,9 +452,6 @@ export function validateDecisionResult(request, result, options = {}) {
       fail("invalid_result_status", contract, "status", "Unavailable results cannot contain answered questions.");
     }
     validateDecisionError(result.error, status, contract);
-    if (usage.completeness === "complete") {
-      fail("invalid_usage", contract, "usage", "An unavailable result cannot assert complete provider usage.");
-    }
   } else if (Object.prototype.hasOwnProperty.call(result, "error")) {
     fail("invalid_result_status", contract, "error", "Complete and review results must use per-question abstention status.");
   }
