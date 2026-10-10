@@ -1,0 +1,80 @@
+{
+  "evidence_version": "controls-offline-evidence/1.0",
+  "dependency_mode": "mock",
+  "billing_mode": "simulated",
+  "runtime": "v22.23.3",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "host_validation": "local_only",
+  "schema_version": "creative-controls/1.1",
+  "action_version": "creative-apply/1.1",
+  "contract_status": "local-consumer-proposal",
+  "source_fingerprint_sha256": "275ae39d2b99d057611786e4076be5304087db5ff63769fa2fd9aab91791b380",
+  "source_files": [
+    "src/controls/actions.mjs",
+    "src/controls/contract.mjs",
+    "src/controls/index.d.mts",
+    "src/controls/index.mjs",
+    "src/controls/runtime.mjs",
+    "src/controls/schema.mjs",
+    "tests/controls/actions.test.mjs",
+    "tests/controls/concurrent-worker.mjs",
+    "tests/controls/types/consumer.mts",
+    "tests/controls/types/tsconfig.json",
+    "examples/frontend-action-roundtrip/.gitignore",
+    "examples/frontend-action-roundtrip/app.mjs",
+    "examples/frontend-action-roundtrip/index.html",
+    "examples/frontend-action-roundtrip/package-lock.json",
+    "examples/frontend-action-roundtrip/package.json",
+    "examples/frontend-action-roundtrip/playwright.config.mjs",
+    "examples/frontend-action-roundtrip/server.mjs",
+    "examples/frontend-action-roundtrip/style.css",
+    "examples/frontend-action-roundtrip/tests/roundtrip.spec.mjs",
+    "fixtures/controls/check.mjs",
+    "fixtures/controls/invalid.json",
+    "fixtures/controls/older.json",
+    "fixtures/controls/state.mjs",
+    "fixtures/controls/unknown-field.json",
+    "fixtures/controls/valid.json",
+    ".github/workflows/controls.yml",
+    "docs/controls-integration.md"
+  ],
+  "fixture_schema_sha256": "c8c4ec7ece4ea3b8a79eee93cbc704e0e3bf11a5ba123e220700192da6e34516",
+  "fixture_action_sha256": "0cf4804a8b81f338c9a9e17961b6d37b61266da7d20a72b8d6897f18c77c5dc3",
+  "checks": [
+    {
+      "command": "node --test tests/controls/actions.test.mjs",
+      "exit_code": 0,
+      "passed": true
+    },
+    {
+      "command": "tsc --strict --module NodeNext (public ESM consumer)",
+      "exit_code": 0,
+      "passed": true
+    },
+    {
+      "command": "npm test (Playwright Chromium + axe)",
+      "exit_code": 0,
+      "passed": true
+    }
+  ],
+  "browser_exercised": true,
+  "types_checked": true,
+  "calls": {
+    "jev": 0,
+    "image": 0
+  },
+  "approval_created": false,
+  "purchase_created": false,
+  "pending": [
+    "canonical external schema publication and consumer acknowledgement",
+    "CE-01 API integration",
+    "CE-02 actual versioned brief integration",
+    "CE-08 actual version store integration",
+    "application authentication/authorization",
+    "harness outbox consumer and paid artwork dispatch",
+    "live providers and external release acceptance",
+    "CloudLinux/CageFS x86_64 host validation (exact Node 22 patch unknown)"
+  ],
+  "passed": true
+}
