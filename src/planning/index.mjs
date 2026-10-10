@@ -77,6 +77,7 @@ function decodedVariants(value) {
   const variants = [value];
   let decoded = value;
   let exhausted = false;
+  let malformed = false;
   for (let index = 0; index < 8; index += 1) {
     try {
       const next = decodeURIComponent(decoded.replace(/\+/g, "%20"));
@@ -85,10 +86,24 @@ function decodedVariants(value) {
       variants.push(decoded);
       if (index === 7 && /%[0-9a-f]{2}/i.test(decoded)) exhausted = true;
     } catch {
-      break;
+      // Decode valid escape runs independently. A malformed neighbour must
+      // not shield a valid encoded email, credential, or signed URL.
+      const next = decoded.replace(/(?:%[0-9a-f]{2})+/gi, (run) => {
+        try {
+          return decodeURIComponent(run);
+        } catch {
+          malformed = true;
+          return run;
+        }
+      });
+      if (/%(?![0-9a-f]{2})/i.test(decoded)) malformed = true;
+      if (next === decoded) break;
+      decoded = next;
+      variants.push(decoded);
+      if (index === 7 && /%[0-9a-f]{2}/i.test(decoded)) exhausted = true;
     }
   }
-  return { variants, exhausted };
+  return { variants, exhausted, malformed };
 }
 
 function hasSignedUrl(value, variants) {
@@ -96,7 +111,7 @@ function hasSignedUrl(value, variants) {
     const candidates = variant.match(/https?:\/\/[^\s"'<>]+/gi) ?? [];
     for (const candidate of candidates) {
       const candidateVariants = decodedVariants(candidate);
-      if (candidateVariants.exhausted) return true;
+      if (candidateVariants.exhausted || candidateVariants.malformed) return true;
       for (const decoded of candidateVariants.variants) {
         if (SENSITIVE_VALUE.test(decoded) || hasBasicAuthMaterial(decoded)) return true;
       }
@@ -119,9 +134,9 @@ function hasSignedUrl(value, variants) {
   return false;
 }
 
-function hasSensitivePublicText(value) {
+function hasSensitivePublicText(value, { uri = false } = {}) {
   const screening = decodedVariants(value);
-  if (screening.exhausted) return true;
+  if (screening.exhausted || (uri && screening.malformed)) return true;
   for (const variant of screening.variants) {
     if (SENSITIVE_VALUE.test(variant) || hasBasicAuthMaterial(variant)) return true;
   }
@@ -142,7 +157,8 @@ function expectString(value, field, { max = 2048, pattern = null } = {}) {
   if (typeof value !== "string" || value.trim().length === 0 || value.length > max || (pattern && !pattern.test(value))) {
     fail("invalid_input", "A required text field is missing or invalid.", field);
   }
-  if (hasSensitivePublicText(value)) fail("sensitive_input", "Sensitive content cannot be included in a brief output.", field);
+  const isUri = /(?:^|\.)uri$/i.test(field);
+  if (hasSensitivePublicText(value, { uri: isUri })) fail("sensitive_input", "Sensitive content cannot be included in a brief output.", field);
   return value;
 }
 

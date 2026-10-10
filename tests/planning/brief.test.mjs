@@ -208,6 +208,11 @@ test("recursive privacy screening catches secret-like keys and signed or encoded
     ["signed source URL", "synthetic-private-signature", (research) => { research.source_identity[0].uri = "https://example.test/image?X-Amz-Signature=synthetic-private-signature"; }],
     ["encoded whole signed URL", "synthetic-private-signature", (research) => { research.source_identity[0].uri = encodedSignedUrl; }],
     ["encoded email URL", "person%40example.test", (research) => { research.source_identity[0].uri = "https://example.test/person%40example.test"; }],
+    ["malformed suffix cannot shield encoded email URL", "person%40example.test", (research) => { research.source_identity[0].uri = "https://example.test/person%40example.test/%ZZ"; }],
+    ["invalid UTF-8 suffix cannot shield encoded email URL", "person%40example.test", (research) => { research.source_identity[0].uri = "https://example.test/person%40example.test/%FF"; }],
+    ["malformed prefix cannot shield encoded Basic credentials", "dXNlcjpwYXNz", (research) => { research.preferences.items[0].value = "%ZZ Basic%20dXNlcjpwYXNz"; }],
+    ["malformed prefix cannot shield encoded signed URL", "synthetic-private-signature", (research) => { research.source_identity[0].uri = "%ZZ " + encodedSignedUrl; }],
+    ["URI with malformed encoding fails closed", "%ZZ", (research) => { research.source_identity[0].uri = "https://example.test/assets/%ZZ"; }],
     ["triple-encoded email URL", "person@example.test", (research) => { research.source_identity[0].uri = tripleEncodedEmailUrl; }],
     ["deep encoding fails closed", "person@example.test", (research) => { research.source_identity[0].uri = deeplyEncodedEmailUrl; }],
     ["URL userinfo", "user:password", (research) => { research.source_identity[0].uri = "https://user:password@example.test/path"; }],
@@ -225,6 +230,10 @@ test("recursive privacy screening catches secret-like keys and signed or encoded
   ordinaryEncodedUrl.source_identity[0].uri = "https://example.test/illustrations%20for%20the%20event";
   assert.equal(plan(ordinaryEncodedUrl).brief.source_identity[0].uri,
     "https://example.test/illustrations%20for%20the%20event");
+  const ordinaryPercentProse = completeResearchPackage();
+  ordinaryPercentProse.preferences.items[0].value = "Use 20% warm and 80% cool colors";
+  assert.equal(plan(ordinaryPercentProse).brief.preferences.items[0].value,
+    "Use 20% warm and 80% cool colors");
 });
 
 test("Basic prose remains usable while credential-looking values are rejected", () => {
