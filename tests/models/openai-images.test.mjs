@@ -418,6 +418,36 @@ test("decoded image fixtures validate dimensions and reject CRC, truncated, inde
   }
 });
 
+test("image byte inspection rejects invalid views before copying and uses intrinsic byte length", async () => {
+  // This impostor passes instanceof without backing storage, so it can exercise the
+  // pre-copy boundary without allocating a 50 MiB fixture.
+  const oversized = Object.create(Uint8Array.prototype);
+  Object.defineProperty(oversized, "byteLength", { value: 50 * 1024 * 1024 + 1 });
+  const originalFrom = Buffer.from;
+  const originalAllocUnsafe = Buffer.allocUnsafe;
+  let copyAttempts = 0;
+  Buffer.from = function (value, ...args) {
+    if (value === oversized) copyAttempts += 1;
+    return originalFrom.call(Buffer, value, ...args);
+  };
+  Buffer.allocUnsafe = function (size, ...args) {
+    if (size > 50 * 1024 * 1024) copyAttempts += 1;
+    return originalAllocUnsafe.call(Buffer, size, ...args);
+  };
+  try {
+    await assert.rejects(inspectOpenAIImageBytes(oversized), (error) => error.code === "image_bytes_invalid");
+  } finally {
+    Buffer.from = originalFrom;
+    Buffer.allocUnsafe = originalAllocUnsafe;
+  }
+  assert.equal(copyAttempts, 0, "invalid or oversized inputs must fail before any proportional copy");
+
+  const valid = makePng();
+  Object.defineProperty(valid, "byteLength", { value: 50 * 1024 * 1024 + 1 });
+  assert.equal((await inspectOpenAIImageBytes(valid)).width, 16,
+    "a shadowed byteLength property must not override the actual bounded view length");
+});
+
 test("16-bit PNG alpha transparency is checked before 8-bit quantization", async () => {
   for (const [alpha, hasTransparency] of [[0xffff, false], [0xfffe, true], [0xffdc, true], [0xfde8, true], [0, true]]) {
     const bytes = makePng16Rgba({ alpha });

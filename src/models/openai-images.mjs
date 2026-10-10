@@ -10,6 +10,10 @@ const MAX_RESPONSE_BYTES = Math.ceil(MAX_IMAGE_BYTES * 4 / 3) + 1024 * 1024;
 const MAX_DECODED_BYTES = 64 * 1024 * 1024;
 const MAX_PROVIDER_CONTEXT_BYTES = 1024 * 1024;
 const MAX_PIXELS = 16_777_216;
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const TYPED_ARRAY_BUFFER = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "buffer").get;
+const TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "byteLength").get;
+const TYPED_ARRAY_BYTE_OFFSET = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "byteOffset").get;
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const OPAQUE_REF = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
 const PROVIDER_REQUEST_REF = /^provider-request-[a-f0-9]{64}$/;
@@ -622,8 +626,28 @@ async function decodeAndVerifyPixels(bytes, structure) {
 /** Bounded image decoders used for provider outputs and edit inputs. */
 export async function inspectOpenAIImageBytes(value) {
   if (!(value instanceof Uint8Array)) fail("image_bytes_invalid", "Image input must be a byte array.", { outcome: "unknown" });
-  const bytes = Buffer.from(value);
-  if (bytes.length > MAX_IMAGE_BYTES) fail("image_bytes_invalid", "Image bytes exceed the provider boundary limit.", { outcome: "unknown" });
+  let inputBuffer;
+  let inputByteOffset;
+  let inputByteLength;
+  try {
+    inputBuffer = Reflect.apply(TYPED_ARRAY_BUFFER, value, []);
+    inputByteOffset = Reflect.apply(TYPED_ARRAY_BYTE_OFFSET, value, []);
+    inputByteLength = Reflect.apply(TYPED_ARRAY_BYTE_LENGTH, value, []);
+  } catch {
+    fail("image_bytes_invalid", "Image input must be a valid byte array.", { outcome: "unknown" });
+  }
+  if (!Number.isSafeInteger(inputByteLength) || inputByteLength < 0 || inputByteLength > MAX_IMAGE_BYTES) {
+    fail("image_bytes_invalid", "Image bytes exceed the provider boundary limit.", { outcome: "unknown" });
+  }
+  let bytes;
+  try {
+    // Copy from a canonical view only after checking the intrinsic byte length. This avoids
+    // caller-overridden length properties and never allocates in proportion to oversized input.
+    bytes = Buffer.allocUnsafe(inputByteLength);
+    bytes.set(new Uint8Array(inputBuffer, inputByteOffset, inputByteLength));
+  } catch {
+    fail("image_bytes_invalid", "Image input could not be copied safely.", { outcome: "unknown" });
+  }
   if (bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return decodeAndVerifyPixels(bytes, inspectPng(bytes));
   if (bytes[0] === 0xff && bytes[1] === 0xd8) return decodeAndVerifyPixels(bytes, inspectJpeg(bytes));
   if (bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") {
