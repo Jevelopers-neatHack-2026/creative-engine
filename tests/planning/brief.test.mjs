@@ -176,16 +176,67 @@ test("public planning inputs are copied from bounded own data descriptors before
 });
 
 test("malformed trusted source values never echo sensitive object keys in public planning errors", () => {
-  const sensitiveKey = "person@example.test";
-  for (const invalidValue of [undefined, () => "private"]) {
-    const research = completeResearchPackage();
-    research.preferences.items[0][sensitiveKey] = invalidValue;
-    let failure;
-    try { plan(research); } catch (error) { failure = error; }
-    assert.equal(failure?.code, "invalid_input");
-    assert.equal(`${failure?.message ?? ""} ${failure?.field ?? ""} ${JSON.stringify(failure)}`.includes(sensitiveKey), false);
-    assert.equal(failure?.field?.includes("*") ?? false, true, "unsafe input keys are replaced by a stable path segment");
+  const sensitiveKeys = [
+    "person@example.test",
+    "Bearer inert-fixture-credential",
+    "Basic OnA=",
+    encodeURIComponent("person@example.test"),
+    "https://example.test/file?signature=inert-value",
+  ];
+  const invalidValue = (kind, getterCalls) => {
+    if (kind === "undefined") return undefined;
+    if (kind === "getter") {
+      const child = {};
+      Object.defineProperty(child, "value", { enumerable: true, get() {
+        getterCalls.count += 1;
+        return "private";
+      } });
+      return child;
+    }
+    if (kind === "depth") {
+      const root = {};
+      let current = root;
+      for (let index = 0; index < 40; index += 1) {
+        current.next = {};
+        current = current.next;
+      }
+      return root;
+    }
+    return "x".repeat(20_001);
+  };
+  const kinds = ["undefined", "getter", "depth", "string"];
+  let getterCalls = { count: 0 };
+  const currentPlan = plan();
+
+  for (const sensitiveKey of sensitiveKeys) {
+    for (const kind of kinds) {
+      for (const helper of ["brief", "invalidation"]) {
+        const malformed = invalidValue(kind, getterCalls);
+        let failure;
+        try {
+          if (helper === "brief") {
+            const extra = Object.defineProperty({}, sensitiveKey, { value: malformed, enumerable: true });
+            buildCreativeBrief({
+              trusted_scope: trustedScope,
+              research_package: completeResearchPackage(),
+              context: { created_at: baseTime, environment: "test", billing_mode: "simulated" },
+              customer_preferences: [extra],
+            });
+          } else {
+            const event = invalidationEvent(currentPlan);
+            Object.defineProperty(event, sensitiveKey, { value: malformed, enumerable: true });
+            createResearchInvalidationRequest({ trusted_scope: trustedScope, event });
+          }
+        } catch (error) { failure = error; }
+        assert.equal(failure?.code, "invalid_input", `${helper} ${kind} ${sensitiveKey}`);
+        const publicError = `${failure?.message ?? ""} ${failure?.field ?? ""} ${JSON.stringify(failure)}`;
+        assert.equal(publicError.includes(sensitiveKey), false, `${helper} ${kind} must not echo ${sensitiveKey}`);
+        assert.equal(failure?.field?.includes("*") ?? false, true,
+          `${helper} ${kind} uses a fixed path for untrusted keys`);
+      }
+    }
   }
+  assert.equal(getterCalls.count, 0, "the complete key table rejects accessors without invoking them");
 });
 
 test("company-URL event evidence is hash-bound and remains a source reference rather than a permission grant", () => {

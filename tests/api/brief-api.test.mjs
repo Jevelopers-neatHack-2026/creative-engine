@@ -508,6 +508,40 @@ test("asset proof expiry during final atomic job authorization prevents provider
   assert.equal(system.counters.provider_dispatch, 0);
 });
 
+test("elapsed operation deadline during final atomic job authorization prevents provider dispatch", async (t) => {
+  let now = NOW;
+  let providerEntered = false;
+  let providerAuthorizations = 0;
+  const system = await setup(t, { now: () => now });
+  const created = await createBrief(system.api, "brief-final-deadline-fence");
+  const brief = created.result.brief;
+  const generate = system.ports.provider.generate;
+  system.ports.provider.generate = async (input) => {
+    providerEntered = true;
+    return generate(input);
+  };
+  const authorize = system.ports.jobs.authorizeDispatch;
+  system.ports.jobs.authorizeDispatch = async (input) => {
+    const result = await authorize(input);
+    if (providerEntered) {
+      providerAuthorizations += 1;
+      if (providerAuthorizations === 2) now += 31_000;
+    }
+    return result;
+  };
+  const result = await system.api.invoke(actor(), request("generate", "generate-final-deadline-fence", {
+    brief_id: brief.brief_id, plan: createPlan(brief, { planId: "plan-final-deadline-fence" }),
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "cancelled");
+  assert.equal(result.error.field, "deadline");
+  assert.equal(providerAuthorizations, 2, "the clock advances after the final atomic authorization returns");
+  assert.equal(system.counters.reserve, 1);
+  assert.equal(system.counters.transport, 1);
+  assert.equal(system.counters.provider, 1);
+  assert.equal(system.counters.provider_dispatch, 0, "no fixture provider send follows the expired deadline");
+});
+
 test("persisted cancellation during the post-ACK context lookup is caught by the final job authorization", async (t) => {
   const system = await setup(t);
   const created = await createBrief(system.api, "brief-final-cancel-fence");

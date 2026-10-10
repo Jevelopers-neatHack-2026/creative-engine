@@ -326,6 +326,11 @@ export interface CreativeRuntimePorts {
   planning?: {
     getCurrentResearchPackage?(input: { scope: PlanningScope }):
       Promise<EventIntelligencePackage | Record<string, unknown>> | EventIntelligencePackage | Record<string, unknown>;
+    getBriefAction?(input: { scope: PlanningScope; actor_id: string; action_id: string; request_hash: string }):
+      Promise<Readonly<{ status: "conflict" }> |
+        Readonly<{ status: "replayed"; brief_hash: string; plan: CreativeBriefPlan }> | null> |
+      Readonly<{ status: "conflict" }> |
+      Readonly<{ status: "replayed"; brief_hash: string; plan: CreativeBriefPlan }> | null;
     saveBriefAction?(input: { scope: PlanningScope; actor_id: string; action_id: string; request_hash: string;
       plan: CreativeBriefPlan; expected_brief_hash: string | null }):
       Promise<{ status: "saved" | "replayed"; brief_hash: string; plan: CreativeBriefPlan } |
@@ -354,8 +359,14 @@ export interface CreativeRuntimePorts {
         action: "reproduce" | "modify"; package_id: string; package_hash: string; now: string }):
         Promise<AssetPermissionEvidence>;
     };
-    applyInvalidation?(input: { trusted_scope: PlanningScope; event_id: string }):
-      Promise<CreativeInvalidationResult> | CreativeInvalidationResult;
+    applyInvalidation?(input: { trusted_scope: PlanningScope; actor_id: string; action_id: string;
+      operation: "brief.invalidate"; request_hash: string; event_id: string }):
+      Promise<Readonly<{ public_action_status: "conflict" }> |
+        Readonly<{ public_action_status: "completed" | "pending" | "replayed";
+          invalidation: CreativeInvalidationResult }>> |
+      Readonly<{ public_action_status: "conflict" }> |
+      Readonly<{ public_action_status: "completed" | "pending" | "replayed";
+        invalidation: CreativeInvalidationResult }>;
   };
 }
 

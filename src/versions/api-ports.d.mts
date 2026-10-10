@@ -62,7 +62,7 @@ export interface CreativeVersionRuntimeJobs extends BaseJobs {
       { status: "cancelled" | "stale_context"; job?: NonNullable<Awaited<ReturnType<BaseJobs["get"]>>> }>;
 }
 
-export type CreativeVersionRuntimePorts = Omit<CreativeRuntimePorts, "storage" | "jobs"> & {
+export type CreativeVersionRuntimePorts = Omit<CreativeRuntimePorts, "storage" | "jobs" | "planning"> & {
   storage: CreativeVersionRuntimeStorage;
   jobs: CreativeVersionRuntimeJobs;
   planning: CreativeVersionRuntimePlanning;

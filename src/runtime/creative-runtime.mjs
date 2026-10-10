@@ -1441,8 +1441,11 @@ export function createCreativeApi(options = {}) {
     };
     const assertFinalDispatchEligibility = (signal) => {
       const currentTime = new Date(now()).getTime();
-      if (signal?.aborted || deadline.signal.aborted || !Number.isFinite(currentTime) ||
-        Date.parse(principal.expires_at) <= currentTime) {
+      const deadlineTime = Date.parse(deadline.deadline_at);
+      if (!Number.isFinite(currentTime) || !Number.isFinite(deadlineTime) || currentTime >= deadlineTime) {
+        throw new CreativeApiError("cancelled", request.operation, "deadline");
+      }
+      if (signal?.aborted || deadline.signal.aborted || Date.parse(principal.expires_at) <= currentTime) {
         throw new CreativeApiError("cancelled", request.operation, "dispatch_authorization");
       }
       if (currentPermissionProofs.some((proof) => proof.expires_at <= currentTime)) {

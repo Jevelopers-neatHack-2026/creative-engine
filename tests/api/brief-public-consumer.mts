@@ -1,6 +1,7 @@
 import { createCreativeApi, CREATIVE_API_OPERATIONS } from "creative-engine/api/v1";
 import type {
   CreativeApiRequest,
+  CreativeInvalidationResult,
   CreativeOperation,
   CreativeRuntimePorts,
   TrustedCreativeActor,
@@ -62,8 +63,24 @@ declare const invalidationEvent: ResearchInvalidationEventInput;
 declare const trustedInvalidationEvidence: TrustedInvalidationEvidence;
 declare const permissionEvidence: AssetPermissionEvidence;
 declare const producerAck: ProducerAcknowledgment;
+declare const invalidationResult: CreativeInvalidationResult;
 
 const planning: NonNullable<CreativeRuntimePorts["planning"]> = {
+  async getBriefAction({ scope, actor_id, action_id, request_hash }) {
+    const tenant: string = scope.tenant_id;
+    void [tenant, actor_id, action_id, request_hash];
+    return null;
+  },
+  async applyInvalidation(input) {
+    const scope: PlanningScope = input.trusted_scope;
+    const actorId: string = input.actor_id;
+    const actionId: string = input.action_id;
+    const operation: "brief.invalidate" = input.operation;
+    const requestHash: string = input.request_hash;
+    const eventId: string = input.event_id;
+    void [scope, actorId, actionId, operation, requestHash, eventId];
+    return { public_action_status: "completed" as const, invalidation: invalidationResult };
+  },
   async getCurrentResearchPackage({ scope }): Promise<EventIntelligencePackage> {
     const tenant: string = scope.tenant_id;
     void tenant;
@@ -113,6 +130,7 @@ const invalidationResponse = api.invoke(actor, requests[1]);
 const versionStore = new CreativeVersionStore({ databasePath: "/tmp/brief-public.sqlite", objectRoot: "/tmp/brief-public-objects" });
 const paired = createCreativeVersionApiPorts({ store: versionStore, otherPorts: ports });
 const pairedApi = createCreativeApi({ ports: paired.ports });
+const pairedPortsAsRuntimePorts: CreativeRuntimePorts = paired.ports;
 const versionPlanning: CreativeVersionRuntimePlanning = paired.ports.planning;
 const historicalBrief = versionPlanning.getBriefVersionByHash({
   scope: { tenant_id: actor.tenant_id, project_id: actor.project_id },
@@ -139,4 +157,4 @@ const publicOperations: readonly CreativeOperation[] = CREATIVE_API_OPERATIONS;
 const unsupportedPublicOperation: CreativeOperation = "asset.eligibility";
 
 void [response, invalidationResponse, pairedApi, historicalBrief, usable, plan, safePlanningError, publicOperations,
-  unsupportedPublicOperation];
+  unsupportedPublicOperation, pairedPortsAsRuntimePorts];
