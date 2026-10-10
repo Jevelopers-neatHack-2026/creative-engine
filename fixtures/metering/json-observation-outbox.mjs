@@ -1,4 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 
 /** TEST ONLY: file-backed fixture for observation replay; it has no billing logic. */
 export class JsonObservationOutboxFixture {
@@ -29,32 +30,49 @@ export class JsonObservationOutboxFixture {
 
   async claimPending({ limit }) {
     const state = await this.#read();
+    for (const record of state.records) {
+      if (record.status === "claimed") {
+        record.status = "pending";
+        delete record.claim_token;
+      }
+    }
+    const claimed = state.records.filter((record) => record.status === "pending").slice(0, limit);
+    for (const record of claimed) {
+      record.status = "claimed";
+      record.claim_token = `fixture-claim:${randomUUID()}`;
+    }
+    await this.#write(state);
     return {
       status: "claimed",
-      records: state.records.filter((record) => record.status === "pending").slice(0, limit)
-        .map(({ status: _status, ...record }) => structuredClone(record)),
+      records: claimed.map(({ status: _status, ...record }) => structuredClone(record)),
     };
   }
 
-  async acknowledge({ record_ref, source_observation_id }) {
+  async acknowledge({ record_ref, claim_token, source_observation_id }) {
     if (this.failNextAcknowledge) {
       this.failNextAcknowledge = false;
       throw new Error("fixture simulates loss after external observation acknowledgement");
     }
     const state = await this.#read();
     const record = state.records.find((item) => item.record_ref === record_ref);
-    if (!record || record.observation.source_observation_id !== source_observation_id) {
+    if (!record || record.status !== "claimed" || record.claim_token !== claim_token ||
+      record.observation.source_observation_id !== source_observation_id) {
       return { status: "mismatch", source_observation_id };
     }
     record.status = "delivered";
+    delete record.claim_token;
     await this.#write(state);
     return { status: "acknowledged", source_observation_id };
   }
 
-  async defer({ record_ref, reason }) {
+  async defer({ record_ref, claim_token, reason }) {
     const state = await this.#read();
     const record = state.records.find((item) => item.record_ref === record_ref);
-    if (record?.status === "pending") record.last_retry_reason = reason;
+    if (record?.status === "claimed" && record.claim_token === claim_token) {
+      record.status = "pending";
+      record.last_retry_reason = reason;
+      delete record.claim_token;
+    }
     await this.#write(state);
     return { status: "retained" };
   }

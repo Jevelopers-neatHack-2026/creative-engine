@@ -1,6 +1,7 @@
 const SENSITIVE_PUBLIC_FIELD = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|admission[_-]?token|client[_-]?secret|secret|password|credential|authorization|cookie|qr[_-]?payload|qr[_-]?code|working[_-]?admission|raw[_-]?response)/i;
 const SENSITIVE_PUBLIC_TEXT = [
   /\bBearer\s+[A-Za-z0-9._~+/-]+={0,2}/i,
+  /\b(?:admission[_ -]?token|working[_ -]?admission|qr[_ -]?(?:payload|code))\s*[:=]\s*["']?[^\s"'&,;]+/i,
   /\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|secret|password|authorization|credential|cookie)\s*[:=]\s*["']?[^\s"'&,;]+/i,
   /\bAKIA[0-9A-Z]{16}\b/,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
@@ -50,7 +51,9 @@ export function containsSensitivePublicText(value) {
   let match;
   while ((match = bearer.exec(value)) !== null) {
     const candidate = match[1].replace(/=+$/, "");
-    if (candidate.length >= 8 || !ORDINARY_BEARER_WORDS.has(candidate.toLowerCase())) return true;
+    const hasPadding = match[1].includes("=");
+    const hasFollowingText = value.slice(bearer.lastIndex).trim().length > 0;
+    if (hasPadding || candidate.length >= 8 || !ORDINARY_BEARER_WORDS.has(candidate.toLowerCase()) || !hasFollowingText) return true;
   }
   return SENSITIVE_PUBLIC_TEXT.slice(1).some((pattern) => pattern.test(value));
 }

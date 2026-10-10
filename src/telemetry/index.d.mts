@@ -137,22 +137,25 @@ export declare function executeCreativeMeteredAttempt(args: {
 }>>;
 
 export interface PendingUsageObservationRecord {
-  record_ref: string;
-  attempt: MeteredAttemptRequest;
-  observation: UsageObservation;
+  readonly record_ref: string;
+  readonly claim_token: string;
+  readonly attempt: MeteredAttemptRequest;
+  readonly observation: UsageObservation;
 }
 export interface UsageObservationOutboxPort {
-  claimPending(args: { limit: number }): Promise<{ status: "claimed"; records: PendingUsageObservationRecord[] }>;
+  claimPending(args: { limit: number }): Promise<{ status: "claimed"; records: readonly PendingUsageObservationRecord[] }>;
   acknowledge(args: {
     record_ref: string;
+    claim_token: string;
     source_observation_id: string;
     effective_billable_attempt_id: string;
     authority_status: "accepted" | "duplicate";
-  }): Promise<{ status: "acknowledged"; source_observation_id: string }>;
+  }): Promise<{ status: "acknowledged" | "mismatch"; source_observation_id: string }>;
   defer(args: {
     record_ref: string;
+    claim_token: string;
     reason: "trusted_scope_or_record_unavailable" | "metering_observation_unconfirmed" | "metering_acknowledgement_mismatch" | "outbox_acknowledgement_unconfirmed";
-  }): Promise<{ status: "retained" }>;
+  }): Promise<{ status: "retained" | "lease_lost" }>;
 }
 export declare function deliverPendingUsageObservations(args: {
   meteringPort: Pick<MeteringPort, "recordUsageObservation">;
@@ -165,3 +168,72 @@ export declare function deliverPendingUsageObservations(args: {
   acknowledged: number;
   retained: number;
 }>>;
+
+export interface SqliteTelemetryEvidenceClaim {
+  readonly event: CreativeTelemetryEvidence;
+  readonly record_ref: string;
+  readonly claim_token: string;
+}
+
+export interface SqliteTelemetryOutbox {
+  append(event: CreativeTelemetryEvidence): Promise<{
+    readonly status: "recorded" | "duplicate";
+    readonly event_id: string;
+  }>;
+  enqueueUsageObservation(args: {
+    attempt: MeteredAttemptRequest;
+    trustedScope: TrustedMeteringScope;
+    observation: UsageObservation;
+  }): Promise<{
+    readonly status: "recorded" | "duplicate";
+    readonly record_ref: string;
+    readonly source_observation_id: string;
+    readonly payload_hash: string;
+  }>;
+  claimPending(args: { limit: number }): Promise<{
+    readonly status: "claimed";
+    readonly records: readonly PendingUsageObservationRecord[];
+  }>;
+  acknowledge(args: {
+    record_ref: string;
+    claim_token: string;
+    source_observation_id: string;
+    effective_billable_attempt_id: string;
+    authority_status: "accepted" | "duplicate";
+  }): Promise<{ readonly status: "acknowledged" | "mismatch"; readonly source_observation_id: string }>;
+  defer(args: {
+    record_ref: string;
+    claim_token: string;
+    reason: "trusted_scope_or_record_unavailable" | "metering_observation_unconfirmed" | "metering_acknowledgement_mismatch" | "outbox_acknowledgement_unconfirmed";
+  }): Promise<{ readonly status: "retained" | "lease_lost" }>;
+  claimPendingEvidence(args: { limit: number; leaseMs?: number }): Promise<{
+    readonly status: "claimed";
+    readonly records: readonly SqliteTelemetryEvidenceClaim[];
+  }>;
+  acknowledgeEvidence(args: { event_id: string; claim_token: string }): Promise<{
+    readonly status: "acknowledged" | "lease_lost";
+    readonly event_id: string;
+  }>;
+  deferEvidence(args: {
+    event_id: string;
+    claim_token: string;
+    reason: "sink_unavailable" | "acknowledgement_unknown" | "sink_acknowledgement_invalid";
+  }): Promise<{ readonly status: "retained" | "lease_lost" }>;
+  status(kind: "evidence" | "observation", reference: string): Promise<Readonly<{
+    status: "pending" | "claimed" | "delivered";
+    claim_count: number;
+    created_at: number;
+    delivered_at?: number;
+  }> | undefined>;
+}
+
+/**
+ * Create the CE-11-only durable queue on a caller-owned SQLite DatabaseSync
+ * connection. This adapter stores evidence and observations, not Finance state.
+ */
+export declare function createSqliteTelemetryOutbox(args: {
+  database: object;
+  idFactory?: (kind: string) => string;
+  clock?: () => number | Date;
+  claimLeaseMs?: number;
+}): SqliteTelemetryOutbox;

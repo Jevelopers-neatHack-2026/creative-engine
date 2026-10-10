@@ -12,7 +12,8 @@ test("telemetry depends on C03 contracts and local helpers only, never on API/ru
     const source = await readFile(new URL(entry.name, telemetryRoot), "utf8");
     const imports = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map((match) => match[1]);
     for (const specifier of imports) {
-      assert.match(specifier, /^(?:\.\.\/contracts\/|\.\/)/, `${entry.name} imports only contract and telemetry modules`);
+      assert.match(specifier, /^(?:\.\.\/contracts\/|\.\/|node:crypto$)/,
+        `${entry.name} imports only contract, telemetry, or required built-in hashing helpers`);
     }
     assert.doesNotMatch(source, /from\s+["'][^"']*(?:runtime|\/api\/|openai|typesafe\.ai|neatlogs)[^"']*["']/i);
     assert.doesNotMatch(source, /\bfetch\s*\(|https?\.request\s*\(/i);

@@ -245,6 +245,70 @@ function deepFreeze(value) {
   return value;
 }
 
+function publicMeteringOutcome(outcome) {
+  try {
+    return projectPublicTelemetry(outcome, { maxDepth: 12, maxNodes: 512, maxBytes: 16 * 1024 }).value;
+  } catch {
+    // C03 has already completed its authoritative transition. Preserve its
+    // outcome state while returning only fixed, bounded fields if projection of
+    // an unexpected adapter response fails; never turn a committed settlement
+    // into a caller-visible execution failure.
+    const statuses = new Set([
+      "cancelled_before_reservation", "reservation_unavailable", "reservation_denied",
+      "cancelled_before_dispatch", "pre_dispatch_release_unknown", "dispatch_authorization_unknown",
+      "cancelled_after_dispatch", "dispatch_outcome_unknown", "transport_attempt_unreported",
+      "dispatch_result_invalid", "usage_observation_invalid", "usage_unknown",
+      "usage_observation_unconfirmed", "usage_incomplete", "settlement_unknown",
+      "settlement_pending", "settled",
+    ]);
+    const status = statuses.has(outcome?.status) ? outcome.status : "dispatch_outcome_unknown";
+    const safe = { status, published: false };
+    const providerOutcome = ["succeeded", "failed", "partial", "unknown"].includes(outcome?.provider_outcome)
+      ? outcome.provider_outcome
+      : "unknown";
+    const safeReference = (value) => {
+      try { return assertSafePublicIdentifier(value, { maxLength: 256 }); }
+      catch { return "[REDACTED]"; }
+    };
+    const safeAck = () => ({
+      status: outcome?.observation_ack?.status === "duplicate" ? "duplicate" : "accepted",
+      source_observation_id: safeReference(outcome?.observation_ack?.source_observation_id),
+      effective_billable_attempt_id: safeReference(outcome?.observation_ack?.effective_billable_attempt_id),
+    });
+    if (["usage_observation_invalid", "usage_unknown", "usage_observation_unconfirmed", "usage_incomplete", "settlement_unknown", "settlement_pending", "settled"].includes(status)) {
+      safe.provider_outcome = providerOutcome;
+    }
+    if (outcome?.hold === "retained_for_reconciliation") safe.hold = outcome.hold;
+    if (["pre_dispatch_release_unknown", "cancelled_after_dispatch", "dispatch_outcome_unknown",
+      "transport_attempt_unreported", "dispatch_result_invalid", "usage_observation_invalid",
+      "usage_unknown", "usage_observation_unconfirmed", "usage_incomplete", "settlement_unknown"].includes(status)) {
+      safe.hold = "retained_for_reconciliation";
+    }
+    if (status === "reservation_unavailable") safe.error_code = "metering_authority_unavailable";
+    else if (status === "reservation_denied") safe.error_code = "budget_unavailable";
+    else if (status === "dispatch_authorization_unknown") safe.error_code = "in_flight_transition_unknown";
+    else if (status === "dispatch_outcome_unknown") safe.error_code = "provider_outcome_unknown";
+    else if (status === "dispatch_result_invalid") safe.error_code = "invalid_provider_response";
+    else if (status === "usage_observation_invalid") safe.error_code = "invalid_usage_observation";
+    else if (status === "settlement_unknown") safe.error_code = "settlement_response_unknown";
+    if (status === "usage_incomplete" || status === "settled") safe.observation_ack = safeAck();
+    if (status === "settled" && outcome?.settlement?.status === "settled") {
+      safe.settlement = {
+        reservation_id: safeReference(outcome.settlement.reservation_id),
+        status: "settled",
+        consumed_amount: outcome.settlement.consumed_amount,
+        released_unused_amount: outcome.settlement.released_unused_amount,
+      };
+    } else if (status === "settlement_pending") {
+      safe.settlement = {
+        reservation_id: safeReference(outcome?.settlement?.reservation_id),
+        status: "held_for_reconciliation",
+      };
+    }
+    return projectPublicTelemetry(safe, { maxDepth: 8, maxNodes: 128, maxBytes: 8 * 1024 }).value;
+  }
+}
+
 /**
  * Run C03's single authoritative metering executor with a required sanitized
  * preflight event and per-transport evidence. It does not publish provider data.
@@ -388,7 +452,7 @@ export async function executeCreativeMeteredAttempt({
     // The caller may persist this sanitized event for replay after a telemetry outage.
   }
   return Object.freeze({
-    outcome,
+    outcome: publicMeteringOutcome(outcome),
     evidence_delivery: finalEvidenceStatus,
     ...(finalEvidenceStatus === "pending" && outcomeEvent ? { pending_evidence: outcomeEvent } : {}),
   });

@@ -261,6 +261,59 @@ test("post-settlement evidence outage is reported as pending without converting 
   assert.equal(authority.reservationFor("attempt:fixture-001").state, "settled");
 });
 
+test("public metering outcome redacts unsafe settlement references without changing Finance outcome", async () => {
+  const authority = new FakeMeteringAuthority();
+  const settle = authority.settleReservation.bind(authority);
+  authority.settleReservation = async (command) => ({
+    ...await settle(command),
+    posting_refs: [
+      "ghp_SyntheticCredentialValueSyntheticCredentialValue",
+      "person@example.invalid",
+      "posting:fixture-safe-1",
+    ],
+  });
+  const result = await executeCreativeMeteredAttempt({
+    meteringPort: authority,
+    evidencePort: evidencePort([]),
+    request: fixtureAttempt({ billable_attempt_id: "attempt:privacy-posting-refs" }),
+    trustedScope,
+    modes,
+    dispatch: successfulDispatch([]),
+    idFactory: idFactory(),
+  });
+  assert.equal(result.outcome.status, "settled");
+  assert.equal(result.outcome.settlement.status, "settled");
+  assert.deepEqual(result.outcome.settlement.posting_refs, [
+    "[REDACTED]", "[REDACTED]", "posting:fixture-safe-1",
+  ]);
+  assert.equal(authority.reservationFor("attempt:privacy-posting-refs").state, "settled");
+  const publicJson = JSON.stringify(result);
+  assert.equal(publicJson.includes("ghp_SyntheticCredentialValueSyntheticCredentialValue"), false);
+  assert.equal(publicJson.includes("person@example.invalid"), false);
+});
+
+test("oversized Finance metadata cannot turn a completed settlement into an execution failure", async () => {
+  const authority = new FakeMeteringAuthority();
+  const settle = authority.settleReservation.bind(authority);
+  authority.settleReservation = async (command) => ({
+    ...await settle(command),
+    posting_refs: Array.from({ length: 600 }, (_, index) => `posting:fixture:${index}`),
+  });
+  const result = await executeCreativeMeteredAttempt({
+    meteringPort: authority,
+    evidencePort: evidencePort([]),
+    request: fixtureAttempt({ billable_attempt_id: "attempt:oversized-settlement-metadata" }),
+    trustedScope,
+    modes,
+    dispatch: successfulDispatch([]),
+    idFactory: idFactory(),
+  });
+  assert.equal(result.outcome.status, "settled");
+  assert.equal(result.outcome.settlement.status, "settled");
+  assert.equal("posting_refs" in result.outcome.settlement, false);
+  assert.equal(authority.reservationFor("attempt:oversized-settlement-metadata").state, "settled");
+});
+
 test("C03 authoritative atomic reservation prevents the losing concurrent attempt from dispatching", async () => {
   const authority = new FakeMeteringAuthority({ budget: "0.08", defaultHold: "0.08" });
   const evidence = evidencePort([]);

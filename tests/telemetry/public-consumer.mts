@@ -7,6 +7,7 @@ import {
   TelemetryPrivacyError,
   assertSafePublicIdentifier,
   createTelemetryEvidence,
+  createSqliteTelemetryOutbox,
   createUsageObservation,
   deduplicateUsageObservations,
   deliverPendingUsageObservations,
@@ -15,6 +16,7 @@ import {
   type CreativeTelemetryEvidence,
   type TelemetryEvidencePort,
   type TelemetryModeContext,
+  type SqliteTelemetryOutbox,
   type UsageObservationOutboxPort,
 } from "../../src/telemetry/index.mjs";
 import { METERING_PROPOSAL_VERSION, type MeteredAttemptRequest, type TrustedMeteringScope, type UsageObservation } from "../../src/contracts/metering.mjs";
@@ -65,6 +67,15 @@ const outbox: UsageObservationOutboxPort = {
   async acknowledge(args) { return { status: "acknowledged", source_observation_id: args.source_observation_id }; },
   async defer() { return { status: "retained" }; },
 };
+const sqliteOutbox: SqliteTelemetryOutbox = createSqliteTelemetryOutbox({
+  database: {} as object,
+  idFactory: (kind) => `id:${kind}`,
+  clock: () => 1_000,
+  claimLeaseMs: 1_000,
+});
+void sqliteOutbox.enqueueUsageObservation({ attempt, trustedScope: scope, observation: usage });
+void sqliteOutbox.append(evidence);
+void sqliteOutbox.claimPendingEvidence({ limit: 4, leaseMs: 500 });
 
 void executeCreativeMeteredAttempt({
   meteringPort: {

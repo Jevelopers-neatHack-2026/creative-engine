@@ -37,21 +37,34 @@ test("recursive projection omits unsafe keys and redacts unsafe nested values wi
       qr_payload: "SYNTHETIC-QR-PAYLOAD",
       "Bearer x": "synthetic value",
       display: "Bearer x",
+      bearer: "Bearer a",
+      bearer_the: "Bearer the",
+      bearer_padding: "Bearer a=",
+      embedded_admission: "metadata: admission_token=SYNTHETIC-ADMISSION-CREDENTIAL",
       safe_note: "the bearer of the note has no credential",
     },
   });
   const admissionJson = JSON.stringify(admission.value);
-  for (const value of ["admission_token", "qr_payload", "Bearer x", "SYNTHETIC-ADMISSION-TOKEN", "SYNTHETIC-QR-PAYLOAD"]) {
+  for (const value of ["admission_token", "qr_payload", "Bearer x", "SYNTHETIC-ADMISSION-TOKEN", "SYNTHETIC-QR-PAYLOAD", "SYNTHETIC-ADMISSION-CREDENTIAL"]) {
     assert.equal(admissionJson.includes(value), false, value);
   }
   assert.equal(admissionJson.includes("[REDACTED]"), true);
   assert.equal(admissionJson.includes("the bearer of the note has no credential"), true);
+  assert.equal(admission.value.nested.bearer, "[REDACTED]");
+  assert.equal(admission.value.nested.bearer_the, "[REDACTED]");
+  assert.equal(admission.value.nested.bearer_padding, "[REDACTED]");
+  assert.equal(admission.value.nested.embedded_admission, "[REDACTED]");
+  assert.equal(admission.value.nested.safe_note, "the bearer of the note has no credential");
 });
 
 test("Basic credentials, signed URLs, email and phone canaries are detected; ordinary prose survives", () => {
   const unsafeStrings = [
     "Authorization: Bearer synthetic-not-real",
     "Bearer x",
+    "Bearer a",
+    "Bearer the",
+    "Bearer a=",
+    "metadata: admission_token=SYNTHETIC-ADMISSION-CREDENTIAL",
     "Basic OnBhc3N3b3Jk",
     "Basic dTpw",
     "Basic dTo=",

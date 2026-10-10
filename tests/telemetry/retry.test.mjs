@@ -79,6 +79,7 @@ test("malformed duplicate outbox references fail before any authority call", asy
   let authorityCalls = 0;
   const duplicate = {
     record_ref: "outbox:duplicate",
+    claim_token: "claim:duplicate",
     attempt: fixtureAttempt(),
     observation: { source_observation_id: "usage:duplicate" },
   };
@@ -91,5 +92,14 @@ test("malformed duplicate outbox references fail before any authority call", asy
     },
     trustedScopeForRecord: () => trustedScope,
   }), TelemetryBoundaryError);
+  await assert.rejects(() => deliverPendingUsageObservations({
+    meteringPort: { async recordUsageObservation() { authorityCalls += 1; } },
+    outbox: {
+      async claimPending() { return { status: "claimed", records: [duplicate, { ...duplicate, record_ref: "outbox:other" }] }; },
+      async acknowledge(args) { return { status: "acknowledged", source_observation_id: args.source_observation_id }; },
+      async defer() { return { status: "retained" }; },
+    },
+    trustedScopeForRecord: () => trustedScope,
+  }), (error) => error instanceof TelemetryBoundaryError && error.code === "duplicate_outbox_claim_token");
   assert.equal(authorityCalls, 0);
 });

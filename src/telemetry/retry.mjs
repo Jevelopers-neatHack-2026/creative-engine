@@ -20,14 +20,23 @@ function validateBatch(value, limit) {
     throw new TelemetryBoundaryError("invalid_observation_batch");
   }
   const references = new Set();
+  const claimTokens = new Set();
   const snapshots = [];
   for (const record of value.records) {
-    if (!isRecord(record) || typeof record.record_ref !== "string" || record.record_ref.length > 256 ||
-      !isRecord(record.attempt) || !isRecord(record.observation)) {
+    if (!isRecord(record) || !isRecord(record.attempt) || !isRecord(record.observation) ||
+      typeof record.record_ref !== "string" || typeof record.claim_token !== "string") {
+      throw new TelemetryBoundaryError("invalid_observation_record");
+    }
+    try {
+      assertSafePublicIdentifier(record.record_ref, { maxLength: 256 });
+      assertSafePublicIdentifier(record.claim_token, { maxLength: 256 });
+    } catch {
       throw new TelemetryBoundaryError("invalid_observation_record");
     }
     if (references.has(record.record_ref)) throw new TelemetryBoundaryError("duplicate_outbox_reference");
+    if (claimTokens.has(record.claim_token)) throw new TelemetryBoundaryError("duplicate_outbox_claim_token");
     references.add(record.record_ref);
+    claimTokens.add(record.claim_token);
     try {
       snapshots.push(structuredClone(record));
     } catch {
@@ -59,10 +68,10 @@ function validatePublicObservationIdentity(attempt, observation, scope) {
   }
 }
 
-async function defer(outbox, recordRef, reason) {
+async function defer(outbox, recordRef, claimToken, reason) {
   try {
-    const result = await outbox.defer({ record_ref: recordRef, reason });
-    return isRecord(result) && result.status === "retained";
+    const result = await outbox.defer({ record_ref: recordRef, claim_token: claimToken, reason });
+    return isRecord(result) && ["retained", "lease_lost"].includes(result.status);
   } catch {
     return false;
   }
@@ -93,6 +102,7 @@ export async function deliverPendingUsageObservations({
   let retained = 0;
   for (const pending of records) {
     const recordRef = pending.record_ref;
+    const claimToken = pending.claim_token;
     let attempt;
     let scope;
     let observationId;
@@ -103,7 +113,7 @@ export async function deliverPendingUsageObservations({
       observationId = assertSafePublicIdentifier(pending.observation.source_observation_id, { maxLength: 256 });
       validatePublicObservationIdentity(attempt, pending.observation, scope);
     } catch {
-      await defer(outbox, recordRef, "trusted_scope_or_record_unavailable");
+      await defer(outbox, recordRef, claimToken, "trusted_scope_or_record_unavailable");
       retained += 1;
       continue;
     }
@@ -117,13 +127,13 @@ export async function deliverPendingUsageObservations({
         observation: pending.observation,
       });
     } catch {
-      await defer(outbox, recordRef, "metering_observation_unconfirmed");
+      await defer(outbox, recordRef, claimToken, "metering_observation_unconfirmed");
       retained += 1;
       continue;
     }
     if (authorityAck.source_observation_id !== observationId ||
       authorityAck.effective_billable_attempt_id !== attempt.billable_attempt_id) {
-      await defer(outbox, recordRef, "metering_acknowledgement_mismatch");
+      await defer(outbox, recordRef, claimToken, "metering_acknowledgement_mismatch");
       retained += 1;
       continue;
     }
@@ -131,13 +141,14 @@ export async function deliverPendingUsageObservations({
     try {
       const persistedAck = await outbox.acknowledge({
         record_ref: recordRef,
+        claim_token: claimToken,
         source_observation_id: observationId,
         effective_billable_attempt_id: attempt.billable_attempt_id,
         authority_status: authorityAck.status,
       });
       if (!isRecord(persistedAck) || persistedAck.status !== "acknowledged" ||
         persistedAck.source_observation_id !== observationId) {
-        await defer(outbox, recordRef, "outbox_acknowledgement_unconfirmed");
+        await defer(outbox, recordRef, claimToken, "outbox_acknowledgement_unconfirmed");
         retained += 1;
         continue;
       }
@@ -145,7 +156,7 @@ export async function deliverPendingUsageObservations({
     } catch {
       // Authority ack has already been confirmed. Replaying the same source ID is
       // safe because C03 receives an idempotent recordUsageObservation call.
-      await defer(outbox, recordRef, "outbox_acknowledgement_unconfirmed");
+      await defer(outbox, recordRef, claimToken, "outbox_acknowledgement_unconfirmed");
       retained += 1;
     }
   }
