@@ -63,6 +63,9 @@ const EVAL_OWNER_ROLES = {
   'EVAL-03': 'Product and frontend',
   'EVAL-04': 'Finance and reliability',
 };
+const SENSITIVE_KEY = /(authorization|api[_-]?key|secret|credential|password|access[_-]?token|refresh[_-]?token|email|customer[_-]?(name|id|account)|account[_-]?(number|id)|raw[_-]?(prompt|response|image|brief))/i;
+const SENSITIVE_VALUE = /\b(?:Bearer\s+[A-Za-z0-9._~+/=-]+|sk-[A-Za-z0-9_-]{8,}|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/i;
+const SAFE_SCHEMA_FINDING_SEGMENTS = new Set(['budget_authorization']);
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -73,7 +76,7 @@ function sha256(value) {
 }
 
 function isSha256(value) {
-  return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value);
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 }
 
 function canonical(value) {
@@ -83,7 +86,14 @@ function canonical(value) {
 }
 
 function add(findings, key, reason) {
-  findings.push({ key, reason });
+  const safeKey = String(key).split(/([.:()[\]])/).map((segment) => {
+    if (/^[.:()[\]]+$/.test(segment)) return segment;
+    if (segment === '') return segment;
+    if (SAFE_SCHEMA_FINDING_SEGMENTS.has(segment)) return segment;
+    if (/^[A-Za-z0-9_-]{1,64}$/.test(segment) && !SENSITIVE_KEY.test(segment) && !SENSITIVE_VALUE.test(segment)) return segment;
+    return '[redacted]';
+  }).join('');
+  findings.push({ key: safeKey, reason });
 }
 
 function verifyExternalEvidence(verifier, evidence, context) {
@@ -282,6 +292,7 @@ function validateQuestionRecord(question, index, findings) {
   ];
   for (const field of required) if (!(field in question)) add(findings, `${prefix}.${field}`, 'required_key_missing');
   if (typeof question.question_id !== 'string' || question.question_id.length === 0) add(findings, `${prefix}.question_id`, 'required_nonempty_id');
+  if (typeof question.version !== 'string' || question.version.length === 0) add(findings, `${prefix}.version`, 'required_nonempty_question_version');
   if (!['CE-06', 'CE-09'].includes(question.owner_issue_key)) add(findings, `${prefix}.owner_issue_key`, 'must_be_owned_by_CE-06_or_CE-09');
   if (question.owner_role !== 'Creative and fulfillment') add(findings, `${prefix}.owner_role`, 'question_owner_role_must_be_preserved');
   if (!Object.hasOwn(REQUIRED_FIXTURES_BY_PRIMITIVE, question.primitive)) add(findings, `${prefix}.primitive`, 'must_be_choice_score_or_noul');
@@ -359,7 +370,11 @@ export function validateQuestionRegister(register, {
     if (!isSha256(definitionHashes) || register.inventory_pin?.sha256 !== definitionHashes) add(findings, 'questionRegister.inventory_pin.sha256', 'inventory_hash_does_not_match_independent_expected_definitions');
   }
   const registeredQuestions = Array.isArray(register.questions) ? register.questions : [];
-  if (allowSyntheticFixture && registeredQuestions.some((question) => question?.synthetic !== true || !question.question_id?.startsWith('fixture.'))) {
+  if (allowSyntheticFixture && registeredQuestions.some((question) => (
+    question?.synthetic !== true
+    || typeof question?.question_id !== 'string'
+    || !question.question_id.startsWith('fixture.')
+  ))) {
     add(findings, 'questionRegister.questions', 'synthetic_questions_must_be_explicitly_test_only');
   }
   if (!Array.isArray(register.questions) || register.questions.length === 0) {
@@ -376,10 +391,25 @@ export function validateQuestionRegister(register, {
   if (Array.isArray(register.questions)) register.questions.forEach((question, index) => validateQuestionRecord(question, index, findings));
   if (isRecord(expectedQuestionDefinitions)) {
     for (const question of registeredQuestions) {
-      const expected = expectedQuestionDefinitions[question?.question_id];
+      const questionId = question?.question_id;
+      const expected = typeof questionId === 'string' && Object.hasOwn(expectedQuestionDefinitions, questionId)
+        ? expectedQuestionDefinitions[questionId]
+        : undefined;
       if (!expected || !isRecord(question)) continue;
-      for (const field of ['primitive', 'schema_sha256', 'model_pin', 'permitted_states', 'permitted_options', 'dependencies', 'fallback', 'required_strata', 'thresholds', 'telemetry_event']) {
-        if (!sameJson(question[field], expected[field])) add(findings, `questionRegister.questions.${question.question_id}.${field}`, 'does_not_match_independently_pinned_definition');
+      const independentlyBoundFields = new Set([
+        'question_id', 'version', 'owner_issue_key', 'owner_role', 'primitive', 'schema_sha256',
+        'model_pin', 'permitted_states', 'permitted_options', 'dependencies', 'fallback',
+        'required_strata', 'thresholds', 'telemetry_event', 'fixture_ref', 'synthetic',
+      ]);
+      for (const field of independentlyBoundFields) {
+        if (!sameJson(question[field], expected[field])) add(findings, `questionRegister.questions.${questionId}.${field}`, 'does_not_match_independently_pinned_definition');
+      }
+      const allFields = new Set([...Object.keys(question), ...Object.keys(expected)]);
+      for (const field of allFields) {
+        if (!independentlyBoundFields.has(field) && !sameJson(question[field], expected[field])) {
+          add(findings, `questionRegister.questions.${questionId}.definition`, 'does_not_match_independently_pinned_definition');
+          break;
+        }
       }
     }
   }
@@ -403,7 +433,9 @@ export function validateQuestionRegister(register, {
     }
 
     const fixture = fixtureRows.find((candidate) => candidate?.question_id === id);
-    const requiredFixtures = REQUIRED_FIXTURES_BY_PRIMITIVE[question.primitive] ?? [];
+    const requiredFixtures = Object.hasOwn(REQUIRED_FIXTURES_BY_PRIMITIVE, question.primitive)
+      ? REQUIRED_FIXTURES_BY_PRIMITIVE[question.primitive]
+      : [];
     if (!fixture) add(findings, `questionFixtures.${id}`, 'primitive_fixture_record_missing');
     else {
       const cases = Array.isArray(fixture.cases) ? fixture.cases : [];
@@ -476,6 +508,7 @@ export function digestSampleHashes(sampleHashes) {
 export function digestSampleRecords(samples) {
   const records = [...samples].map((sample) => ({
     sha256: sample.sha256,
+    family_id: sample.family_id ?? null,
     gold_label_ref: sample.gold_label_ref ?? null,
     fixture_label: sample.fixture_label ?? null,
     question_ids: Array.isArray(sample.question_ids) ? [...sample.question_ids].sort() : [],
@@ -544,6 +577,7 @@ export function validateCorpusManifest(manifest, { allowSyntheticFixture = false
       if (!isSha256(sample.sha256)) add(findings, `${prefix}.samples.${sampleIndex}.sha256`, 'immutable_sample_sha256_required');
       else if (seenWithin.has(sample.sha256)) add(findings, `${prefix}.samples.${sampleIndex}.sha256`, 'duplicate_sample_hash_in_split');
       else seenWithin.add(sample.sha256);
+      if (typeof sample.family_id !== 'string' || sample.family_id.trim().length === 0) add(findings, `${prefix}.samples.${sampleIndex}.family_id`, 'immutable_sample_family_required');
       if (!Array.isArray(sample.question_ids) || sample.question_ids.length === 0) add(findings, `${prefix}.samples.${sampleIndex}.question_ids`, 'question_inventory_binding_required');
       if (!Array.isArray(sample.strata)) add(findings, `${prefix}.samples.${sampleIndex}.strata`, 'strata_tags_required');
       if (allowSyntheticFixture) {
@@ -599,6 +633,26 @@ export function validateCorpusManifest(manifest, { allowSyntheticFixture = false
       if (previous) add(findings, `corpusManifest.splits.${split?.id}.samples.${sample.sha256}`, `hash_reused_from_${previous}`);
       else hashes.set(sample.sha256, split?.id ?? 'unknown');
       allSamples.push(sample);
+    }
+  }
+  const disjointFamilyGroups = [
+    ['routing_calibration', 'routing_held_out', 'routing_safety'],
+    ['inspection_calibration', 'inspection_held_out'],
+  ];
+  for (const group of disjointFamilyGroups) {
+    const familyOwner = new Map();
+    for (const splitId of group) {
+      const split = byId.get(splitId);
+      for (const [sampleIndex, sample] of (Array.isArray(split?.samples) ? split.samples : []).entries()) {
+        if (typeof sample?.family_id !== 'string' || sample.family_id.trim().length === 0) continue;
+        const familyKey = sample.family_id.trim().toLowerCase();
+        const previous = familyOwner.get(familyKey);
+        if (previous && previous !== splitId) {
+          add(findings, `corpusManifest.splits.${splitId}.samples.${sampleIndex}.family_id`, `family_reused_from_${previous}`);
+        } else {
+          familyOwner.set(familyKey, splitId);
+        }
+      }
     }
   }
   for (const stratum of COVERAGE_STRATA) {
@@ -658,28 +712,51 @@ export function validateEvaluationReport(report, { requiredCells } = {}) {
     const key = `${row?.question_id ?? ''}::${row?.stratum_id ?? ''}`;
     if (rowByKey.has(key)) add(findings, `evaluationReport.question_strata.${key}`, 'duplicate_question_stratum_result');
     else rowByKey.set(key, row);
+    if (!isRecord(row)) add(findings, `evaluationReport.question_strata.${key}`, 'result_row_must_be_object');
   }
   for (const cell of cells) {
     const key = `${cell?.question_id ?? ''}::${cell?.stratum_id ?? ''}`;
+    if (typeof cell?.question_id !== 'string' || cell.question_id.length === 0) add(findings, `evaluationReport.required_cells.${key}.question_id`, 'nonempty_question_id_required');
+    if (typeof cell?.stratum_id !== 'string' || cell.stratum_id.length === 0) add(findings, `evaluationReport.required_cells.${key}.stratum_id`, 'nonempty_stratum_id_required');
+    if (typeof cell?.question_version !== 'string' || cell.question_version.length === 0) add(findings, `evaluationReport.required_cells.${key}.question_version`, 'pinned_question_version_required');
+    if (!isSha256(cell?.schema_sha256)) add(findings, `evaluationReport.required_cells.${key}.schema_sha256`, 'pinned_question_schema_hash_required');
+    if (!Number.isInteger(cell?.expected_count) || cell.expected_count < 1) add(findings, `evaluationReport.required_cells.${key}.expected_count`, 'independently_pinned_positive_expected_count_required');
     const row = rowByKey.get(key);
     if (!row) {
       add(findings, `evaluationReport.question_strata.${key}`, 'required_question_stratum_result_missing');
       continue;
     }
+    if (!isRecord(row)) continue;
     for (const field of ['false_negatives', 'abstention_count', 'latency_ms', 'downstream_cost', 'uncertainty', 'failure_count', 'denominator', 'attempted_count', 'bootstrap_interval', 'negative_findings']) {
       if (!(field in row)) add(findings, `evaluationReport.question_strata.${key}.${field}`, 'required_metric_missing');
     }
+    if (row.question_version !== cell.question_version) add(findings, `evaluationReport.question_strata.${key}.question_version`, 'result_question_version_does_not_match_required_cell');
+    if (row.schema_sha256 !== cell.schema_sha256) add(findings, `evaluationReport.question_strata.${key}.schema_sha256`, 'result_schema_hash_does_not_match_required_cell');
     if (!Number.isInteger(row.denominator) || row.denominator < 1) add(findings, `evaluationReport.question_strata.${key}.denominator`, 'positive_denominator_required');
+    if (Number.isInteger(cell.expected_count) && cell.expected_count > 0 && row.denominator !== cell.expected_count) add(findings, `evaluationReport.question_strata.${key}.denominator`, 'denominator_must_match_independently_frozen_expected_count');
     if (!Number.isInteger(row.attempted_count) || row.attempted_count !== row.denominator) add(findings, `evaluationReport.question_strata.${key}.attempted_count`, 'all_attempts_including_failures_must_be_denominator');
     if (!Number.isInteger(row.failure_count) || row.failure_count < 0 || row.failure_count > row.denominator) add(findings, `evaluationReport.question_strata.${key}.failure_count`, 'failure_count_must_be_in_denominator');
+    if (!Number.isInteger(row.false_negatives) || row.false_negatives < 0 || row.false_negatives > row.denominator) add(findings, `evaluationReport.question_strata.${key}.false_negatives`, 'false_negatives_must_be_within_denominator');
+    if (!Number.isInteger(row.abstention_count) || row.abstention_count < 0 || row.abstention_count > row.denominator) add(findings, `evaluationReport.question_strata.${key}.abstention_count`, 'abstentions_must_be_within_denominator');
+    if (!isRecord(row.latency_ms) || !Number.isFinite(row.latency_ms.p95) || row.latency_ms.p95 < 0) add(findings, `evaluationReport.question_strata.${key}.latency_ms`, 'nonnegative_finite_p95_latency_required');
+    else if (Object.values(row.latency_ms).some((value) => !Number.isFinite(value) || value < 0)) add(findings, `evaluationReport.question_strata.${key}.latency_ms`, 'latency_values_must_be_nonnegative_finite_numbers');
+    if (!isRecord(row.uncertainty) || !Number.isFinite(row.uncertainty.value) || row.uncertainty.value < 0) add(findings, `evaluationReport.question_strata.${key}.uncertainty`, 'nonnegative_finite_uncertainty_required');
     if (!Array.isArray(row.negative_findings)) add(findings, `evaluationReport.question_strata.${key}.negative_findings`, 'negative_findings_must_be_reported_as_array');
-    if (!isRecord(row.bootstrap_interval) || row.bootstrap_interval.level !== 0.95 || row.bootstrap_interval.method !== 'family-bootstrap') {
+    if (!isRecord(row.bootstrap_interval)
+      || row.bootstrap_interval.level !== 0.95
+      || row.bootstrap_interval.method !== 'family-bootstrap'
+      || !Number.isFinite(row.bootstrap_interval.lower)
+      || !Number.isFinite(row.bootstrap_interval.upper)
+      || row.bootstrap_interval.lower < 0
+      || row.bootstrap_interval.lower > row.bootstrap_interval.upper) {
       add(findings, `evaluationReport.question_strata.${key}.bootstrap_interval`, '95_percent_family_bootstrap_interval_required');
     }
     if (!isRecord(row.downstream_cost) || !['known', 'estimated', 'unknown'].includes(row.downstream_cost.status)) {
       add(findings, `evaluationReport.question_strata.${key}.downstream_cost`, 'known_estimated_or_unknown_cost_status_required');
-    } else if (row.downstream_cost.status === 'unknown' && report.economy_claim === true) {
-      add(findings, 'evaluationReport.economy_claim', 'unknown_total_cost_blocks_economy_claim');
+    } else {
+      if (row.downstream_cost.status === 'unknown' && row.downstream_cost.amount !== null) add(findings, `evaluationReport.question_strata.${key}.downstream_cost.amount`, 'unknown_cost_amount_must_be_null');
+      if (row.downstream_cost.status !== 'unknown' && (!Number.isFinite(row.downstream_cost.amount) || row.downstream_cost.amount < 0)) add(findings, `evaluationReport.question_strata.${key}.downstream_cost.amount`, 'known_cost_amount_must_be_nonnegative_finite');
+      if (row.downstream_cost.status === 'unknown' && report.economy_claim === true) add(findings, 'evaluationReport.economy_claim', 'unknown_total_cost_blocks_economy_claim');
     }
   }
   for (const key of rowByKey.keys()) {
@@ -689,9 +766,6 @@ export function validateEvaluationReport(report, { requiredCells } = {}) {
   }
   return findings;
 }
-
-const SENSITIVE_KEY = /(authorization|api[_-]?key|secret|credential|password|access[_-]?token|refresh[_-]?token|email|customer[_-]?(name|id|account)|account[_-]?(number|id)|raw[_-]?(prompt|response|image|brief))/i;
-const SENSITIVE_VALUE = /\b(?:Bearer\s+[A-Za-z0-9._~+/=-]+|sk-[A-Za-z0-9_-]{8,}|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/i;
 
 export function validatePublicEvidence(value) {
   const findings = [];
@@ -710,7 +784,12 @@ export function validatePublicEvidence(value) {
       return;
     }
     for (const [key, child] of Object.entries(node)) {
-      const next = path ? `${path}.${key}` : key;
+      const safeKey = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key)
+        && !SENSITIVE_KEY.test(key)
+        && !SENSITIVE_VALUE.test(key)
+        ? key
+        : '[redacted]';
+      const next = path ? `${path}.${safeKey}` : safeKey;
       if (SENSITIVE_KEY.test(key)) add(findings, next, 'sensitive_field_name');
       visit(child, next);
     }
@@ -817,7 +896,7 @@ export function evaluatePolicyAcceptance({
 export function evaluatePaidEvaluationReadiness({
   policy,
   acceptanceInputs,
-  modelPinKeys = ['vision_observation', 'generative_classification_baseline'],
+  modelPinKeys,
   includeModelBasedPlanning = false,
   trustedEvidenceVerifier,
 } = {}) {
@@ -828,10 +907,24 @@ export function evaluatePaidEvaluationReadiness({
     trustedEvidenceVerifier,
   });
   if (!acceptance.accepted) add(findings, 'paidEvaluation.policy_acceptance', 'owner_accepted_policy_and_corpus_required');
-  const requestedPins = Array.isArray(modelPinKeys) ? [...modelPinKeys] : [];
-  if (includeModelBasedPlanning && !requestedPins.includes('model_based_planning')) requestedPins.push('model_based_planning');
+  const requestedPins = new Set(['vision_observation', 'generative_classification_baseline']);
+  const supportedPinKeys = new Set(['vision_observation', 'generative_classification_baseline', 'model_based_planning']);
+  if (modelPinKeys !== undefined) {
+    if (!Array.isArray(modelPinKeys)) add(findings, 'paidEvaluation.modelPinKeys', 'additional_model_pin_keys_must_be_an_array');
+    else {
+      for (const pinKey of modelPinKeys) {
+        if (typeof pinKey !== 'string' || !supportedPinKeys.has(pinKey)) {
+          add(findings, 'paidEvaluation.modelPinKeys', 'unsupported_or_malformed_model_pin_key');
+        } else requestedPins.add(pinKey);
+      }
+    }
+  }
+  if (typeof includeModelBasedPlanning !== 'boolean') add(findings, 'paidEvaluation.includeModelBasedPlanning', 'must_be_boolean');
+  else if (includeModelBasedPlanning) requestedPins.add('model_based_planning');
   for (const pinKey of requestedPins) {
-    const pin = policy?.model_pins?.[pinKey];
+    const pin = isRecord(policy?.model_pins) && Object.hasOwn(policy.model_pins, pinKey)
+      ? policy.model_pins[pinKey]
+      : undefined;
     const prefix = `paidEvaluation.model_pins.${pinKey}`;
     if (!isRecord(pin)) {
       add(findings, prefix, 'required_model_pin_missing');

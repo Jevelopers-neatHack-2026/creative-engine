@@ -45,6 +45,7 @@ function makeSamples(splitId, count, questionIds, classByIndex = () => null) {
     if (splitId === 'routing_safety' && index < 20) strata.push('injection', 'permission', 'race');
     return {
       sha256: sha(`synthetic-test-fixture:${splitId}:${index}`),
+      family_id: `${splitId}:family-${Math.floor(index / 10)}`,
       question_ids: [...questionIds],
       strata: [...new Set(strata)],
       fixture_label: label ?? 'synthetic-only',

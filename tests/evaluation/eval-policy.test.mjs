@@ -155,9 +155,10 @@ test('the checked-in pending artifacts fail acceptance until external evidence i
 
 test('the eval-policy acceptance command emits machine-readable findings and exits 2 while pending', () => {
   const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
-  const result = spawnSync('make', ['acceptance', 'TARGET=eval-policy'], {
+  const result = spawnSync('make', ['--no-print-directory', '--silent', 'acceptance', 'TARGET=eval-policy'], {
     cwd: repoRoot,
     encoding: 'utf8',
+    env: { ...process.env, MAKEFLAGS: 'w', MAKELEVEL: '1' },
   });
   assert.equal(result.status, 2);
   assert.ok(!result.stdout.includes('scripts/acceptance-gate.mjs'));
@@ -243,6 +244,26 @@ test('an empty owner register and a removed question cannot pass vacuously or sh
   mismatchedDefinitionId.expectedQuestionDefinitions[mismatchedDefinitionId.requiredQuestionIds[0]].question_id = 'other.question';
   const idFindings = validateQuestionRegister(mismatchedDefinitionId.questionRegister, questionOptions(mismatchedDefinitionId));
   assert.ok(hasKey(idFindings, `questionRegister.inventory_pin.question_definitions.${mismatchedDefinitionId.requiredQuestionIds[0]}`));
+
+  for (const [field, changedValue] of [
+    ['version', 'owner-edited-version'],
+    ['owner_issue_key', 'CE-09'],
+    ['owner_role', 'unverified owner'],
+    ['fixture_ref', 'fixtures/changed.json'],
+  ]) {
+    const changedDefinition = makeSyntheticEvaluationPackage(policy);
+    changedDefinition.questionRegister.questions[0][field] = changedValue;
+    const changedFindings = validateQuestionRegister(changedDefinition.questionRegister, questionOptions(changedDefinition));
+    assert.ok(hasKey(changedFindings, `questionRegister.questions.${changedDefinition.requiredQuestionIds[0]}.${field}`), `${field} must match the independently pinned definition`);
+  }
+  const malformedVersion = makeSyntheticEvaluationPackage(policy);
+  const malformedVersionId = malformedVersion.requiredQuestionIds[0];
+  malformedVersion.questionRegister.questions[0].version = '';
+  malformedVersion.expectedQuestionDefinitions[malformedVersionId].version = '';
+  malformedVersion.questionRegister.inventory_pin.sha256 = canonicalSha256(
+    Object.values(malformedVersion.expectedQuestionDefinitions).sort((left, right) => left.question_id.localeCompare(right.question_id)),
+  );
+  assert.ok(hasKey(validateQuestionRegister(malformedVersion.questionRegister, questionOptions(malformedVersion)), `questionRegister.questions.${malformedVersionId}.version`));
 });
 
 test('removing a question stratum, primitive fixture, model pin, or threshold is rejected', () => {
@@ -297,6 +318,25 @@ test('corpus hashes are disjoint, content-bound, and cover required held-out cla
   findings = validateCorpusManifest(repeatedHash, { allowSyntheticFixture: true, policy });
   assert.ok(findings.some((finding) => finding.key.includes(repeatedHash.splits[1].samples[0].sha256) && finding.reason.startsWith('hash_reused_from_')));
 
+  const noncanonicalHash = clone(valid);
+  noncanonicalHash.splits[0].samples[0].sha256 = 'a'.repeat(64);
+  noncanonicalHash.splits[1].samples[0].sha256 = 'A'.repeat(64);
+  refreezeCorpus(noncanonicalHash);
+  findings = validateCorpusManifest(noncanonicalHash, { allowSyntheticFixture: true, policy });
+  assert.ok(hasKey(findings, 'corpusManifest.splits.routing_held_out.samples.0.sha256'));
+
+  const familyBound = clone(valid);
+  familyBound.splits[0].samples[0].family_id += ':changed';
+  findings = validateCorpusManifest(familyBound, { allowSyntheticFixture: true, policy });
+  assert.ok(hasKey(findings, 'corpusManifest.splits.routing_calibration.content_sha256'));
+
+  const reusedFamily = clone(valid);
+  for (const sample of reusedFamily.splits.find((split) => split.id === 'routing_calibration').samples) sample.family_id = 'shared-family';
+  for (const sample of reusedFamily.splits.find((split) => split.id === 'routing_held_out').samples) sample.family_id = 'SHARED-FAMILY';
+  refreezeCorpus(reusedFamily);
+  findings = validateCorpusManifest(reusedFamily, { allowSyntheticFixture: true, policy });
+  assert.ok(findings.some((finding) => finding.key.startsWith('corpusManifest.splits.routing_held_out.samples.') && finding.reason === 'family_reused_from_routing_calibration'));
+
   const missingReviewer = clone(valid);
   missingReviewer.splits[0].labeling.reviewers.pop();
   findings = validateCorpusManifest(missingReviewer, { allowSyntheticFixture: true, policy });
@@ -329,7 +369,7 @@ test('held-out runs bind exact freeze hashes, reject post-freeze tuning, and ret
 });
 
 test('report validation requires question-by-stratum negatives, uncertainty, latency, and cost state', () => {
-  const cell = { question_id: 'fixture.q.v1', stratum_id: 'fixture.stratum' };
+  const cell = { question_id: 'fixture.q.v1', question_version: 'fixture-v1', schema_sha256: 'c'.repeat(64), stratum_id: 'fixture.stratum', expected_count: 10 };
   const report = {
     policy_sha256: 'a'.repeat(64),
     corpus_sha256: 'b'.repeat(64),
@@ -344,11 +384,41 @@ test('report validation requires question-by-stratum negatives, uncertainty, lat
       failure_count: 1,
       denominator: 10,
       attempted_count: 10,
-      bootstrap_interval: { level: 0.95, method: 'family-bootstrap' },
+      bootstrap_interval: { level: 0.95, method: 'family-bootstrap', lower: 0.7, upper: 0.9 },
       negative_findings: ['fixture failure retained'],
     }],
   };
   assert.deepEqual(validateEvaluationReport(report, { requiredCells: [cell] }), []);
+  const schemaMismatch = clone(report);
+  schemaMismatch.question_strata[0].schema_sha256 = 'd'.repeat(64);
+  assert.ok(hasKey(validateEvaluationReport(schemaMismatch, { requiredCells: [cell] }), `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}.schema_sha256`));
+
+  const badMetrics = [
+    ['false_negatives', -1, `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}.false_negatives`],
+    ['abstention_count', 11, `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}.abstention_count`],
+    ['latency_ms', null, `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}.latency_ms`],
+    ['uncertainty', null, `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}.uncertainty`],
+  ];
+  for (const [field, value, expectedKey] of badMetrics) {
+    const malformed = clone(report);
+    malformed.question_strata[0][field] = value;
+    assert.ok(hasKey(validateEvaluationReport(malformed, { requiredCells: [cell] }), expectedKey), `${field} must reject invalid bounds or missing values`);
+  }
+  const negativeCost = clone(report);
+  negativeCost.question_strata[0].downstream_cost = { status: 'known', amount: -0.01 };
+  assert.ok(hasKey(validateEvaluationReport(negativeCost, { requiredCells: [cell] }), `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}.downstream_cost.amount`));
+  const missingInterval = clone(report);
+  delete missingInterval.question_strata[0].bootstrap_interval.lower;
+  assert.ok(hasKey(validateEvaluationReport(missingInterval, { requiredCells: [cell] }), `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}.bootstrap_interval`));
+  const shrunkDenominator = clone(report);
+  Object.assign(shrunkDenominator.question_strata[0], {
+    denominator: 1,
+    attempted_count: 1,
+    false_negatives: 0,
+    abstention_count: 0,
+    failure_count: 0,
+  });
+  assert.ok(hasKey(validateEvaluationReport(shrunkDenominator, { requiredCells: [cell] }), `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}.denominator`));
   report.economy_claim = true;
   let findings = validateEvaluationReport(report, { requiredCells: [cell] });
   assert.ok(hasKey(findings, 'evaluationReport.economy_claim'));
@@ -357,17 +427,30 @@ test('report validation requires question-by-stratum negatives, uncertainty, lat
   findings = validateEvaluationReport(report, { requiredCells: [cell] });
   assert.ok(hasKey(findings, `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}.attempted_count`));
   assert.ok(hasKey(validateEvaluationReport({ ...report, question_strata: [] }, { requiredCells: [cell] }), `evaluationReport.question_strata.${cell.question_id}::${cell.stratum_id}`));
+  const malformedRowFindings = validateEvaluationReport({ ...report, question_strata: [null] }, { requiredCells: [cell] });
+  assert.ok(malformedRowFindings.some((finding) => finding.reason === 'result_row_must_be_object'));
 });
 
 test('public evidence scanner rejects credentials and personal identifiers', () => {
+  const hostileKey = 'Bearer secret-private-value';
   const evidence = {
     policy_sha256: 'a'.repeat(64),
     authorization: 'Bearer synthetic-secret-token',
     owner_contact: 'person@example.invalid',
+    [hostileKey]: 'opaque value',
   };
   const findings = validatePublicEvidence(evidence);
-  assert.ok(hasKey(findings, 'evidence.authorization'));
+  assert.ok(hasKey(findings, 'evidence.[redacted]'));
   assert.ok(findings.some((finding) => finding.reason === 'possible_secret_or_personal_data'));
+  assert.ok(!JSON.stringify(findings).includes(hostileKey));
+  assert.ok(!JSON.stringify(findings).includes('synthetic-secret-token'));
+
+  const fixture = makeSyntheticEvaluationPackage(policy);
+  fixture.questionRegister.questions[0].question_id = hostileKey;
+  const identifierFindings = validateQuestionRegister(fixture.questionRegister, questionOptions(fixture));
+  assert.ok(identifierFindings.length > 0);
+  assert.ok(!JSON.stringify(identifierFindings).includes(hostileKey));
+  assert.ok(!JSON.stringify(identifierFindings).includes('secret-private-value'));
 });
 
 test('local status strings and hashes cannot authenticate missing owner or corpus acceptance', () => {
@@ -466,6 +549,26 @@ test('synthetic labels never satisfy actual acceptance and unresolved model pins
   assert.ok(hasKey(paid.findings, 'paidEvaluation.model_pins.vision_observation.status'));
   assert.ok(hasKey(paid.findings, 'paidEvaluation.model_pins.generative_classification_baseline.model_id'));
   assert.ok(hasKey(paid.findings, 'paidEvaluation.policy_acceptance'));
+
+  const acceptedScenario = makeInjectedAcceptanceScenario();
+  const narrowed = evaluatePaidEvaluationReadiness({
+    policy: acceptedScenario.policy,
+    acceptanceInputs: acceptedScenario,
+    modelPinKeys: [],
+    trustedEvidenceVerifier: () => true,
+  });
+  assert.equal(narrowed.ready, false);
+  assert.ok(hasKey(narrowed.findings, 'paidEvaluation.model_pins.vision_observation.status'));
+  assert.ok(hasKey(narrowed.findings, 'paidEvaluation.model_pins.generative_classification_baseline.status'));
+
+  const malformedKeys = evaluatePaidEvaluationReadiness({
+    policy: acceptedScenario.policy,
+    acceptanceInputs: acceptedScenario,
+    modelPinKeys: 'skip-required-pins',
+    trustedEvidenceVerifier: () => true,
+  });
+  assert.equal(malformedKeys.ready, false);
+  assert.ok(hasKey(malformedKeys.findings, 'paidEvaluation.modelPinKeys'));
 });
 
 test('held-out samples must carry exactly one task class; malformed iterables return findings safely', () => {
@@ -486,6 +589,16 @@ test('held-out samples must carry exactly one task class; malformed iterables re
   malformedQuestion.questions[0].required_strata = { id: 'injection' };
   const questionFindings = validateQuestionRegister(malformedQuestion, questionOptions(fixture));
   assert.ok(hasKey(questionFindings, `questionRegister.questions.${fixture.requiredQuestionIds[0]}.required_strata`));
+
+  const prototypePrimitive = clone(fixture.questionRegister);
+  prototypePrimitive.questions[0].primitive = 'toString';
+  const prototypePrimitiveFindings = validateQuestionRegister(prototypePrimitive, questionOptions(fixture));
+  assert.ok(hasKey(prototypePrimitiveFindings, `questionRegister.questions.${fixture.requiredQuestionIds[0]}.primitive`));
+  const numericSyntheticId = clone(fixture.questionRegister);
+  numericSyntheticId.questions[0].question_id = 7;
+  const numericIdFindings = validateQuestionRegister(numericSyntheticId, questionOptions(fixture));
+  assert.ok(numericIdFindings.some((finding) => finding.reason === 'required_nonempty_id'));
+  assert.ok(numericIdFindings.some((finding) => finding.reason === 'synthetic_questions_must_be_explicitly_test_only'));
 
   const malformedTelemetry = clone(fixture.telemetrySchema);
   malformedTelemetry.events[0].fields = { false_negative: true };

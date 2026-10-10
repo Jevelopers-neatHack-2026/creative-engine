@@ -34,7 +34,7 @@ jobs:
         run: |
           mkdir -p test-results/eval-policy
           set +e
-          make --silent acceptance TARGET=eval-policy > test-results/eval-policy/acceptance.json
+          make --no-print-directory --silent acceptance TARGET=eval-policy > test-results/eval-policy/acceptance.json
           status=$?
           set -e
           if [ "$status" -ne 2 ]; then
