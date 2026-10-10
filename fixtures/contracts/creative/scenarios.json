@@ -1,0 +1,18 @@
+{
+  "negative_cases": [
+    "missing_required_field",
+    "unsupported_major_version",
+    "unsupported_minor_version",
+    "unknown_sensitive_fields_redacted",
+    "unknown_additive_optional_fields_preserved",
+    "bad_source_reference",
+    "forged_api_tenant_scope",
+    "forged_job_scope",
+    "forged_artifact_scope",
+    "forged_signed_access_claim_scope",
+    "missing_permission_and_conflicting_fact_incomplete",
+    "unknown_action_rejected",
+    "unbounded_action_parameters_rejected",
+    "hash_mismatch_rejected"
+  ]
+}
