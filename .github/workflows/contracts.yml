@@ -50,4 +50,5 @@ jobs:
           if-no-files-found: error
       - run: make check TARGET=metering-contract MODE=mock
       - run: make check TARGET=handoff-contract MODE=mock
+      - run: make check TARGET=versions MODE=mock
       - run: make check TARGET=all MODE=mock

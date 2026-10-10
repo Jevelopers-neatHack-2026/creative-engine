@@ -1,8 +1,7 @@
-import { createCreativeApi } from "../../src/api/v1.mjs";
-import { createCreativeVersionApiPorts, CreativeVersionStore, VersionStoreError } from "../../src/versions/index.mjs";
-import { hashArtifactBytes, writeContentAddressedObject } from "../../src/storage/content-addressed.mjs";
-import type { CreativeApiRequest, TrustedCreativeActor } from "../../src/api/v1.mjs";
-import type { DesignSelection } from "../../src/api/v1.mjs";
+import { createCreativeApi } from "creative-engine/api/v1";
+import { createCreativeVersionApiPorts, CreativeVersionStore, VersionStoreError } from "creative-engine/versions";
+import type { CreativeApiRequest, TrustedCreativeActor, DesignSelection } from "creative-engine/api/v1";
+import type { VersionScope, VersionSelectionInput } from "creative-engine/versions";
 
 const store = new CreativeVersionStore({ databasePath: "/tmp/creative-versions.sqlite", objectRoot: "/tmp/creative-objects" });
 const paired = createCreativeVersionApiPorts({ store, idFactory: () => "public-consumer-id" });
@@ -19,12 +18,15 @@ const request: CreativeApiRequest = {
   environment: "test", billing_mode: "simulated", source_refs: [], operation: "job.status", payload: { job_id: "job-public" },
 };
 void api.invoke(actor, request);
-void hashArtifactBytes(new Uint8Array([1]));
-void writeContentAddressedObject("/tmp/creative-objects", new Uint8Array([1]), `sha256:${"0".repeat(64)}`);
 const publicError = new VersionStoreError("unavailable", "handoff.durable_result_staging", true);
 const readSelection = (selection: DesignSelection) => selection.design_hash;
 void readSelection;
 void publicError;
+const scope: VersionScope = { tenant_id: "tenant-public", project_id: "project-public", brief_id: "brief-public" };
+const selection: VersionSelectionInput = { mode: "advance", expected_revision: 0,
+  expected_selected_design_version_id: null, expected_selected_design_hash: null };
+void scope;
+void selection;
 
 // Internal transaction minting must not be part of the public declaration.
 // @ts-expect-error publication transactions are created only by the paired adapter

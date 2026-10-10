@@ -11,7 +11,7 @@ import { computeDesignVersionHash } from "../../src/contracts/index.mjs";
 import { hashArtifactBytes, readContentAddressedObject, writeContentAddressedObject } from "../../src/storage/content-addressed.mjs";
 import { CreativeVersionStore, VersionStoreError } from "../../src/versions/store.mjs";
 import { createStore, createWrite, DEFAULT_SCOPE } from "./helpers.mjs";
-import * as publicVersions from "../../src/versions/index.mjs";
+import * as publicVersions from "creative-engine/versions";
 
 const CRASH_WORKER = new URL("../../fixtures/versions/crash-worker.mjs", import.meta.url);
 const SELECTION_WORKER = new URL("../../fixtures/versions/selection-worker.mjs", import.meta.url);

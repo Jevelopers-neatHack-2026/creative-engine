@@ -41,4 +41,4 @@ node --test tests/versions/api-integration.test.mjs tests/versions/store.test.mj
 node examples/frontend-action-roundtrip/node_modules/typescript/bin/tsc --noEmit --strict --skipLibCheck false --module NodeNext --moduleResolution NodeNext --target ES2022 tests/versions/public-consumer.mts
 ```
 
-The root `make check TARGET=versions MODE=mock` and package subpath export are serialized with the root build/CI owner and must be integrated before the versions package surface is advertised as available.
+`make check TARGET=versions MODE=mock` runs the durable API/store integration and process fixtures, then typechecks the `creative-engine/versions` package subpath in strict NodeNext mode. `make build` also syntax-checks the store, paired ports, and byte store. `make acceptance TARGET=versions` remains fail-closed until the external C01 schema/producer/scope and C03 finance/usage-schema agreements are published and independently verified.

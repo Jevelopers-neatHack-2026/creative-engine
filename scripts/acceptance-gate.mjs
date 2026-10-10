@@ -34,6 +34,13 @@ const requirements = {
     "production_artwork_handoff",
     "shared_contracts_approval_handoff_schemas",
   ],
+  versions: [
+    "shared_contracts_creative_schemas",
+    "event_intelligence_producer",
+    "trusted_project_membership",
+    "finance_metering_budget_protocol",
+    "shared_contracts_usage_budget_schemas",
+  ],
 };
 
 function rawSha256(bytes) {
@@ -181,7 +188,7 @@ async function main() {
     return;
   }
   if (!Object.hasOwn(requirements, target) && target !== "all") {
-    process.stderr.write("Unknown acceptance target " + target + ". Use api, controls, contracts, decision-contract, eval-policy, metering-contract, handoff-contract, access-preflight, or all.\n");
+    process.stderr.write("Unknown acceptance target " + target + ". Use api, controls, contracts, decision-contract, eval-policy, metering-contract, handoff-contract, versions, access-preflight, or all.\n");
     process.exitCode = 2;
     return;
   }
