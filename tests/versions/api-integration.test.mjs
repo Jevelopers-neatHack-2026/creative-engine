@@ -143,6 +143,125 @@ test("real API invocation commits job, exact artifact bytes, version and selecti
   assert.equal(counters.provider, 1, "conflicting action replay must not dispatch again");
 });
 
+test("dispatch authorization rechecks lease expiry after the intent timestamp and retains the metering hold", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-api-dispatch-expired-lease-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  let store;
+  let authorizationClockReads = 0;
+  const now = () => {
+    if (store?.db.isTransaction === true &&
+      store.db.prepare("SELECT count(*) AS count FROM creative_jobs WHERE status='running'").get().count > 0 &&
+      store.db.prepare("SELECT count(*) AS count FROM creation_actions").get().count === 0) {
+      authorizationClockReads += 1;
+      if (authorizationClockReads >= 2) return NOW + 120_000;
+    }
+    return NOW;
+  };
+  store = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now });
+  t.after(() => store.close());
+  const brief = await fixture("brief");
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief });
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const api = createCreativeApi({ ports: portsFor(store, counters, () => `dispatch-expiry-port-${++id}`),
+    now: () => NOW, idFactory: () => `dispatch-expiry-api-${++id}` });
+  const response = await api.invoke(actor(), request("dispatch-expired-lease", await fixture("generate-plan")));
+
+  assert.ok(authorizationClockReads >= 2, "the clock crosses expiry during the final dispatch authorization check");
+  assert.equal(response.ok, false, JSON.stringify(response));
+  assert.equal(counters.reserved, 1, "the reservation was consumed before the dispatch fence");
+  assert.equal(counters.provider, 0, "expired authorization cannot start the transport");
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM creative_dispatch_intents").get().count, 0);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM design_versions").get().count, 0);
+  assert.equal(store.getSelection({ scope: SCOPE, brief_id: SCOPE.brief_id }), null);
+  const job = store.db.prepare("SELECT status,result_json FROM creative_jobs WHERE action_id=?")
+    .get("dispatch-expired-lease");
+  assert.notEqual(job.status, "completed");
+  assert.equal(job.result_json, null);
+});
+
+test("dispatch authorization replay does not reuse an intent after the lease expires during replay checks", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-api-dispatch-replay-expired-lease-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  let store;
+  let replayClockReads = 0;
+  let advanceDuringReplay = false;
+  const now = () => {
+    if (advanceDuringReplay && store?.db.isTransaction === true &&
+      store.db.prepare("SELECT count(*) AS count FROM creative_jobs WHERE status='running'").get().count > 0 &&
+      store.db.prepare("SELECT count(*) AS count FROM creative_dispatch_intents").get().count > 0) {
+      replayClockReads += 1;
+      if (replayClockReads >= 2) return NOW + 120_000;
+    }
+    return NOW;
+  };
+  store = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now });
+  t.after(() => store.close());
+  const brief = await fixture("brief");
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief });
+  const adapter = createCreativeVersionApiPorts({ store, idFactory: (() => {
+    let id = 0;
+    return () => `dispatch-replay-id-${++id}`;
+  })() });
+  const action_id = "dispatch-replay-expired-lease";
+  const started = await adapter.jobs.begin({ scope: SCOPE, actor_id: "actor-api-1", action_id,
+    request_hash: canonicalHash({ action_id, operation: "generate" }), operation: "generate" });
+  const authorization = { scope: SCOPE, actor_id: "actor-api-1", job_id: started.job_id,
+    lease_token: started.lease_token, action_id, operation: "generate",
+    billable_attempt_id: "billable-replay-lease", transport_attempt_id: "transport-replay-lease",
+    context_fence: { brief_id: SCOPE.brief_id, brief_hash: canonicalHash(brief),
+      expected_current_design_version_id: null, expected_current_design_hash: null } };
+  assert.equal((await adapter.jobs.authorizeDispatch(authorization)).status, "authorized");
+
+  advanceDuringReplay = true;
+  const replay = await adapter.jobs.authorizeDispatch(authorization);
+  assert.ok(replayClockReads >= 2, "the lease expires between the initial and final replay checks");
+  assert.deepEqual(replay, { status: "lease_lost" });
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM creative_dispatch_intents WHERE job_id=?")
+    .get(started.job_id).count, 1, "the replay cannot create another dispatch intent");
+});
+
+test("normal paired publication rolls back when the lease expires during final result timestamping", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "creative-api-publication-expired-lease-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  let store;
+  let publicationClockReads = 0;
+  const now = () => {
+    if (store?.db.isTransaction === true &&
+      store.db.prepare("SELECT count(*) AS count FROM creation_actions WHERE state='committed'").get().count > 0) {
+      publicationClockReads += 1;
+      if (publicationClockReads >= 2) return NOW + 120_000;
+    }
+    return NOW;
+  };
+  store = new CreativeVersionStore({ databasePath: join(root, "versions.sqlite"),
+    objectRoot: join(root, "objects"), now });
+  t.after(() => store.close());
+  const brief = await fixture("brief");
+  store.putBrief({ scope: { tenant_id: SCOPE.tenant_id, project_id: SCOPE.project_id }, brief });
+  const counters = { provider: 0, reserved: 0 };
+  let id = 0;
+  const api = createCreativeApi({ ports: portsFor(store, counters, () => `publication-expiry-port-${++id}`),
+    now: () => NOW, idFactory: () => `publication-expiry-api-${++id}` });
+  const response = await api.invoke(actor(), request("publication-expired-lease", await fixture("generate-plan")));
+
+  assert.equal(publicationClockReads, 2, "the final persisted completion timestamp is after lease expiry");
+  assert.equal(response.ok, false, JSON.stringify(response));
+  assert.equal(counters.provider, 1, "the already-dispatched attempt remains attributable");
+  assert.equal(counters.reserved, 1, "publication fencing cannot erase or recreate the reservation");
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM design_versions").get().count, 0);
+  assert.equal(store.getSelection({ scope: SCOPE, brief_id: SCOPE.brief_id }), null);
+  const job = store.db.prepare("SELECT status,result_json FROM creative_jobs WHERE action_id=?")
+    .get("publication-expired-lease");
+  assert.notEqual(job.status, "completed");
+  assert.equal(job.result_json, null);
+  const action = store.db.prepare("SELECT state FROM creation_actions WHERE action_id=?")
+    .get("publication-expired-lease");
+  assert.notEqual(action.state, "committed", "the version publication transaction must roll back with the job result");
+});
+
 test("paired API rejects a changed commit intent before publication and replay never redispatches", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "creative-version-intent-integrity-api-"));
   t.after(async () => rm(root, { recursive: true, force: true }));

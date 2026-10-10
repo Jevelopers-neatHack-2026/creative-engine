@@ -281,16 +281,28 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
           if (existing) {
             const sameFence = existing.context_fence_json === canonicalSerialize(input.context_fence);
             const sameAttempt = (existing.billable_attempt_id ?? null) === (input.billable_attempt_id ?? null);
+            const finalStatus = transactionStatusFor(row, input.scope, input.actor_id, input.lease_token, store.now());
+            if (finalStatus !== "active") {
+              store.db.exec("ROLLBACK");
+              return Object.freeze({ status: finalStatus });
+            }
             store.db.exec("COMMIT");
             return sameFence && sameAttempt ? Object.freeze({ status: "authorized", dispatch_intent_ref: existing.dispatch_intent_ref })
               : Object.freeze({ status: "lease_lost" });
           }
           const dispatch_intent_ref = safeReference(idFactory(), "dispatch_intent_ref");
+          const authorized_at = store.timestamp();
+          const authorizedAtMs = Date.parse(authorized_at);
+          if (!Number.isFinite(authorizedAtMs) ||
+            transactionStatusFor(row, input.scope, input.actor_id, input.lease_token, authorizedAtMs) !== "active") {
+            store.db.exec("ROLLBACK");
+            return Object.freeze({ status: "lease_lost" });
+          }
           store.db.prepare(`INSERT INTO creative_dispatch_intents
             (tenant_id,project_id,job_id,transport_attempt_id,billable_attempt_id,dispatch_intent_ref,context_fence_json,authorized_at)
             VALUES(?,?,?,?,?,?,?,?)`)
             .run(input.scope.tenant_id, input.scope.project_id, input.job_id, transport_attempt_id,
-              input.billable_attempt_id ?? null, dispatch_intent_ref, canonicalSerialize(input.context_fence), store.timestamp());
+              input.billable_attempt_id ?? null, dispatch_intent_ref, canonicalSerialize(input.context_fence), authorized_at);
           store.db.exec("COMMIT");
           return Object.freeze({ status: "authorized", dispatch_intent_ref });
         } catch (error) {
@@ -342,9 +354,21 @@ export function createCreativeVersionApiPorts({ store, otherPorts = {}, idFactor
           }
           const result_json = canonicalSerialize(safeJson(input.result, "job.result"));
           const updated_at = store.timestamp();
-          store.db.prepare(`UPDATE creative_jobs SET status='completed',result_json=?,error_json=NULL,updated_at=?
-            WHERE tenant_id=? AND project_id=? AND job_id=? AND status='running' AND lease_hash=?`)
-            .run(result_json, updated_at, scope.tenant_id, scope.project_id, input.job_id, tokenHash(input.lease_token));
+          const completedAt = Date.parse(updated_at);
+          const finalRow = store.db.prepare(`SELECT * FROM creative_jobs WHERE tenant_id=? AND project_id=? AND job_id=?`)
+            .get(scope.tenant_id, scope.project_id, input.job_id);
+          if (!Number.isFinite(completedAt) ||
+            transactionStatusFor(finalRow, scope, input.actor_id, input.lease_token, completedAt) !== "active" ||
+            finalRow.action_id !== input.action_id || finalRow.operation !== input.operation ||
+            finalRow.request_hash !== row.request_hash) {
+            throw new VersionStoreError("cancelled", "job.lease_token");
+          }
+          const completedChanges = store.db.prepare(`UPDATE creative_jobs SET status='completed',result_json=?,error_json=NULL,updated_at=?
+            WHERE tenant_id=? AND project_id=? AND job_id=? AND status='running' AND actor_id=? AND action_id=?
+              AND operation=? AND request_hash=? AND lease_hash=? AND lease_expires_at>?`)
+            .run(result_json, updated_at, scope.tenant_id, scope.project_id, input.job_id,
+              input.actor_id, input.action_id, input.operation, row.request_hash, tokenHash(input.lease_token), updated_at).changes;
+          if (completedChanges !== 1) throw new VersionStoreError("cancelled", "job.lease_token");
           store.db.exec("COMMIT");
           faultInjector?.("after_job_commit");
           const completed = store.db.prepare(`SELECT * FROM creative_jobs WHERE tenant_id=? AND project_id=? AND job_id=?`)
