@@ -1,4 +1,5 @@
 {
+  "license": "MIT",
   "name": "creative-controls-mock-browser-fixture",
   "private": true,
   "type": "module",
