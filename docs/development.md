@@ -56,6 +56,8 @@ make typecheck-contracts
 
 The controls browser example has its own lockfile and dependency install. Its Node and Chromium roundtrip instructions, local evidence format, and remaining integration requirements are in [controls integration](controls-integration.md). It uses mock application identity and state. The packed-tarball consumer check run by `make check TARGET=controls MODE=mock` is described in [controls package integration](controls-package-integration.md).
 
+`make acceptance TARGET=all` reports the same pending local H → R1 → E1 → R2 → Q integration prerequisites as `TARGET=controls`, alongside canonical owner, policy, access and provider evidence. These local prerequisites remain release blockers even if external evidence is supplied. Mock checks do not satisfy them.
+
 ## Detailed package status
 
 These paragraphs were the opening of the root README before the 2026-10-11 refresh.

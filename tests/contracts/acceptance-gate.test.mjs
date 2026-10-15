@@ -128,6 +128,13 @@ test("canonical owner acceptance gate reports missing C01 and C02 agreements as 
   assert.match(all.stderr, /product_approval_protocol_and_consumer/);
   assert.match(all.stderr, /CE-A01 live access remains pending/);
   assert.match(all.stderr, /No authoritative Neatlogs evidence-sink agreement reference is available/);
+  // The release entry point must expose unfinished local work as well as
+  // external evidence, so providing credentials cannot appear to unblock it.
+  for (const prefix of ["H", "R1", "E1", "R2", "Q"]) {
+    const localGate = controlsGate.pending_local_gates.find((gate) => gate.startsWith(prefix + ":"));
+    assert.ok(localGate);
+    assert.ok(all.stderr.includes(localGate), `all acceptance must report ${prefix} local prerequisite`);
+  }
 
   const access = spawnSync("make", ["acceptance", "TARGET=access-preflight"], {
     cwd: root,

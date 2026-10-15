@@ -329,13 +329,18 @@ async function main() {
   const creativePolicy = target === "all" ? evaluateCreativePolicy(repoRoot) : null;
   const accessPreflight = target === "all" ? createAccessPreflightGateReport() : null;
   const imageAdapter = target === "all" ? createImageAdapterGateReport() : null;
-  if (unmet.length > 0 || unresolved.length > 0 || creativePolicy && !creativePolicy.accepted || accessPreflight || imageAdapter) {
+  const localGates = target === "all" ? controlsLocalAcceptanceGates : [];
+  if (unmet.length > 0 || unresolved.length > 0 || localGates.length > 0 || creativePolicy && !creativePolicy.accepted || accessPreflight || imageAdapter) {
     process.stderr.write("Acceptance blocked: missing or unverified canonical owner agreement evidence or required integration evidence for " + target + " (proposal_state=" + proposalState + ").\n");
     for (const id of unmet) {
       const agreement = record.agreements?.[id];
       process.stderr.write("- " + id + " (" + (agreement?.owner_role ?? "owner unknown") + "; status=" + (agreement?.status ?? "missing") + ")\n");
     }
     for (const gate of unresolved) process.stderr.write("- " + gate + "\n");
+    if (localGates.length > 0) {
+      process.stderr.write("Acceptance blocked: required local creative integration remains incomplete.\n");
+      for (const gate of localGates) process.stderr.write("- " + gate + "\n");
+    }
     if (creativePolicy && !creativePolicy.accepted) {
       process.stderr.write("Acceptance blocked: CE-Q01 policy and corpus evidence remain pending.\n");
       for (const finding of creativePolicy.findings) {

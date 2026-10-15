@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -154,7 +154,9 @@ async function installedProcessFixture(t, scenario) {
     const ready = await wait("ready");
     assert.equal(ready.runtime, process.version);
     assert.equal(ready.database_path, databasePath);
-    assert.equal(ready.module_url, pathToFileURL(workerPath).href);
+    // Node resolves ESM entry points through symlinks (including macOS
+    // /var -> /private/var). Compare the exact installed file identity.
+    assert.equal(ready.module_url, pathToFileURL(await realpath(workerPath)).href);
     return { child, send, wait, call, ready,
       invoke: (body, trustedPrincipal = principal) => call("invoke", "result", { principal: trustedPrincipal, request: body }),
       close: async () => { send({ kind: "close" }); await wait("closed"); assert.deepEqual(await child.recorded, { code: 0, signal: null }); },
