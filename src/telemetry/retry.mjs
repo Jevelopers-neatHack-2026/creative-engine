@@ -1,5 +1,7 @@
 import { recordUsageObservation, validateMeteredAttempt } from "../contracts/metering.mjs";
-import { assertSafePublicIdentifier, containsSensitivePublicText, isSensitivePublicField } from "./privacy.mjs";
+import { types as utilTypes } from "node:util";
+import { snapshotBoundedPlainJson } from "../contracts/plain-json.mjs";
+import { assertSafePublicIdentifier, containsSensitivePublicText, isSensitivePublicField, projectPublicTelemetry } from "./privacy.mjs";
 import { TelemetryBoundaryError } from "./evidence.mjs";
 
 const MAX_BATCH = 32;
@@ -93,6 +95,62 @@ async function deferEvidence(outbox, eventId, claimToken, reason) {
   }
 }
 
+function validateEvidenceBatch(value, limit) {
+  // Inspect only own data descriptors, then snapshot every record before the
+  // first sink await. Keep the outbox's per-event bound rather than imposing a
+  // smaller aggregate limit on a valid batch of up to MAX_BATCH events.
+  let inputs;
+  try {
+    if (!isRecord(value) || utilTypes.isProxy(value)) throw new Error();
+    const status = Object.getOwnPropertyDescriptor(value, "status");
+    const records = Object.getOwnPropertyDescriptor(value, "records");
+    if (!status || !Object.hasOwn(status, "value") || status.value !== "claimed" ||
+      !records || !Object.hasOwn(records, "value") || !Array.isArray(records.value) || utilTypes.isProxy(records.value)) throw new Error();
+    const length = Object.getOwnPropertyDescriptor(records.value, "length").value;
+    if (!Number.isSafeInteger(length) || length < 0 || length > limit) throw new Error();
+    inputs = [];
+    for (let index = 0; index < length; index += 1) {
+      const item = Object.getOwnPropertyDescriptor(records.value, String(index));
+      if (!item || !Object.hasOwn(item, "value")) throw new Error();
+      inputs.push(item.value);
+    }
+  } catch {
+    throw new TelemetryBoundaryError("invalid_evidence_batch");
+  }
+  const eventIds = new Set();
+  const references = new Set();
+  const claimTokens = new Set();
+  const snapshots = [];
+  for (const input of inputs) {
+    let record;
+    try {
+      record = snapshotBoundedPlainJson(input, { maxStringLength: 128 * 1024, maxKeyLength: 128 * 1024 });
+    } catch {
+      throw new TelemetryBoundaryError("invalid_evidence_record");
+    }
+    if (!isRecord(record) || !isRecord(record.event)) {
+      throw new TelemetryBoundaryError("invalid_evidence_record");
+    }
+    try {
+      assertSafePublicIdentifier(record.event.event_id, { maxLength: 256 });
+      assertSafePublicIdentifier(record.record_ref, { maxLength: 256 });
+      assertSafePublicIdentifier(record.claim_token, { maxLength: 256 });
+      const projected = projectPublicTelemetry(record.event, { maxDepth: 24, maxNodes: 8192, maxBytes: 128 * 1024 });
+      if (projected.redactions.length !== 0) throw new Error();
+    } catch {
+      throw new TelemetryBoundaryError("invalid_evidence_record");
+    }
+    if (eventIds.has(record.event.event_id)) throw new TelemetryBoundaryError("duplicate_evidence_record");
+    if (references.has(record.record_ref)) throw new TelemetryBoundaryError("duplicate_evidence_reference");
+    if (claimTokens.has(record.claim_token)) throw new TelemetryBoundaryError("duplicate_evidence_claim_token");
+    eventIds.add(record.event.event_id);
+    references.add(record.record_ref);
+    claimTokens.add(record.claim_token);
+    snapshots.push(record);
+  }
+  return Object.freeze(snapshots);
+}
+
 /** Deliver already committed evidence through an explicit record/ack port.
  * Generic SDK flush/HTTP success is not an acknowledgement for this boundary. */
 export async function deliverPendingTelemetryEvidence({ outbox, sink, limit = 16 }) {
@@ -107,28 +165,12 @@ export async function deliverPendingTelemetryEvidence({ outbox, sink, limit = 16
   } catch {
     return Object.freeze({ status: "outbox_unavailable", attempted: 0, acknowledged: 0, retained: 0 });
   }
-  if (!isRecord(claimed) || claimed.status !== "claimed" || !Array.isArray(claimed.records) || claimed.records.length > limit) {
-    throw new TelemetryBoundaryError("invalid_evidence_batch");
-  }
+  const records = validateEvidenceBatch(claimed, limit);
   let acknowledged = 0;
   let retained = 0;
-  const seen = new Set();
-  for (const claimedRecord of claimed.records) {
-    if (!isRecord(claimedRecord) || !isRecord(claimedRecord.event) ||
-      typeof claimedRecord.record_ref !== "string" || typeof claimedRecord.claim_token !== "string") {
-      throw new TelemetryBoundaryError("invalid_evidence_record");
-    }
-    let eventId;
-    let claimToken;
-    try {
-      eventId = assertSafePublicIdentifier(claimedRecord.event.event_id, { maxLength: 256 });
-      claimToken = assertSafePublicIdentifier(claimedRecord.claim_token, { maxLength: 256 });
-      assertSafePublicIdentifier(claimedRecord.record_ref, { maxLength: 256 });
-    } catch {
-      throw new TelemetryBoundaryError("invalid_evidence_record");
-    }
-    if (seen.has(eventId)) throw new TelemetryBoundaryError("duplicate_evidence_record");
-    seen.add(eventId);
+  for (const claimedRecord of records) {
+    const eventId = claimedRecord.event.event_id;
+    const claimToken = claimedRecord.claim_token;
     let response;
     try {
       response = await sink.record(structuredClone(claimedRecord.event));
@@ -157,7 +199,7 @@ export async function deliverPendingTelemetryEvidence({ outbox, sink, limit = 16
     }
   }
   return Object.freeze({ status: retained === 0 ? "complete" : "pending",
-    attempted: claimed.records.length, acknowledged, retained });
+    attempted: records.length, acknowledged, retained });
 }
 
 /**

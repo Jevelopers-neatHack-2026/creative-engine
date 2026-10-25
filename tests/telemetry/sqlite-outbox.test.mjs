@@ -329,6 +329,27 @@ test("evidence delivery requires an event-level acknowledgement and recovers aft
   reopenedDb.close();
 });
 
+test("evidence replay retains the per-event payload allowance across a large valid SQLite batch", async (t) => {
+  const path = await temporaryDatabase(t);
+  const database = openDatabase(path);
+  t.after(() => database.close());
+  const outbox = createSqliteTelemetryOutbox({ database });
+  for (let index = 0; index < 16; index += 1) {
+    await outbox.append({ ...makeEvent(`event:large-${index}`), extension: "x".repeat(129_000), ["k".repeat(257)]: "safe" });
+  }
+  let delivered = 0;
+  const result = await deliverPendingTelemetryEvidence({ outbox, limit: 16, sink: {
+    async record(event) {
+      delivered += 1;
+      assert.equal(event.extension.length, 129_000);
+      assert.equal(event["k".repeat(257)], "safe");
+      return { status: "accepted", event_id: event.event_id };
+    },
+  } });
+  assert.deepEqual(result, { status: "complete", attempted: 16, acknowledged: 16, retained: 0 });
+  assert.equal(delivered, 16);
+});
+
 test("SQLite reads reject column-to-payload scope drift and roll back both claims", async (t) => {
   const path = await temporaryDatabase(t);
   const database = openDatabase(path);

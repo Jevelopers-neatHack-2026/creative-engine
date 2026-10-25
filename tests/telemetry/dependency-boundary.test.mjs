@@ -13,8 +13,17 @@ test("telemetry depends on C03 contracts and local helpers only, never on API/ru
     const imports = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map((match) => match[1]);
     for (const specifier of imports) {
       const neutralAdmissionImport = entry.name === "sqlite-outbox.mjs" && specifier === "../sqlite/admission.mjs";
-      assert.ok(neutralAdmissionImport || /^(?:\.\.\/contracts\/|\.\/|node:crypto$)/.test(specifier),
-        `${entry.name} imports only contract, telemetry, or required built-in hashing helpers`);
+      // The replay worker uses only the intrinsic proxy guard before reading
+      // host-provided descriptors; it gains no transport or provider capability.
+      const proxyInspectionImport = entry.name === "retry.mjs" && specifier === "node:util";
+      if (proxyInspectionImport) {
+        const utilityImports = [...source.matchAll(/import\s+([^;]+?)\s+from\s+["']node:util["']/g)];
+        assert.deepEqual(utilityImports.map((match) => match[1].replace(/\s+/g, " ").trim()), ["{ types as utilTypes }"]);
+        assert.match(source, /\butilTypes\.isProxy\(/);
+        assert.doesNotMatch(source, /\butilTypes\.(?!isProxy\b)/);
+      }
+      assert.ok(neutralAdmissionImport || proxyInspectionImport || /^(?:\.\.\/contracts\/|\.\/|node:crypto$)/.test(specifier),
+        `${entry.name} imports only contract, telemetry, or required built-in hashing/proxy inspection helpers`);
     }
     assert.doesNotMatch(source, /from\s+["'][^"']*(?:runtime|\/api\/|openai|typesafe\.ai|neatlogs)[^"']*["']/i);
     assert.doesNotMatch(source, /\bfetch\s*\(|https?\.request\s*\(/i);
